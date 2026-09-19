@@ -16,7 +16,6 @@ from app.api.openai import router as openai_router
 from app.api.status import router as status_router
 from app.api.v1.router import api_router as v1_router
 from app.config import settings
-from app.core.database import Base, engine
 from app.utils.redact import redact
 
 _LOG_HANDLER_NAME = "jevproxy-stdout"
@@ -40,24 +39,10 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """
-    Lifespan context manager for FastAPI application.
-    Handles startup and shutdown events.
-    """
-    # Startup
+    """Log startup and shutdown."""
     logger.info("Starting up application...")
-
-    # Create database tables
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    logger.info("Application started successfully")
-
     yield
-
-    # Shutdown
     logger.info("Shutting down application...")
-    await engine.dispose()
 
 
 # Create FastAPI application

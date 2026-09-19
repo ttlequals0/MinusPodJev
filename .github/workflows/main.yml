@@ -27,21 +27,6 @@ jobs:
     runs-on: ubuntu-latest
     name: Backend Tests
 
-    services:
-      postgres:
-        image: postgres:15-alpine
-        env:
-          POSTGRES_USER: test_user
-          POSTGRES_PASSWORD: test_password
-          POSTGRES_DB: test_webapp
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -61,7 +46,6 @@ jobs:
 
     - name: Run tests with coverage
       env:
-        DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_webapp
         TESTING: "true"
       run: |
         uv run pytest backend/tests/ --cov=backend/app --cov-report=xml:coverage.xml --cov-report=term

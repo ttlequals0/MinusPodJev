@@ -16,8 +16,3 @@ services:
       # Optional fallback for direct callers only.
       # - TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-}
     restart: unless-stopped
-    volumes:
-      - jevproxy_data:/app/data
-
-volumes:
-  jevproxy_data:

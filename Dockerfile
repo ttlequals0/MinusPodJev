@@ -28,13 +28,6 @@ FROM python:3.11-slim AS backend-builder
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
-
 # Install uv, then the locked runtime deps into the system site-packages
 RUN pip install --no-cache-dir uv
 
@@ -53,7 +46,6 @@ FROM python:3.11-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
-    libpq5 \
     curl \
     nginx \
     supervisor \
@@ -70,8 +62,6 @@ COPY --from=backend-builder /usr/local/bin /usr/local/bin
 COPY --from=backend-builder /app/backend ./backend
 COPY --from=backend-builder /app/compat ./compat
 COPY --from=backend-builder /app/pyproject.toml ./
-COPY backend/alembic.ini ./backend/
-COPY backend/alembic ./backend/alembic
 
 # Copy frontend build
 COPY --from=frontend-builder /app/frontend/dist /usr/share/nginx/html
