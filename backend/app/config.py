@@ -63,16 +63,20 @@ class Settings(BaseSettings):
         default="sponsor", description="Category used when the category pass is off"
     )
 
-    # Sponsor lookup
-    MINUSPOD_SPONSORS_URL: str | None = Field(
+    # Sponsor lookup (MinusPod password login -> session cookies)
+    MINUSPOD_BASE_URL: str | None = Field(
         default=None,
-        description="Full URL of MinusPod's GET /sponsors; None uses the SEED_SPONSORS gazetteer",
+        description="MinusPod base URL (e.g. https://podsrv.ttlequals0.com); the proxy "
+        "derives /api/v1/auth/login and /api/v1/sponsors from it. None uses SEED_SPONSORS",
     )
-    MINUSPOD_API_TOKEN: str | None = Field(
-        default=None, description="Optional bearer token for the MinusPod sponsors call"
+    MINUSPOD_PASSWORD: str | None = Field(
+        default=None, description="Password for MinusPod's POST /api/v1/auth/login"
     )
     SPONSOR_CACHE_TTL_SECONDS: float = Field(
         default=3600.0, description="TTL of the cached MinusPod sponsor matcher in seconds"
+    )
+    MINUSPOD_SESSION_TTL_SECONDS: float = Field(
+        default=1800.0, description="How long to reuse a login session before re-logging-in"
     )
 
     # Database

@@ -1,5 +1,6 @@
-"""Tests for the sponsor matcher: live list, SEED fallback, TTL cache, and the
-jev-<7char> placeholder (no real network - the fetcher is monkeypatched)."""
+"""Tests for the sponsor matcher: cookie login, session reuse, 401 re-login, SEED
+fallback, TTL cache, and the jev-<7char> placeholder (no real network - the login
+and fetch seams are monkeypatched)."""
 
 import re
 
@@ -18,61 +19,143 @@ MOCK_LIST = {
 
 @pytest.fixture(autouse=True)
 def clean(monkeypatch):
-    """Fresh cache and default sponsor settings around every test."""
+    """Fresh cache/session and default sponsor settings around every test."""
     sponsors.reset_cache()
-    monkeypatch.setattr(settings, "MINUSPOD_SPONSORS_URL", None)
-    monkeypatch.setattr(settings, "MINUSPOD_API_TOKEN", None)
+    monkeypatch.setattr(settings, "MINUSPOD_BASE_URL", None)
+    monkeypatch.setattr(settings, "MINUSPOD_PASSWORD", None)
     monkeypatch.setattr(settings, "SPONSOR_CACHE_TTL_SECONDS", 3600.0)
+    monkeypatch.setattr(settings, "MINUSPOD_SESSION_TTL_SECONDS", 1800.0)
     yield
     sponsors.reset_cache()
 
 
+def _configure(monkeypatch):
+    monkeypatch.setattr(settings, "MINUSPOD_BASE_URL", "https://mp.test")
+    monkeypatch.setattr(settings, "MINUSPOD_PASSWORD", "pw")
+
+
+def _fake_login(counter=None):
+    def _login(base_url, password, timeout):
+        if counter is not None:
+            counter.append(base_url)
+        return {"session": "abc"}  # a fresh dict per login
+
+    return _login
+
+
 def _fake_fetch(payload=MOCK_LIST, counter=None):
-    def fetch(url, *, token, timeout):
+    def _fetch(url, cookies, timeout):
         if counter is not None:
             counter.append(url)
         return payload
 
-    return fetch
+    return _fetch
 
 
 def test_matched_sponsor_name_and_alias(monkeypatch):
-    monkeypatch.setattr(settings, "MINUSPOD_SPONSORS_URL", "https://mp.test/api/sponsors")
-    monkeypatch.setattr(sponsors, "fetch_sponsors_json", _fake_fetch())
+    _configure(monkeypatch)
+    monkeypatch.setattr(sponsors, "login", _fake_login())
+    monkeypatch.setattr(sponsors, "fetch_sponsors", _fake_fetch())
     assert sponsors.match_sponsor("try Zorptech today") == "Zorptech"  # name
     assert sponsors.match_sponsor("use Zorp Tech now") == "Zorptech"  # alias -> canonical
     assert sponsors.sponsor_for_span("grab some Quib later") == "Quibbly"  # alias via span
 
 
 def test_unmatched_span_gets_jev_placeholder(monkeypatch):
-    monkeypatch.setattr(settings, "MINUSPOD_SPONSORS_URL", "https://mp.test/api/sponsors")
-    monkeypatch.setattr(sponsors, "fetch_sponsors_json", _fake_fetch())
+    _configure(monkeypatch)
+    monkeypatch.setattr(sponsors, "login", _fake_login())
+    monkeypatch.setattr(sponsors, "fetch_sponsors", _fake_fetch())
     val = sponsors.sponsor_for_span("just a normal chat about the weather")
     assert re.fullmatch(r"jev-[a-z0-9]{7}", val)
     assert val != sponsors.sponsor_for_span("another unmatched span entirely")  # fresh per span
 
 
-def test_fallback_to_seed_on_fetch_error(monkeypatch):
-    monkeypatch.setattr(settings, "MINUSPOD_SPONSORS_URL", "https://mp.test/api/sponsors")
+def test_fallback_to_seed_when_unconfigured(monkeypatch):
+    login_calls: list[str] = []
+    fetch_calls: list[str] = []
+    monkeypatch.setattr(sponsors, "login", _fake_login(counter=login_calls))
+    monkeypatch.setattr(sponsors, "fetch_sponsors", _fake_fetch(counter=fetch_calls))
+    assert sponsors.match_sponsor("brought to you by Squarespace") == "Squarespace"  # seed name
+    assert login_calls == []  # unconfigured -> SEED path, never logs in
+    assert fetch_calls == []
 
-    def boom(url, *, token, timeout):
-        raise RuntimeError("network down")
 
-    monkeypatch.setattr(sponsors, "fetch_sponsors_json", boom)
+def test_fallback_to_seed_on_login_failure(monkeypatch):
+    _configure(monkeypatch)
+
+    def boom(base_url, password, timeout):
+        raise RuntimeError("login rate-limited (HTTP 429)")
+
+    monkeypatch.setattr(sponsors, "login", boom)
     assert sponsors.match_sponsor("go to BetterHelp for therapy") == "BetterHelp"  # seed name
 
 
-def test_fallback_to_seed_when_url_unset(monkeypatch):
-    calls: list[str] = []
-    monkeypatch.setattr(sponsors, "fetch_sponsors_json", _fake_fetch(counter=calls))
-    assert sponsors.match_sponsor("brought to you by Squarespace") == "Squarespace"
-    assert calls == []  # URL unset -> SEED path, fetcher never called
+def test_fallback_to_seed_on_fetch_error(monkeypatch):
+    _configure(monkeypatch)
+    monkeypatch.setattr(sponsors, "login", _fake_login())
+
+    def boom(url, cookies, timeout):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(sponsors, "fetch_sponsors", boom)
+    assert sponsors.match_sponsor("go to BetterHelp for therapy") == "BetterHelp"  # seed name
 
 
-def test_ttl_cache_fetches_once(monkeypatch):
-    monkeypatch.setattr(settings, "MINUSPOD_SPONSORS_URL", "https://mp.test/api/sponsors")
-    calls: list[str] = []
-    monkeypatch.setattr(sponsors, "fetch_sponsors_json", _fake_fetch(counter=calls))
+def test_session_reused_across_fetches(monkeypatch):
+    _configure(monkeypatch)
+    monkeypatch.setattr(settings, "SPONSOR_CACHE_TTL_SECONDS", 0.0)  # force a refetch each match
+    login_calls: list[str] = []
+    fetch_calls: list[str] = []
+    monkeypatch.setattr(sponsors, "login", _fake_login(counter=login_calls))
+    monkeypatch.setattr(sponsors, "fetch_sponsors", _fake_fetch(counter=fetch_calls))
     assert sponsors.match_sponsor("try Zorptech today") == "Zorptech"
     assert sponsors.match_sponsor("grab some Quib later") == "Quibbly"
-    assert len(calls) == 1  # second match served from the TTL cache
+    assert len(fetch_calls) == 2  # matcher cache disabled -> two fetches
+    assert len(login_calls) == 1  # session reused within TTL -> exactly one login
+
+
+def test_401_triggers_single_relogin_then_succeeds(monkeypatch):
+    _configure(monkeypatch)
+    login_calls: list[str] = []
+    monkeypatch.setattr(sponsors, "login", _fake_login(counter=login_calls))
+    fetch_calls: list[str] = []
+
+    def fetch(url, cookies, timeout):
+        fetch_calls.append(url)
+        if len(fetch_calls) == 1:
+            raise sponsors.SponsorAuthError("401")
+        return MOCK_LIST
+
+    monkeypatch.setattr(sponsors, "fetch_sponsors", fetch)
+    assert sponsors.match_sponsor("try Zorptech today") == "Zorptech"
+    assert len(login_calls) == 2  # initial login + exactly one re-login after 401
+    assert len(fetch_calls) == 2  # first GET 401s, the retry succeeds
+
+
+def test_401_relogin_failure_falls_back_to_seed(monkeypatch):
+    _configure(monkeypatch)
+    login_calls: list[str] = []
+
+    def login(base_url, password, timeout):
+        login_calls.append(base_url)
+        if len(login_calls) >= 2:
+            raise RuntimeError("re-login rate-limited (HTTP 429)")
+        return {"session": "abc"}
+
+    def fetch(url, cookies, timeout):
+        raise sponsors.SponsorAuthError("401")
+
+    monkeypatch.setattr(sponsors, "login", login)
+    monkeypatch.setattr(sponsors, "fetch_sponsors", fetch)
+    assert sponsors.match_sponsor("go to BetterHelp for therapy") == "BetterHelp"  # seed name
+    assert len(login_calls) == 2  # initial login + one re-login attempt, then SEED
+
+
+def test_matcher_ttl_fetches_once(monkeypatch):
+    _configure(monkeypatch)
+    fetch_calls: list[str] = []
+    monkeypatch.setattr(sponsors, "login", _fake_login())
+    monkeypatch.setattr(sponsors, "fetch_sponsors", _fake_fetch(counter=fetch_calls))
+    assert sponsors.match_sponsor("try Zorptech today") == "Zorptech"
+    assert sponsors.match_sponsor("grab some Quib later") == "Quibbly"
+    assert len(fetch_calls) == 1  # second match served from the TTL cache

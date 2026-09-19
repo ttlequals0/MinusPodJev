@@ -9,6 +9,8 @@ evaluated in parallel against the shared state.
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -16,6 +18,8 @@ import httpx
 
 from app.utils.cache import JsonCache
 from app.utils.spans import spans_from_probabilities
+
+logger = logging.getLogger(__name__)
 
 # $ per million input tokens (docs.typesafe.ai/models). Output is not billed.
 INPUT_COST_PER_MTOK = 0.042
@@ -106,11 +110,20 @@ def call_payload(
 ) -> dict[str, Any]:
     """POST the payload to the upstream endpoint and return the decoded body."""
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    start = time.monotonic()
     if client is not None:
         resp = client.post(url, json=payload, headers=headers)
     else:
         with httpx.Client(timeout=timeout) as own_client:
             resp = own_client.post(url, json=payload, headers=headers)
+    # URL, status, latency, and payload size only: never headers or the key.
+    logger.debug(
+        "jev upstream POST %s -> %d (%d questions) in %.0f ms",
+        url,
+        resp.status_code,
+        len(payload.get("questions", {})),
+        (time.monotonic() - start) * 1000,
+    )
     resp.raise_for_status()
     result: dict[str, Any] = resp.json()
     return result
@@ -160,10 +173,9 @@ def jev_ask(
 
 
 # --- Category second pass -------------------------------------------------
-# One upstream call per assembled span: a single state carrying the span's
-# segments plus a little context, and one noul per category. The argmax noul
-# is the span's category. Keyed c<index> so it never collides with the s<sid>
-# detection questions, and cached through the same JsonCache.
+# One call per span: the span's segments plus a little context, one noul per
+# category, argmax = the category. Keyed c<index> so it never collides with the
+# detection s<sid> questions; cached through the same JsonCache.
 
 CATEGORY_GUIDANCE = (
     "Each line of `transcript` is one segment around a single advertising "

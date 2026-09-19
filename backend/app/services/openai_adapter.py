@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from minuspod_compat import SEED_SPONSORS, SEGMENT_CATEGORIES, SPONSOR_PRIORITY_FIELDS
+from minuspod_compat import SEGMENT_CATEGORIES, SPONSOR_PRIORITY_FIELDS
 
 from app.services.jev import jev_ask, jev_category
 from app.services.sponsors import sponsor_for_span
@@ -29,10 +29,8 @@ _TS_LINE = re.compile(r"^\s*\[(\d+(?:\.\d+)?)s\s*-\s*(\d+(?:\.\d+)?)s\]\s?(.*)$"
 # segment_ids mode: [12] some text
 _ID_LINE = re.compile(r"^\s*\[(\d+)\]\s?(.*)$")
 
-# Review discriminator + candidate markers. MinusPod's ad_reviewer._build_user_prompt
-# always wraps the candidate ad in these markers (both accepted-pool review and
-# resurrection-pool), while detection's format_window_prompt never emits them, so
-# their presence in the user text is a robust review-vs-detection signal.
+# Candidate markers: ad_reviewer._build_user_prompt wraps every review candidate in
+# these; detection never emits them, so they tell a review request from detection.
 _REVIEW_START_MARK = ">>> CANDIDATE AD START ["
 _REVIEW_END_MARK = "<<< CANDIDATE AD END ["
 _REVIEW_START_RE = re.compile(r">>> CANDIDATE AD START \[(\d+(?:\.\d+)?)s\] >>>")
@@ -45,10 +43,9 @@ _REVIEW_BOUNDS_RE = re.compile(
 # must keep the segment rejected, not confirm a cut.
 _REVIEW_RESURRECT_MARK = "rejected for low confidence"
 
-# Fallback review signal: opening lines of MinusPod's DEFAULT_REVIEW_PROMPT and
-# DEFAULT_RESURRECT_PROMPT (database.py). Matched case-insensitively so a review
-# routes correctly even if the code-generated candidate markers ever change. The
-# detection prompt opens "Analyze this podcast transcript..." and carries neither.
+# Fallback signal (case-insensitive): opening lines of DEFAULT_REVIEW_PROMPT /
+# DEFAULT_RESURRECT_PROMPT, in case the candidate markers ever change. Detection
+# opens "Analyze this podcast transcript..." and matches neither.
 _REVIEW_SYSTEM_SIGNATURES = (
     "reviewing a candidate advertisement that has already been detected",
     "taking a second look at a segment that the validator already rejected",
@@ -118,18 +115,6 @@ def parse_transcript(text: str) -> tuple[list[dict[str, Any]], str]:
     if ids:
         return ids, "segment_ids"
     return [], "empty"
-
-
-def match_sponsor(text: str) -> str | None:
-    """First SEED_SPONSORS advertiser named in the text on a word-ish boundary."""
-    for entry in SEED_SPONSORS:
-        for term in [entry["name"], *entry.get("aliases", [])]:
-            if not term:
-                continue
-            pattern = rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])"
-            if re.search(pattern, text, re.IGNORECASE):
-                return entry["name"]
-    return None
 
 
 def _members(ordered: list[dict[str, Any]], start_id: int, end_id: int) -> list[dict[str, Any]]:
@@ -219,6 +204,7 @@ def run_chat_completion(
     probabilities: dict[str, float] = detection["probabilities"]
     input_tokens = int(detection["usage"]["input_tokens"])
     output_tokens = int(detection["usage"]["output_tokens"])
+    logger.info("detection: %d segments -> %d spans", len(segments), len(detection["spans"]))
 
     ordered = sorted(segments, key=lambda s: int(s["sid"]))
     categories = list(SEGMENT_CATEGORIES)
@@ -267,10 +253,11 @@ def run_chat_completion(
         # never drops a long span that named no sponsor.
         ad["reason"] = f"jev ad: {k}/{n} segments >= enter"
         ad["end_text"] = str(members[-1].get("text", ""))
-        # Always populate a sponsor: a real name when matched, else a unique
-        # jev-<7char> placeholder. An omitted field let MinusPod re-derive a
-        # sponsor from the reason string and cluster unnamed spans together.
-        ad[SPONSOR_PRIORITY_FIELDS[0]] = sponsor_for_span(span_text)
+        # Always populate sponsor: real name if matched, else a unique jev-<7char>.
+        # An empty field lets MinusPod mint one from the reason and cluster unnamed ads.
+        sponsor = sponsor_for_span(span_text)
+        ad[SPONSOR_PRIORITY_FIELDS[0]] = sponsor
+        logger.debug("sponsor: %s", sponsor)
         ads.append(ad)
 
     return _envelope(
@@ -279,14 +266,11 @@ def run_chat_completion(
 
 
 # --- Review route --------------------------------------------------------
-# MinusPod's ad_reviewer points its review model at this proxy. The review user
-# prompt marks one candidate ad inline with the CANDIDATE markers and 60s of
-# before/after context. We run Jev over the whole window and answer with the
-# ads-wrapped review schema (ad_reviewer.py:62-83): an empty array rejects the
-# candidate, one {is_ad,start,end,confidence,reason} object keeps it. MinusPod
-# derives its verdict from the boundary delta (ad_reviewer.py:1320-1387):
-# unchanged bounds -> "confirmed", moved bounds -> "adjust", empty -> "reject";
-# in the resurrection pool a non-empty answer is a "resurrect".
+# ad_reviewer sends one candidate ad (CANDIDATE markers + context). We run Jev
+# over the window and answer with its ads-wrapped schema (ad_reviewer.py:62-83):
+# empty array = reject, one {is_ad,start,end,confidence,reason} = keep. MinusPod
+# reads the verdict from the boundary delta; a non-empty resurrection answer
+# resurrects.
 
 
 def is_review_request(text: str, system_text: str = "") -> bool:
@@ -429,6 +413,7 @@ def run_review(
 
     if best_bounds is None:
         # No ad signal in the candidate region: reject / keep-rejected.
+        logger.info("review: verdict=reject (no overlapping span, pool=%s)", pool)
         return _envelope(echo_model, {"ads": []}, usage)
 
     ad_start, ad_end, confidence = best_bounds
@@ -444,4 +429,5 @@ def run_review(
         "confidence": confidence,
         "reason": f"jev review: candidate is advertising ({k}/{n} segments >= enter)",
     }
+    logger.info("review: verdict=keep %.1fs-%.1fs (pool=%s)", ad_start, ad_end, pool)
     return _envelope(echo_model, {"ads": [verdict]}, usage)

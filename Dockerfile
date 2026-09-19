@@ -35,18 +35,18 @@ RUN apt-get update && apt-get install -y \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Poetry
-RUN pip install --no-cache-dir poetry==1.7.1
+# Install uv, then the locked runtime deps into the system site-packages
+RUN pip install --no-cache-dir uv
 
-# Copy poetry files
-COPY pyproject.toml poetry.lock* ./
+COPY pyproject.toml uv.lock ./
 
-# Configure poetry and install dependencies
-RUN poetry config virtualenvs.create false \
-    && poetry install --no-interaction --no-ansi --no-root --only main
+# Export locked deps (no dev group, not the project itself) and pip-install them
+RUN uv export --frozen --no-dev --no-emit-project > requirements.txt \
+    && pip install --no-cache-dir -r requirements.txt
 
-# Copy backend source
+# Copy backend source and the vendored compat package the app imports at runtime
 COPY backend/ ./backend/
+COPY compat/ ./compat/
 
 # Stage 3: Final Production Image
 FROM python:3.11-slim
@@ -66,8 +66,9 @@ WORKDIR /app
 COPY --from=backend-builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=backend-builder /usr/local/bin /usr/local/bin
 
-# Copy backend application
+# Copy backend application and the vendored compat package
 COPY --from=backend-builder /app/backend ./backend
+COPY --from=backend-builder /app/compat ./compat
 COPY --from=backend-builder /app/pyproject.toml ./
 COPY backend/alembic.ini ./backend/
 COPY backend/alembic ./backend/alembic

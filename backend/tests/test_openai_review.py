@@ -192,7 +192,7 @@ def test_dedupe_overlapping_context_and_candidate_lines():
     segs = parse_review_segments(prompt)
     starts = [s["start"] for s in segs]
     assert starts == sorted(starts)
-    assert len(segs) == len(set((s["start"], s["end"], s["text"]) for s in segs))
+    assert len(segs) == len({(s["start"], s["end"], s["text"]) for s in segs})
     assert [s["sid"] for s in segs] == list(range(len(segs)))
 
 

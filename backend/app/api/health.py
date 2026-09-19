@@ -2,6 +2,7 @@
 Health check endpoints.
 """
 
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -10,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.database import get_db
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -43,11 +46,12 @@ async def readiness_check(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
             "environment": settings.ENVIRONMENT,
             "version": settings.APP_VERSION,
         }
-    except Exception as e:
+    except Exception:
+        # Log the detail server-side; do not leak it to the caller.
+        logger.exception("readiness check failed")
         return {
             "status": "not_ready",
             "database": "disconnected",
-            "error": str(e),
             "environment": settings.ENVIRONMENT,
             "version": settings.APP_VERSION,
         }

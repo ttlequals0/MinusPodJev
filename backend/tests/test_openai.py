@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 from app.config import settings
-from app.services.openai_adapter import extract_user_text, match_sponsor, parse_transcript
+from app.services.openai_adapter import extract_user_text, parse_transcript
 from minuspod_compat import (
     AD_DETECTION_JSON_SCHEMA,
     format_window_prompt,
@@ -97,20 +97,7 @@ def test_extract_user_text_last_user_message():
     assert extract_user_text(messages) == "the transcript"
 
 
-# ---------------- sponsor gazetteer ----------------
-
-
-def test_match_sponsor_hits_seed_and_alias():
-    assert match_sponsor("go to BetterHelp for therapy") == "BetterHelp"
-    assert match_sponsor("try Better Help today") == "BetterHelp"  # alias
-    assert match_sponsor("AG1 greens powder") == "Athletic Greens"  # alias -> canonical
-    assert match_sponsor("just a normal conversation about trees") is None
-
-
-def test_match_sponsor_respects_word_boundary():
-    # "Ring" is a seed; a substring inside another word must not match.
-    assert match_sponsor("the bell was ringing loudly") is None
-    assert match_sponsor("install a Ring doorbell") == "Ring"
+# sponsor matching now lives in app.services.sponsors; see test_sponsors.py
 
 
 # ---------------- endpoint round trips ----------------

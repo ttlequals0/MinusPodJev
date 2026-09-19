@@ -10,6 +10,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege default for GITHUB_TOKEN; jobs that need more set their own.
+permissions:
+  contents: read
+
 env:
   # Docker Registry Configuration
   # Update these variables for your Docker registry
@@ -47,31 +51,20 @@ jobs:
       with:
         python-version: '3.11'
 
-    - name: Install Poetry
-      run: |
-        python -m pip install --upgrade pip
-        python -m pip install poetry==1.7.1
-        python -m poetry config virtualenvs.create true
-        python -m poetry config virtualenvs.in-project true
-
-    - name: Cache dependencies
-      uses: actions/cache@v4
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
       with:
-        path: |
-          .venv
-          ~/.cache/pypoetry
-        key: ${{ runner.os }}-poetry-${{ hashFiles('poetry.lock') }}
+        enable-cache: true
 
     - name: Install dependencies
-      run: |
-        poetry install --with dev
+      run: uv sync --frozen
 
     - name: Run tests with coverage
       env:
         DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_webapp
         TESTING: "true"
       run: |
-        poetry run pytest backend/tests/ --cov=backend/app --cov-report=xml:coverage.xml --cov-report=term
+        uv run pytest backend/tests/ --cov=backend/app --cov-report=xml:coverage.xml --cov-report=term
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
@@ -132,30 +125,19 @@ jobs:
       with:
         python-version: '3.11'
 
-    - name: Install linters
-      run: |
-        python -m pip install --upgrade pip
-        pip install ruff==0.8.3 mypy==1.13.0
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      run: uv sync --frozen
 
     - name: Run Ruff
-      run: |
-        ruff check backend/ --output-format=github
-      continue-on-error: true
-
-    - name: Install Poetry for MyPy
-      run: |
-        python -m pip install poetry==1.7.1
-        python -m poetry config virtualenvs.create true
-        python -m poetry config virtualenvs.in-project true
-
-    - name: Install dependencies for MyPy
-      run: |
-        poetry install --with dev
+      run: uv run ruff check backend/ --output-format=github
 
     - name: Run MyPy
-      run: |
-        poetry run mypy backend/app/ --ignore-missing-imports
-      continue-on-error: true
+      run: uv run mypy backend/app/ --ignore-missing-imports
 
   # Dependency Security Check
   dependency-check:

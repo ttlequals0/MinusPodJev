@@ -1,66 +1,23 @@
 version: '3.8'
 
 services:
-  webapp:
-    # Replace with your Docker image name
-    image: your-username/your-app-name:latest
-    container_name: webapp
+  jevproxy:
+    build: .
+    container_name: jevproxy
     ports:
       - "8080:8080"
     environment:
-      # Database settings
-      - DATABASE_TYPE=postgresql
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_USER=webapp_user
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-change_me_in_production}
-      - POSTGRES_DB=webapp_db
-
-      # Application settings
-      - ENVIRONMENT=${ENVIRONMENT:-production}
-      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
-      - WORKERS=${WORKERS:-2}
-
-      # TypeSafe Jev upstream. The key normally rides in per request as the
-      # bearer token (MinusPod's provider api_key); set it here only as a
-      # fallback for direct callers.
-      - TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-}
-      - TYPESAFE_API_URL=${TYPESAFE_API_URL:-https://api.typesafe.ai/v1/systemone}
-
-      # Sponsor lookup: the proxy calls MinusPod's own API to name sponsors.
-      # MINUSPOD_API_TOKEN is MinusPod's API key, not the TypeSafe key.
-      - MINUSPOD_SPONSORS_URL=${MINUSPOD_SPONSORS_URL:-}
-      - MINUSPOD_API_TOKEN=${MINUSPOD_API_TOKEN:-}
-
-      # CORS settings
-      - CORS_ORIGINS=${CORS_ORIGINS:-["http://localhost:8080"]}
-    depends_on:
-      postgres:
-        condition: service_healthy
+      # MinusPod, so the proxy can name sponsors from the live sponsor list.
+      # MINUSPOD_PASSWORD is MinusPod's login password (the proxy logs in for a
+      # session cookie), not the TypeSafe key. The TypeSafe key rides in per
+      # request as the OpenAI bearer token, so it is not set here.
+      - MINUSPOD_BASE_URL=${MINUSPOD_BASE_URL:-}
+      - MINUSPOD_PASSWORD=${MINUSPOD_PASSWORD:-}
+      # Optional fallback for direct callers only.
+      # - TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-}
     restart: unless-stopped
     volumes:
-      - webapp_logs:/app/logs
-      - webapp_data:/app/data
-
-  postgres:
-    image: postgres:15-alpine
-    container_name: webapp_postgres
-    environment:
-      - POSTGRES_USER=webapp_user
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-change_me_in_production}
-      - POSTGRES_DB=webapp_db
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U webapp_user -d webapp_db"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
+      - jevproxy_data:/app/data
 
 volumes:
-  postgres_data:
-  webapp_logs:
-  webapp_data:
+  jevproxy_data:
