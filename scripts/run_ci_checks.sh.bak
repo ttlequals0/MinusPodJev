@@ -1,0 +1,302 @@
+#!/bin/bash
+set -e
+
+# Run CI checks locally - mimics GitHub Actions workflows
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Track overall status
+EXIT_CODE=0
+
+# Script directory
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# CI tools virtual environment
+CI_VENV="$PROJECT_ROOT/.ci-venv"
+
+# Helper functions
+print_section() {
+    echo -e "\n${BLUE}PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP${NC}"
+    echo -e "${YELLOW}$1${NC}"
+    echo -e "${BLUE}PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP${NC}\n"
+}
+
+print_success() {
+    echo -e "${GREEN} $1${NC}"
+}
+
+print_error() {
+    echo -e "${RED} $1${NC}"
+}
+
+print_warning() {
+    echo -e "${YELLOW}� $1${NC}"
+}
+
+run_check() {
+    local name=$1
+    local command=$2
+    echo -e "${YELLOW}Running: $name${NC}"
+    if eval "$command"; then
+        print_success "$name passed"
+    else
+        print_error "$name failed"
+        EXIT_CODE=1
+        return 1
+    fi
+    return 0
+}
+
+# Parse arguments
+SKIP_TESTS=false
+SKIP_LINT=false
+SKIP_DOCKER=true
+AUTO_FIX=true
+FRONTEND_ONLY=false
+BACKEND_ONLY=false
+USE_POSTGRES=false
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --skip-tests) SKIP_TESTS=true; shift ;;
+    --skip-lint) SKIP_LINT=true; shift ;;
+    --include-docker) SKIP_DOCKER=false; shift ;;
+    --no-auto-fix) AUTO_FIX=false; shift ;;
+    --frontend-only) FRONTEND_ONLY=true; shift ;;
+    --backend-only) BACKEND_ONLY=true; shift ;;
+    --postgres) USE_POSTGRES=true; shift ;;
+    -h|--help)
+      echo "Usage: $0 [OPTIONS]"
+      echo ""
+      echo "Options:"
+      echo "  --skip-tests      Skip running tests"
+      echo "  --skip-lint       Skip linting checks"
+      echo "  --include-docker  Include Docker build test"
+      echo "  --no-auto-fix     Disable automatic fixes for ESLint and Ruff"
+      echo "  --frontend-only   Run only frontend checks"
+      echo "  --backend-only    Run only backend checks"
+      echo "  --postgres        Use PostgreSQL for tests"
+      echo "  -h, --help        Show this help message"
+      exit 0 ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Use -h or --help for usage information"
+      exit 1 ;;
+  esac
+done
+
+# Main script
+print_section "Python Web App Template CI Checks"
+
+# Check prerequisites
+print_section "Checking Prerequisites"
+
+cd "$PROJECT_ROOT"
+
+# Check Python
+if ! command -v python3 &> /dev/null; then
+    print_error "Python 3 is not installed"
+    exit 1
+else
+    print_success "Python $(python3 --version | cut -d' ' -f2) found"
+fi
+
+# Check Poetry
+if ! command -v poetry &> /dev/null; then
+    print_error "Poetry is not installed. Please install it: https://python-poetry.org/docs/#installation"
+    exit 1
+else
+    print_success "Poetry $(poetry --version | cut -d' ' -f3) found"
+fi
+
+# Check Node.js
+if ! command -v node &> /dev/null; then
+    print_error "Node.js is not installed"
+    exit 1
+else
+    print_success "Node.js $(node --version) found"
+fi
+
+# Setup CI virtual environment
+if [ ! -f "$CI_VENV/bin/activate" ]; then
+    echo -e "${YELLOW}Creating CI tools virtual environment...${NC}"
+    python3 -m venv "$CI_VENV"
+fi
+
+source "$CI_VENV/bin/activate"
+python -m pip install --upgrade pip --quiet
+
+# Backend Tests
+if [ "$SKIP_TESTS" = false ] && [ "$FRONTEND_ONLY" = false ]; then
+    print_section "Backend Tests"
+
+    cd "$PROJECT_ROOT"
+    if [ ! -d ".venv" ]; then
+        echo "Installing backend dependencies..."
+        poetry install --with dev
+    fi
+
+    # Setup PostgreSQL if requested
+    POSTGRES_CONTAINER=""
+    if [ "$USE_POSTGRES" = true ]; then
+        echo -e "${YELLOW}Starting PostgreSQL container for tests...${NC}"
+
+        if ! command -v docker &> /dev/null; then
+            print_error "Docker is required for PostgreSQL tests"
+            exit 1
+        fi
+
+        POSTGRES_CONTAINER="webapp-test-db-$$"
+        docker run -d \
+            --name "$POSTGRES_CONTAINER" \
+            -e POSTGRES_USER=test_user \
+            -e POSTGRES_PASSWORD=test_password \
+            -e POSTGRES_DB=test_webapp \
+            -p 5432:5432 \
+            postgres:15-alpine > /dev/null 2>&1
+
+        echo -e "${YELLOW}Waiting for PostgreSQL...${NC}"
+        sleep 5
+
+        export DATABASE_URL="postgresql://test_user:test_password@localhost:5432/test_webapp"
+        export TESTING="true"
+        print_success "PostgreSQL test database started"
+    else
+        export TESTING="true"
+        print_success "Using SQLite for tests"
+    fi
+
+    run_check "Backend tests with coverage" "poetry run pytest --cov=backend/app --cov-report=term"
+
+    if [ -n "$POSTGRES_CONTAINER" ]; then
+        docker rm -f "$POSTGRES_CONTAINER" > /dev/null 2>&1
+        print_success "PostgreSQL test database stopped"
+    fi
+
+    cd "$PROJECT_ROOT"
+fi
+
+# Frontend Build & Type Check
+if [ "$SKIP_TESTS" = false ] && [ "$BACKEND_ONLY" = false ]; then
+    print_section "Frontend Type Check & Build"
+
+    cd "$PROJECT_ROOT/frontend"
+    if [ ! -d "node_modules" ]; then
+        echo "Installing frontend dependencies..."
+        npm ci
+    fi
+
+    run_check "Frontend TypeScript check" "npm run type-check"
+    run_check "Frontend build" "npm run build"
+
+    cd "$PROJECT_ROOT"
+fi
+
+# Python Linting
+if [ "$SKIP_LINT" = false ] && [ "$FRONTEND_ONLY" = false ]; then
+    print_section "Python Linting"
+
+    echo "Installing linting tools..."
+    python -m pip install --quiet ruff==0.8.3 mypy==1.13.0
+
+    cd "$PROJECT_ROOT"
+    if [ ! -d ".venv" ]; then
+        poetry install --with dev
+    fi
+
+    # Black - Check only (formatting handled by pre-commit)
+    echo -e "\n${YELLOW}Black Code Formatting${NC}"
+    run_check "Black formatting" "poetry run black --check backend/"
+
+    # Ruff
+    echo -e "\n${YELLOW}Ruff Linting${NC}"
+    SAVED_EXIT_CODE=$EXIT_CODE
+
+    if ! run_check "Ruff" "\"$CI_VENV/bin/ruff\" check backend/"; then
+        if [ "$AUTO_FIX" = true ]; then
+            echo -e "${YELLOW}Auto-fixing Ruff issues...${NC}"
+            "$CI_VENV/bin/ruff" check backend/ --fix
+            AUTO_FIXES_APPLIED+=("Ruff")
+            EXIT_CODE=$SAVED_EXIT_CODE
+            print_success "Ruff auto-fixed"
+        fi
+    fi
+
+    # MyPy
+    echo -e "\n${YELLOW}MyPy Type Checking${NC}"
+    run_check "MyPy" "poetry run mypy backend/app/ --ignore-missing-imports"
+
+    cd "$PROJECT_ROOT"
+fi
+
+# Frontend Linting
+if [ "$SKIP_LINT" = false ] && [ "$BACKEND_ONLY" = false ]; then
+    print_section "Frontend Linting"
+
+    cd "$PROJECT_ROOT/frontend"
+    if [ ! -d "node_modules" ]; then
+        npm ci
+    fi
+
+    # ESLint
+    SAVED_EXIT_CODE=$EXIT_CODE
+
+    if ! run_check "ESLint" "npm run lint"; then
+        if [ "$AUTO_FIX" = true ]; then
+            echo -e "${YELLOW}Auto-fixing ESLint issues...${NC}"
+            npm run lint -- --fix
+            AUTO_FIXES_APPLIED+=("ESLint")
+            EXIT_CODE=$SAVED_EXIT_CODE
+            print_success "ESLint auto-fixed"
+        fi
+    fi
+
+    # Prettier - Check only (formatting handled by pre-commit)
+    run_check "Prettier formatting" "npm run format:check"
+
+    cd "$PROJECT_ROOT"
+fi
+
+# Docker Build Test
+if [ "$SKIP_DOCKER" = false ]; then
+    print_section "Docker Build Test"
+
+    if command -v docker &> /dev/null; then
+        run_check "Docker build" "docker build -f Dockerfile -t webapp-template:ci-test ."
+        docker rmi webapp-template:ci-test 2>/dev/null || true
+    else
+        print_warning "Docker not installed. Skipping Docker build test."
+    fi
+fi
+
+# Summary
+print_section "CI Check Summary"
+
+if [ $EXIT_CODE -eq 0 ]; then
+    print_success "All CI checks passed! ("
+else
+    print_error "Some CI checks failed. Please fix the issues above."
+    if [ "$AUTO_FIX" = false ]; then
+        echo -e "${YELLOW}Tip: Remove --no-auto-fix to automatically fix some issues${NC}"
+    fi
+fi
+
+# Show auto-fixes summary
+if [ ${#AUTO_FIXES_APPLIED[@]} -gt 0 ]; then
+    echo -e "\n${YELLOW}Auto-fixes applied (ESLint and Ruff only):${NC}"
+    for fix in "${AUTO_FIXES_APPLIED[@]}"; do
+        echo -e "  ${GREEN}${NC} $fix"
+    done
+    echo -e "\n${YELLOW}Please review the changes and commit if they look good.${NC}"
+    echo -e "${YELLOW}Note: Black and Prettier formatting are handled by pre-commit hooks.${NC}"
+fi
+
+deactivate 2>/dev/null || true
+
+exit $EXIT_CODE

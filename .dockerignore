@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+.venv/
+.env
+env/
+venv/
+ENV/
+.ci-venv/
+
+# Poetry
+.venv/
+
+# Testing
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+coverage.xml
+
+# Frontend
+node_modules/
+frontend/dist/
+frontend/node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Docker
+.dockerignore
+docker-compose*.yml
+Dockerfile*
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.circleci/
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment files
+.env
+.env.*
+!.env.example
+jev-benchmark-archive-2026-09-19.zip

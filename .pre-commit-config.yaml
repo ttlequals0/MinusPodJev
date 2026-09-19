@@ -1,0 +1,29 @@
+repos:
+  # Basic file fixes that always succeed
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  # Python formatting with Black (always fixable)
+  - repo: https://github.com/psf/black
+    rev: 24.10.0
+    hooks:
+      - id: black
+        files: ^backend/
+        language_version: python3
+
+  # Frontend formatting with Prettier (always fixable)
+  - repo: local
+    hooks:
+      - id: prettier-frontend
+        name: Prettier Frontend
+        entry: sh -c 'cd frontend && npm run format'
+        language: system
+        files: ^frontend/.*\.(ts|tsx|css|js|jsx|json|md)$
+        pass_filenames: false
+        require_serial: true

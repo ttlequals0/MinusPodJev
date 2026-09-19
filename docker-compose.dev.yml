@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  # Backend development service
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: backend-builder
+    container_name: webapp_backend_dev
+    command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./backend:/app/backend
+      - ./pyproject.toml:/app/pyproject.toml
+      - ./poetry.lock:/app/poetry.lock
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_TYPE=postgresql
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=dev_user
+      - POSTGRES_PASSWORD=dev_password
+      - POSTGRES_DB=dev_webapp_db
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - SECRET_KEY=dev-secret-key-not-for-production
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Frontend development service
+  frontend:
+    image: node:20-alpine
+    container_name: webapp_frontend_dev
+    working_dir: /app
+    command: sh -c "npm install && npm run dev"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    environment:
+      - NODE_ENV=development
+
+  # PostgreSQL database
+  postgres:
+    image: postgres:15-alpine
+    container_name: webapp_postgres_dev
+    environment:
+      - POSTGRES_USER=dev_user
+      - POSTGRES_PASSWORD=dev_password
+      - POSTGRES_DB=dev_webapp_db
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dev_user -d dev_webapp_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Optional: Adminer for database management
+  adminer:
+    image: adminer:latest
+    container_name: webapp_adminer
+    ports:
+      - "8081:8080"
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_dev_data:

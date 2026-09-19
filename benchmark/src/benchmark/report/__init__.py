@@ -1,0 +1,195 @@
+"""Render Markdown report from calls.jsonl + episode_results.jsonl + corpus."""
+from __future__ import annotations
+
+import logging
+
+from pathlib import Path
+
+from .. import pricing
+from ..corpus import Episode
+from ..storage import read_jsonl
+from .aggregate import (
+    _aggregate,
+    _dedup_last_write_wins,
+    campaign_mixing,
+    _json_format_summary,
+)
+from .charts import (
+    _render_accuracy_latency,
+    _render_agreement_chart,
+    _render_alignment_chart,
+    _render_boundary_chart,
+    _render_calibration_chart,
+    _render_cost_split_chart,
+    _render_compliance,
+    _render_detection_bucket_chart,
+    _render_episode_heatmap,
+    _render_latency_tail_chart,
+    _render_pareto,
+    _render_parser_stress_chart,
+    _render_precision_recall_chart,
+    _render_token_efficiency_chart,
+    _render_trial_variance_chart,
+)
+from .sections import (
+    _build_toc,
+    _render_accuracy_breakdown,
+    _render_boundary_accuracy,
+    _render_calibration_table,
+    _render_charts_section,
+    _render_cost_breakdown,
+    _render_cross_model_agreement,
+    _render_deprecated,
+    _render_detection_buckets,
+    _render_failures,
+    _render_how_to_read,
+    _render_latency_tail,
+    _render_methodology,
+    _render_parser_stress,
+    _render_per_episode_detail,
+    _render_per_model_detail,
+    _render_quick_comparison,
+    _render_run_metadata,
+    _render_tldr,
+    _render_token_efficiency,
+    _render_transcript_source,
+    _render_trial_variance,
+)
+
+
+
+logger = logging.getLogger(__name__)
+
+def render(
+    *,
+    cfg,
+    episodes: list[Episode],
+    calls_path: Path,
+    episode_results_path: Path,
+    pricing_snapshot: pricing.PricingSnapshot,
+    output_path: Path,
+    assets_dir: Path,
+    prompt_source: str = "live",
+    addressing_mode: str = "timestamps",
+    include_jev: bool = False,
+    jev_passes: int = 1,
+) -> None:
+    """Render results/report.md from calls.jsonl.
+
+    ``addressing_mode`` isolates the report to one addressing scheme: calls
+    are filtered to records whose ``addressing_mode`` field (missing on every
+    call written before this field existed, which defaults to 'timestamps')
+    matches. A store holding both timestamps- and segment_ids-mode calls
+    never blends them into one set of numbers; run twice with each mode to
+    get two separate reports.
+    """
+    title = "# MinusPod LLM Benchmark Report"
+    if addressing_mode != "timestamps":
+        title += f" (addressing mode: {addressing_mode})"
+
+    all_calls = list(read_jsonl(calls_path))
+    raw_calls = [r for r in all_calls if r.get("addressing_mode", "timestamps") == addressing_mode]
+    if not raw_calls:
+        run_hint = "benchmark run" + ("" if addressing_mode == "timestamps" else f" --addressing-mode {addressing_mode}")
+        mode_note = "" if addressing_mode == "timestamps" else f" for addressing mode '{addressing_mode}'"
+        output_path.write_text(f"{title}\n\nNo benchmark data yet{mode_note}. Run `{run_hint}` first.\n")
+        return
+    mixed = campaign_mixing(raw_calls)
+    if mixed:
+        logger.warning(
+            "calls.jsonl holds more than one campaign: %d work units across %d models carry "
+            "two prompt hashes. Dedup keeps the last row per unit regardless of prompt, so "
+            "any unit not re-run this campaign still shows the older result. Run "
+            "`benchmark rotate-raw` between campaigns.",
+            sum(mixed.values()), len(mixed),
+        )
+    calls = _dedup_last_write_wins(raw_calls)
+
+    by_model, extras = _aggregate(calls, episodes, pricing_snapshot=pricing_snapshot)
+    deprecated_ids = {m.id for m in cfg.models if m.deprecated}
+    active = {mid: s for mid, s in by_model.items() if mid not in deprecated_ids}
+    if include_jev:
+        from .. import jev as jev_mod
+        try:
+            jev_mod.merge_into_stats(
+                active, episodes, cache_path=calls_path.parent / "jev_cache.json",
+                passes=jev_passes)
+        except KeyError as exc:
+            logger.warning("jev rows skipped: %s", exc)
+    deprecated = {mid: s for mid, s in by_model.items() if mid in deprecated_ids}
+
+    extras_active = extras.without(deprecated_ids)
+    calls_active = calls if not deprecated_ids else [r for r in calls if r["model"] not in deprecated_ids]
+
+    stale = sum(1 for r in calls_active if r.get("windows_stale"))
+    if stale:
+        logger.warning(
+            "%d scored call(s) are marked windows_stale: they ran against "
+            "windows that changed afterward. Re-run those units before "
+            "trusting the affected models' numbers.", stale,
+        )
+
+    sections = [
+        _render_how_to_read(episodes),
+        _render_tldr(active, episodes),
+        _render_charts_section(active),
+        _render_failures(calls_active),
+        _render_accuracy_breakdown(active),
+        _render_boundary_accuracy(active),
+        _render_calibration_table(extras_active.calibration),
+        _render_latency_tail(active),
+        _render_token_efficiency(active),
+        _render_cost_breakdown(active),
+        _render_trial_variance(active),
+        _render_cross_model_agreement(extras_active.agreement, active, episodes),
+        _render_detection_buckets(extras_active.detection_buckets),
+        _render_quick_comparison(active, episodes),
+        "---",
+        "## Detailed Results",
+        _render_per_model_detail(active),
+        _render_per_episode_detail(active, episodes),
+        _render_parser_stress(active),
+    ]
+    if deprecated:
+        sections.append(_render_deprecated(deprecated))
+    sections += [
+        _render_methodology(cfg, episodes, pricing_snapshot=pricing_snapshot),
+        _render_transcript_source(),
+        _render_run_metadata(
+            calls, pricing_snapshot=pricing_snapshot, raw_calls=raw_calls,
+            prompt_source=prompt_source, addressing_mode=addressing_mode,
+        ),
+    ]
+
+    body = "\n\n".join(s for s in sections if s) + "\n"
+    toc = _build_toc(body)
+    output_path.write_text(title + "\n\n" + toc + "\n\n" + body)
+
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    _render_pareto(active, assets_dir / "pareto.svg")
+    _render_accuracy_latency(active, assets_dir / "accuracy_latency.svg")
+    _render_cost_split_chart(active, assets_dir / "cost_split.svg")
+    _render_compliance(active, assets_dir / "compliance.svg")
+    _render_episode_heatmap(active, episodes, assets_dir / "episodes.svg")
+    _render_calibration_chart(extras_active.calibration, assets_dir / "calibration.svg")
+    _render_latency_tail_chart(active, assets_dir / "latency_tail.svg")
+    _render_agreement_chart(extras_active.agreement, len(active), assets_dir / "agreement.svg")
+    _render_alignment_chart(extras_active.agreement, len(active), assets_dir / "alignment.svg")
+    _render_precision_recall_chart(active, assets_dir / "precision_recall.svg")
+    _render_boundary_chart(active, assets_dir / "boundary.svg")
+    _render_token_efficiency_chart(active, assets_dir / "token_efficiency.svg")
+    _render_trial_variance_chart(active, assets_dir / "trial_variance.svg")
+    _render_detection_bucket_chart(
+        extras_active.detection_buckets, "length",
+        ["short (<30s)", "medium (30-90s)", "long (>=90s)"],
+        "Detection rate by ad length (rows sorted by overall detection rate, descending)",
+        assets_dir / "detection_by_length.svg",
+    )
+    _render_detection_bucket_chart(
+        extras_active.detection_buckets, "position",
+        ["pre-roll (<10%)", "mid-roll (10-90%)", "post-roll (>90%)"],
+        "Detection rate by ad position (rows sorted by overall detection rate, descending)",
+        assets_dir / "detection_by_position.svg",
+    )
+    _render_parser_stress_chart(active, assets_dir / "parser_stress.svg")
+

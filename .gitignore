@@ -1,0 +1,96 @@
+MinusPod/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+/lib/
+/lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Ruff
+.ruff_cache/
+
+# Additional items for web app
+.ci-venv/
+poetry.lock
+uv.lock
+node_modules/
+frontend/dist/
+frontend/build/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+data/
+logs/
+docker-compose.override.yml
+jev_cache.json
+.DS_Store
+.idea/
+*.tsbuildinfo
+jev-benchmark-archive-2026-09-19.zip
+
+# --- benchmark data: override the broad proxy-scaffold rules above ---
+# Keep the corpus, caches, rendered reports, and the full raw call logs so the
+# benchmark is reproducible from a clone.
+!benchmark/data/
+!benchmark/data/**
+!benchmark/results/
+!benchmark/results/**
+# junk the broad re-include above would otherwise pull back in
+benchmark/.venv/
+benchmark/results/archive/
+.DS_Store

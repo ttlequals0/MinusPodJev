@@ -1,0 +1,345 @@
+name: Main Branch CI/CD
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+
+# Cancel in-progress runs when new commits are pushed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Docker Registry Configuration
+  # Update these variables for your Docker registry
+  REGISTRY: docker.io
+  # Replace with your Docker Hub username/organization and image name
+  IMAGE_NAME: ${{ vars.DOCKER_IMAGE_NAME || 'your-username/your-app-name' }}
+
+jobs:
+  # Backend Tests
+  backend-tests:
+    runs-on: ubuntu-latest
+    name: Backend Tests
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_webapp
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Poetry
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install poetry==1.7.1
+        python -m poetry config virtualenvs.create true
+        python -m poetry config virtualenvs.in-project true
+
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          .venv
+          ~/.cache/pypoetry
+        key: ${{ runner.os }}-poetry-${{ hashFiles('poetry.lock') }}
+
+    - name: Install dependencies
+      run: |
+        poetry install --with dev
+
+    - name: Run tests with coverage
+      env:
+        DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_webapp
+        TESTING: "true"
+      run: |
+        poetry run pytest backend/tests/ --cov=backend/app --cov-report=xml:coverage.xml --cov-report=term
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        file: ./coverage.xml
+        flags: backend
+        name: backend-coverage
+      continue-on-error: true
+
+  # Frontend Tests
+  frontend-tests:
+    runs-on: ubuntu-latest
+    name: Frontend Tests
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Install dependencies
+      run: |
+        cd frontend
+        npm ci
+
+    - name: Run TypeScript check
+      run: |
+        cd frontend
+        npm run type-check
+
+    - name: Run linting
+      run: |
+        cd frontend
+        npm run lint
+
+    - name: Build frontend
+      run: |
+        cd frontend
+        npm run build
+
+  # Linting - Python
+  python-lint:
+    runs-on: ubuntu-latest
+    name: Python Linting
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install linters
+      run: |
+        python -m pip install --upgrade pip
+        pip install ruff==0.8.3 mypy==1.13.0
+
+    - name: Run Ruff
+      run: |
+        ruff check backend/ --output-format=github
+      continue-on-error: true
+
+    - name: Install Poetry for MyPy
+      run: |
+        python -m pip install poetry==1.7.1
+        python -m poetry config virtualenvs.create true
+        python -m poetry config virtualenvs.in-project true
+
+    - name: Install dependencies for MyPy
+      run: |
+        poetry install --with dev
+
+    - name: Run MyPy
+      run: |
+        poetry run mypy backend/app/ --ignore-missing-imports
+      continue-on-error: true
+
+  # Dependency Security Check
+  dependency-check:
+    runs-on: ubuntu-latest
+    name: Dependency Security Check
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Audit npm dependencies
+      run: |
+        cd frontend
+        npm audit --json > npm-audit.json || true
+        if [ -s npm-audit.json ]; then
+          echo "::warning::npm audit found vulnerabilities"
+          cat npm-audit.json | jq '.vulnerabilities' || echo "jq not available"
+        fi
+
+  # Docker Build (runs in parallel with tests)
+  docker-build:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    name: Docker Build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      registry-creds: ${{ steps.creds.outputs.available }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    # Registry credentials are optional: with them the image is pushed by
+    # digest; without them the image is only built as a validation step.
+    - name: Detect registry credentials
+      id: creds
+      run: echo "available=${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
+
+    - name: Log in to Docker Hub
+      if: steps.creds.outputs.available == 'true'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Build (validation only, no registry credentials)
+      if: steps.creds.outputs.available != 'true'
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./Dockerfile
+        platforms: ${{ matrix.platform }}
+        push: false
+        build-args: |
+          BUILDTIME=${{ fromJSON('{"timestamp":""}').timestamp || github.event.head_commit.timestamp }}
+          VERSION=${{ github.ref_name }}
+          REVISION=${{ github.sha }}
+        provenance: false
+
+    - name: Build and push by digest
+      if: steps.creds.outputs.available == 'true'
+      id: build
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./Dockerfile
+        platforms: ${{ matrix.platform }}
+        outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+        # Use registry cache for better performance
+        cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+        cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+        build-args: |
+          BUILDTIME=${{ fromJSON('{"timestamp":""}').timestamp || github.event.head_commit.timestamp }}
+          VERSION=${{ github.ref_name }}
+          REVISION=${{ github.sha }}
+        provenance: false
+
+    - name: Export digest
+      if: steps.creds.outputs.available == 'true'
+      run: |
+        mkdir -p /tmp/digests
+        digest="${{ steps.build.outputs.digest }}"
+        touch "/tmp/digests/${digest#sha256:}"
+
+    - name: Upload digest
+      if: steps.creds.outputs.available == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+        path: /tmp/digests/*
+        if-no-files-found: error
+        retention-days: 1
+
+  # Docker Push (only after all tests pass, and only with registry credentials)
+  docker-push:
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) &&
+      needs.docker-build.outputs.registry-creds == 'true'
+    runs-on: ubuntu-latest
+    needs: [backend-tests, frontend-tests, python-lint, docker-build]
+    name: Docker Push
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Download digests
+      uses: actions/download-artifact@v4
+      with:
+        path: /tmp/digests
+        pattern: digests-*
+        merge-multiple: true
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=tag
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=semver,pattern={{major}}
+          type=sha,prefix={{branch}}-,format=short
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Create manifest list and push
+      working-directory: /tmp/digests
+      run: |
+        docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+          $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+    - name: Inspect image
+      run: |
+        docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+
+    - name: Send webhook notification (optional)
+      if: vars.WEBHOOK_URL != ''
+      uses: distributhor/workflow-webhook@v3
+      env:
+        webhook_url: ${{ secrets.WEBHOOK_URL }}
+        webhook_secret: ${{ secrets.WEBHOOK_SECRET }}
+      continue-on-error: true
+
+  # All checks passed
+  ci-success:
+    runs-on: ubuntu-latest
+    needs: [backend-tests, frontend-tests, python-lint, dependency-check, docker-push]
+    if: always()
+    name: CI Success
+    steps:
+    - name: Check status
+      run: |
+        if [ "${{ contains(needs.*.result, 'failure') }}" == "true" ]; then
+          echo "One or more jobs failed"
+          exit 1
+        else
+          echo "All CI checks passed!"
+        fi
