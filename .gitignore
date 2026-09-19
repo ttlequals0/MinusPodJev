@@ -62,7 +62,6 @@ dmypy.json
 # Additional items for web app
 .ci-venv/
 poetry.lock
-uv.lock
 node_modules/
 frontend/dist/
 frontend/build/

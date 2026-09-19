@@ -6,7 +6,6 @@ __pycache__/
 *.egg-info/
 .venv/
 .pytest_cache/
-uv.lock
 
 # Local backups created during destructive ops (e.g. dropping an episode).
 results/raw/*.bak*
