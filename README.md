@@ -141,18 +141,22 @@ and [API documentation](https://docs.typesafe.ai/api) for the current upstream c
 bearer token nor `TYPESAFE_API_KEY` is rejected with 503. When a fallback key is configured,
 a bearer token is still required unless `JEV_ALLOW_UNAUTHENTICATED_FALLBACK=true`.
 
-Jev review remains available when routed to the proxy, but it is correlated with Jev detection
-and is not an independent judgment. It uses coarse segment context and parses word timing
-separately. The focused evidence NouL question adds an upstream call unless cached.
-`JEV_REVIEW_REFINE_BOUNDARIES=false` disables optional word-boundary refinement by default. Set it
-to `true` when provided word times should refine boundaries; the proxy handles Jev's 255-option
-Choice limit without truncating the supplied options. `GET /api/status` reports effective review
-settings: enabled state, model, evidence threshold, and Choice threshold. Enabled does not
-guarantee refinement: both word-timing edges, sufficient evidence, and confident Choice answers
-are required. Review logs include request ID, stage, evidence score and threshold, word counts,
-Choice confidence, and skip or failure reason. An inconclusive review returns 422 with
+Jev review is correlated with Jev detection, not an independent judgment. It uses coarse context and
+separate word timing. Evidence NouL adds an upstream call unless cached.
+
+`JEV_REVIEW_REFINE_BOUNDARIES=false` disables word-boundary refinement by default. Set it to `true` to use
+supplied word times; the proxy handles Jev's 255-option Choice limit without truncating options.
+`GET /api/status` reports effective enabled state, model, evidence threshold, and Choice threshold.
+Enabled does not guarantee refinement: both word-timing edges, sufficient evidence, and confident
+Choice answers are required.
+
+Review logs include request ID, stage, evidence score and threshold, word counts, Choice
+confidence, and skip or failure reason. An inconclusive start selection stops before end selection.
+An inconclusive review returns 422 with
 `x-should-retry: false` and does not confirm or move the candidate. An upstream or invalid-upstream
-review error returns 503.
+review error returns 503. Diagnostics identify invalid-upstream validation failures but do not
+repair the response.
+
 MinusPod's local breaker still counts non-rate errors. Sponsor naming: set `MINUSPOD_BASE_URL` +
 `MINUSPOD_PASSWORD` and the proxy logs into MinusPod (cached session) to read
 `GET /api/v1/sponsors`. It emits `sponsor_name` only for one known sponsor with local ad
@@ -254,19 +258,16 @@ uv run pytest backend/tests -q   # upstream calls mocked; no network
 - `GET /api/status` reports whether Jev and MinusPod are reachable and whether a MinusPod
   session is active, using cheap probes only (no billable Jev call, no login), so it is safe
   to poll. `GET /api/health` is liveness.
-- `GET /api/stats` is available immediately after startup. It reports one process's proxy and
-  upstream-attempt counts, latency, cache activity, uptime, and an estimated input cost. It
-  resets on restart and is not a container-wide total when multiple workers are configured. The
-  configured-worker field is an optional environment hint, not a discovered worker count.
-  Proxy handling time is request receipt to response headers, not full MinusPod round-trip time.
-  Jev timing is per upstream HTTP attempt, including retries. Estimated cost includes only
-  successful uncached calls with valid upstream input-token usage. Cache hits do not call Jev; failed cache
-  fetches are cache misses.
+- `GET /api/stats` is available immediately after startup. It reports process-scoped proxy and
+  upstream counts, latency, cache activity, uptime, configured workers, and estimated input cost.
+  It resets on restart and is not container-wide with multiple workers. Proxy timing runs from
+  request receipt to response headers; Jev timing covers each upstream HTTP attempt, including
+  retries. Estimated cost includes only successful uncached calls with valid input-token usage.
+  Cache hits do not call Jev; failed fetches are cache misses.
 - Logs go to stdout at `LOG_LEVEL` (`DEBUG` for verbose tracing). The TypeSafe key, MinusPod
   password, session cookies, and Authorization header are never logged.
   Review validation failures log a fixed rule and stage with numeric expected/actual option counts
-  and probability totals, without upstream payloads. If start-word selection is inconclusive,
-  refinement stops instead of issuing an end-selection request.
+  and probability totals, without upstream payloads.
 - The included status page calls `/api/health`, `/api/status`, `/api/settings`, and `/api/stats`
   directly. It reports live reachability and performs no inference or MinusPod login.
 
