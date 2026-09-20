@@ -24,6 +24,7 @@ flowchart TD
   subgraph proxyapi["Proxy API"]
     health["Health API<br/>[health.py]"]
     status["Status API<br/>[status.py]"]
+    stats["Stats API<br/>[status.py]"]
     nativejev["Native Jev API<br/>[jev.py]"]
     openai["OpenAI API<br/>[openai.py]"]
   end
@@ -46,8 +47,9 @@ flowchart TD
   chatmodel["Chat Model"]
   mpapi["MinusPod API"]
 
-  statuspage -->|polls health| health
-  statuspage -->|polls status| status
+  statuspage -->|loads and Refresh| health
+  statuspage -->|loads and Refresh| status
+  statuspage -->|polls every 5 s| stats
   status -->|probes Jev| typesafe
   status -->|probes MinusPod| mpapi
 
@@ -77,7 +79,7 @@ flowchart TD
   classDef pipec fill:#fde9c8,stroke:#d97706,color:#7c2d12
   classDef enrichc fill:#d1fae5,stroke:#10b981,color:#065f46
   classDef statusc fill:#fee2e2,stroke:#ef4444,color:#991b1b
-  class health,status,nativejev,openai proxyc
+  class health,status,stats,nativejev,openai proxyc
   class adapter,category,spans,jevclient pipec
   class cache,sponsors,gazetteer enrichc
   class statuspage statusc
@@ -107,7 +109,8 @@ Endpoints:
   (with and without `/v1`); routes detection/verification/review by prompt
 - `GET /v1/models`, `GET /models` - advertise `typesafe/jev`
 - `POST /api/v1/jev/ask` - native segments-in, spans-out
-- `GET /api/status`, `GET /api/health`, `GET /api/docs`
+- `GET /api/status`, `GET /api/health`, `GET /api/stats`
+- `GET /api/docs` when `PRODUCTION=false`
 
 ### Pointing MinusPod at it (settings only, no app-code change)
 
@@ -149,9 +152,9 @@ it as rationale. Unset `MINUSPOD_BASE_URL` falls back to the gazetteer.
 ### MinusPod runtime ownership
 
 Jev Proxy is a POC shim. It does not change the MinusPod runtime that controls holds,
-autoapproval, or verification logs. `compat/minuspod_compat` is an import-free snapshot used
-only for offline validation. Keep production operations in the existing MinusPod application
-until Jev is mature.
+autoapproval, or verification logs. `compat/minuspod_compat` is a vendored snapshot used by the
+production proxy and offline benchmarks. Keep production operations in the existing MinusPod
+application until Jev is mature.
 
 ### Request safety and cache
 
@@ -207,19 +210,20 @@ uv run pytest backend/tests -q   # upstream calls mocked; no network
   upstream-attempt counts, latency, cache activity, uptime, and an estimated input cost. It
   resets on restart and is not a container-wide total when multiple workers are configured. The
   configured-worker field is an optional environment hint, not a discovered worker count.
-  Proxy handling time is receive-to-response, not full MinusPod round-trip time; Jev timing is
-  per upstream HTTP attempt, including retries. Estimated cost includes only successful uncached
-  calls with valid upstream input-token usage. Cache hits do not call Jev; failed cache
+  Proxy handling time is request receipt to response headers, not full MinusPod round-trip time.
+  Jev timing is per upstream HTTP attempt, including retries. Estimated cost includes only
+  successful uncached calls with valid upstream input-token usage. Cache hits do not call Jev; failed cache
   fetches are cache misses.
 - Logs go to stdout at `LOG_LEVEL` (`DEBUG` for verbose tracing). The TypeSafe key, MinusPod
   password, session cookies, and Authorization header are never logged.
-- The included status page uses `/api/health` and `/api/status` directly. It reports live
-  reachability and performs no inference or MinusPod login.
+- The included status page calls `/api/health`, `/api/status`, and `/api/stats` directly. It
+  reports live reachability and performs no inference or MinusPod login.
 
 ### Status page
 
-Served at the proxy root (`http://<proxy>:8080/`), with an Overview and a Runtime stats view
-and a manual Refresh.
+Served at the proxy root (`http://<proxy>:8080/`), with an Overview and a Runtime stats view.
+Runtime stats refresh every 5 seconds. Manual Refresh probes health and status; after a successful
+probe, it refreshes stats.
 
 ![Jev Proxy status page](assets/status-page.png)
 
@@ -228,7 +232,7 @@ and a manual Refresh.
 - **Runtime stats** - process-scoped counters from `/api/stats`: proxy calls, average proxy
   handling time, Jev HTTP attempts, average Jev round-trip, cache hit rate, estimated input
   cost, process uptime, and configured workers. Counters reset when the process restarts and
-  are per worker, not a container-wide total.
+  are per process, not a container-wide total.
 
 ### Docker Compose exposure
 
