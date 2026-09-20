@@ -9,7 +9,9 @@ import httpx
 import pytest
 from app.config import Settings, settings
 from app.services.jev import (
+    JevReviewValidationError,
     _retry_after_seconds,
+    _review_answers,
     build_payload,
     call_payload,
     estimate_cost_usd,
@@ -24,6 +26,25 @@ ANSWER_BODY: dict[str, Any] = {
     "answers": {"s1": {"noul": 0.98}, "junk": {"noul": 0.5}},
     "usage": {"input_tokens": 1000, "output_tokens": 5},
 }
+
+REVIEW_QUESTIONS = {
+    "evidence": {"type": "noul"},
+    "start_0": {"type": "choice", "criteria": {"unknown": "none", "w0": "word"}},
+}
+
+
+def _valid_review_body() -> dict[str, Any]:
+    return {
+        "answers": {
+            "evidence": {"noul": 0.96},
+            "start_0": {
+                "choice": "w0",
+                "confidence": 0.94,
+                "probabilities": {"unknown": 0.1, "w0": 0.9},
+            },
+        },
+        "usage": {"input_tokens": 3, "output_tokens": 2},
+    }
 
 
 def _store_cache_entry(cache_path: str, payload: dict[str, Any]) -> None:
@@ -51,6 +72,120 @@ def test_parse_response_keeps_noul_answers_and_usage():
     assert entry["probabilities"] == {"s1": 0.98}
     assert entry["input_tokens"] == 1000
     assert entry["output_tokens"] == 5
+
+
+def test_review_validation_error_exposes_only_fixed_rule_and_numeric_details():
+    body = _valid_review_body()
+    body["answers"]["start_0"]["probabilities"] = {"unknown": 0.2, "w0": 0.2}
+    with pytest.raises(JevReviewValidationError) as raised:
+        _review_answers(body, REVIEW_QUESTIONS)
+    error = raised.value
+    assert error.code == "jev_upstream_invalid_response"
+    assert error.rule == "choice_probability_sum"
+    assert error.numeric_details == {"expected_total": 1.0, "actual_total": 0.4, "tolerance": 1e-6}
+    assert "unknown" not in str(error)
+
+
+def test_review_validation_allowlist_and_confidence_are_independent():
+    error = JevReviewValidationError(
+        "not-a-rule", {"unexpected": 1, "actual_count": 2}
+    )
+    assert error.rule == "response_object"
+    assert error.numeric_details == {"actual_count": 2}
+
+    body = _valid_review_body()
+    body["answers"]["start_0"]["confidence"] = 0.1
+    assert _review_answers(body, REVIEW_QUESTIONS)["answers"]["start_0"]["confidence"] == 0.1
+
+
+@pytest.mark.parametrize(
+    ("body", "rule"),
+    [
+        (None, "response_object"),
+        ({"answers": {}}, "answers_keys"),
+        ({"answers": {"evidence": {"noul": float("nan")}, "start_0": {}}}, "evidence_probability"),
+        (
+            {
+                "answers": {
+                    "evidence": {"noul": 0.9},
+                    "start_0": {"choice": "w0", "confidence": 0.9},
+                }
+            },
+            "choice_answer_shape",
+        ),
+        (
+            {
+                "answers": {
+                    "evidence": {"noul": 0.9},
+                    "start_0": {
+                        "choice": "w0",
+                        "confidence": 0.9,
+                        "probabilities": {"w0": 1.0},
+                    },
+                }
+            },
+            "choice_probability_keys",
+        ),
+        (
+            {
+                "answers": {
+                    "evidence": {"noul": 0.9},
+                    "start_0": {
+                        "choice": "w0",
+                        "confidence": float("inf"),
+                        "probabilities": {"unknown": 0.1, "w0": 0.9},
+                    },
+                }
+            },
+            "choice_confidence",
+        ),
+        (
+            {
+                "answers": {
+                    "evidence": {"noul": 0.9},
+                    "start_0": {
+                        "choice": "unknown",
+                        "confidence": 0.9,
+                        "probabilities": {"unknown": 0.1, "w0": 0.9},
+                    },
+                }
+            },
+            "choice_winner",
+        ),
+    ],
+)
+def test_review_validation_reports_malformed_rules(body, rule):
+    with pytest.raises(JevReviewValidationError) as raised:
+        _review_answers(body, REVIEW_QUESTIONS)
+    assert raised.value.code == "jev_upstream_invalid_response"
+    assert raised.value.rule == rule
+    assert all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in raised.value.numeric_details.values())
+
+
+def test_review_validation_reports_usage_rule_without_echoing_value():
+    body = _valid_review_body()
+    body["usage"]["input_tokens"] = "secret-like-invalid-value"
+    with pytest.raises(JevReviewValidationError) as raised:
+        _review_answers(body, REVIEW_QUESTIONS)
+    assert raised.value.rule == "usage_input_tokens"
+    assert "secret-like" not in str(raised.value)
+
+
+def test_review_validation_reports_choice_criteria_shape():
+    body = _valid_review_body()
+    questions = {**REVIEW_QUESTIONS, "start_0": {"type": "choice", "criteria": []}}
+    with pytest.raises(JevReviewValidationError) as raised:
+        _review_answers(body, questions)
+    assert raised.value.rule == "choice_criteria_object"
+
+
+@pytest.mark.parametrize("usage", [[], False, 0, ""])
+def test_review_validation_reports_usage_object_shape(usage):
+    body = _valid_review_body()
+    body["usage"] = usage
+    with pytest.raises(JevReviewValidationError) as raised:
+        _review_answers(body, REVIEW_QUESTIONS)
+    assert raised.value.rule == "usage_object"
 
 
 @pytest.mark.parametrize("value", [True, float("nan"), float("inf")])

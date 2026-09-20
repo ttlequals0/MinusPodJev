@@ -7,6 +7,35 @@ import threading
 import time
 from typing import Any
 
+_REVIEW_OUTCOMES = (
+    "confirmed",
+    "adjusted",
+    "rejected",
+    "inconclusive",
+    "upstream_error",
+    "invalid_request",
+    "internal_error",
+)
+_REVIEW_REASON_CODES = (
+    "ambiguous_spans",
+    "insufficient_evidence",
+    "choice_inconclusive",
+    "malformed_context",
+    "invalid_choice",
+    "upstream_failure",
+    "upstream_invalid_response",
+    "invalid_request",
+    "internal_error",
+    "unknown",
+)
+_REFINEMENT_SKIP_REASONS = (
+    "disabled",
+    "missing_word_timings",
+    "insufficient_evidence",
+    "ambiguous_spans",
+    "no_overlapping_span",
+)
+
 
 class RuntimeMetrics:
     def __init__(self) -> None:
@@ -18,6 +47,14 @@ class RuntimeMetrics:
             self._started_at = time.monotonic()
             self._proxy = self._empty_timing()
             self._jev = self._empty_timing()
+            self._review = self._empty_timing()
+            self._review_outcomes = dict.fromkeys(_REVIEW_OUTCOMES, 0)
+            self._review_reasons = dict.fromkeys(_REVIEW_REASON_CODES, 0)
+            self._review_refinement = dict.fromkeys(
+                ("attempted", "completed", "changed", "unchanged", "inconclusive", "upstream_error"),
+                0,
+            )
+            self._review_refinement_skipped = dict.fromkeys(_REFINEMENT_SKIP_REASONS, 0)
             self._cache_hits = 0
             self._cache_misses = 0
             self._estimated_input_usd = 0.0
@@ -58,6 +95,34 @@ class RuntimeMetrics:
             else:
                 self._cache_misses += 1
 
+    def record_review(
+        self, outcome: str, duration_ms: float, reason_code: str | None = None
+    ) -> None:
+        with self._lock:
+            safe_outcome = outcome if outcome in _REVIEW_OUTCOMES else "internal_error"
+            safe_reason = reason_code if reason_code in _REVIEW_REASON_CODES else "unknown"
+            self._record(self._review, duration_ms, safe_outcome not in {"upstream_error", "internal_error"})
+            self._review_outcomes[safe_outcome] += 1
+            self._review_reasons[safe_reason] += 1
+
+    def record_review_refinement(
+        self,
+        event: str,
+        *,
+        skip_reason: str | None = None,
+        changed: bool | None = None,
+    ) -> None:
+        with self._lock:
+            if event == "attempted":
+                self._review_refinement["attempted"] += 1
+            elif event == "completed":
+                self._review_refinement["completed"] += 1
+                self._review_refinement["changed" if changed else "unchanged"] += 1
+            elif event in {"inconclusive", "upstream_error"}:
+                self._review_refinement[event] += 1
+            elif event == "skipped" and skip_reason in _REFINEMENT_SKIP_REASONS:
+                self._review_refinement_skipped[skip_reason] += 1
+
     @staticmethod
     def _latency(timing: dict[str, float | int | None]) -> dict[str, float | int]:
         count = int(timing["count"] or 0)
@@ -97,6 +162,24 @@ class RuntimeMetrics:
                     "failure": int(self._jev["failure"] or 0),
                     "unknown_usage": self._unknown_usage,
                     "latency_ms": self._latency(self._jev),
+                },
+                "review": {
+                    "count": int(self._review["count"] or 0),
+                    "outcomes": dict(self._review_outcomes),
+                    "reasons": dict(self._review_reasons),
+                    "latency_ms": self._latency(self._review),
+                    "refinement": {
+                        "attempted": int(self._review_refinement["attempted"]),
+                        "completed": int(self._review_refinement["completed"]),
+                        "changed": int(self._review_refinement["changed"]),
+                        "unchanged": int(self._review_refinement["unchanged"]),
+                        "inconclusive": int(self._review_refinement["inconclusive"]),
+                        "upstream_error": int(self._review_refinement["upstream_error"]),
+                        "skipped": {
+                            reason: int(self._review_refinement_skipped[reason])
+                            for reason in _REFINEMENT_SKIP_REASONS
+                        },
+                    },
                 },
                 "cache": {"hits": self._cache_hits, "misses": self._cache_misses},
                 "cost": {"estimated_input_usd": self._estimated_input_usd},

@@ -57,6 +57,26 @@ async def test_status_both_configured_and_reachable(client: AsyncClient, monkeyp
     assert "://" not in data["jev"]["url"] and "/" not in data["jev"]["url"]
 
 
+@pytest.mark.parametrize("refine_boundaries", [False, True])
+async def test_status_reports_effective_review_settings(client: AsyncClient, monkeypatch, refine_boundaries):
+    monkeypatch.setattr(settings, "JEV_REVIEW_REFINE_BOUNDARIES", refine_boundaries)
+    monkeypatch.setattr(settings, "JEV_MODEL", "jev-test-model")
+    monkeypatch.setattr(settings, "JEV_ENTER", 0.9137)
+    monkeypatch.setattr(status, "_probe", _probe_all_reachable)
+    monkeypatch.setattr(sponsors, "has_active_session", lambda: False)
+
+    response = await client.get("/api/status")
+
+    assert response.json()["review"] == {
+        "refine_boundaries": refine_boundaries,
+        "model": "jev-test-model",
+        "detection_threshold": 0.9137,
+        "detection_stay_threshold": 0.4,
+        "evidence_threshold": 0.9137,
+        "choice_threshold": 0.9137,
+    }
+
+
 async def test_status_minuspod_unconfigured(client: AsyncClient, monkeypatch):
     monkeypatch.setattr(settings, "MINUSPOD_BASE_URL", None)
     monkeypatch.setattr(settings, "MINUSPOD_PASSWORD", None)

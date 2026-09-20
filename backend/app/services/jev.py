@@ -24,6 +24,78 @@ from app.utils.spans import spans_from_probabilities
 
 logger = logging.getLogger(__name__)
 
+
+class JevReviewValidationError(ValueError):
+    """Safe, machine-readable validation failure for a review response."""
+
+    code = "jev_upstream_invalid_response"
+    _RULES = frozenset(
+        {
+            "response_object",
+            "answers_object",
+            "answers_keys",
+            "answer_object",
+            "evidence_probability",
+            "choice_criteria_object",
+            "choice_criteria_empty",
+            "choice_answer_shape",
+            "choice_confidence",
+            "choice_probability",
+            "choice_probability_keys",
+            "choice_probability_sum",
+            "choice_winner",
+            "usage_object",
+            "usage_input_tokens",
+            "usage_output_tokens",
+        }
+    )
+    _DETAILS = frozenset(
+        {
+            "expected_count",
+            "actual_count",
+            "actual",
+            "expected_total",
+            "actual_total",
+            "tolerance",
+            "selected_probability",
+            "max_probability",
+        }
+    )
+
+    def __init__(self, rule: str, numeric_details: dict[str, int | float] | None = None):
+        self.rule = rule if rule in self._RULES else "response_object"
+        self.numeric_details = self._safe_details(numeric_details or {})
+        super().__init__(f"upstream review response validation failed: {self.rule}")
+
+    @classmethod
+    def _safe_details(cls, details: dict[str, int | float]) -> dict[str, int | float]:
+        safe: dict[str, int | float] = {}
+        for name, value in details.items():
+            if name not in cls._DETAILS:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if isinstance(value, int):
+                safe[name] = value
+                continue
+            try:
+                numeric = float(value)
+            except (OverflowError, TypeError, ValueError):
+                continue
+            if math.isfinite(numeric):
+                safe[name] = numeric
+        return safe
+
+
+def _finite_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
 # $ per million input tokens (docs.typesafe.ai/models). Output is not billed.
 INPUT_COST_PER_MTOK = 0.042
 
@@ -88,7 +160,11 @@ def build_payload(
 
 def parse_response(body: dict[str, Any]) -> dict[str, Any]:
     """Normalize an upstream reply into cache-entry shape."""
+    if not isinstance(body, dict):
+        raise ValueError("upstream response must be an object")
     answers = body.get("answers") or {}
+    if not isinstance(answers, dict):
+        raise ValueError("upstream answers must be an object")
     probs: dict[str, float] = {}
     for key, ans in answers.items():
         if not key.startswith("s") or not isinstance(ans, dict):
@@ -97,6 +173,8 @@ def parse_response(body: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
             probs[key] = float(value)
     usage = body.get("usage") or {}
+    if not isinstance(usage, dict):
+        raise ValueError("upstream usage must be an object")
     return {
         "probabilities": probs,
         "input_tokens": _usage_tokens(usage, "input_tokens"),
@@ -235,14 +313,14 @@ def _usage_tokens(usage: dict[str, Any], key: str) -> int:
     value = usage.get(key, 0)
     if value is None:
         return 0
-    if (
-        not isinstance(value, (int, float))
-        or isinstance(value, bool)
-        or not math.isfinite(value)
-        or value < 0
-        or int(value) != value
-    ):
-        raise ValueError(f"upstream usage.{key} must be a non-negative integer")
+    valid = False
+    if isinstance(value, int) and not isinstance(value, bool):
+        valid = value >= 0
+    elif isinstance(value, float):
+        valid = math.isfinite(value) and value >= 0 and int(value) == value
+    if not valid:
+        rule = "usage_input_tokens" if key == "input_tokens" else "usage_output_tokens"
+        raise JevReviewValidationError(rule)
     return int(value)
 
 
@@ -330,6 +408,155 @@ def jev_ask(
         },
         "estimated_cost_usd": estimate_cost_usd(input_tokens),
         "spans": spans_from_probabilities(segments, probabilities, enter=enter, stay=stay),
+    }
+
+
+def _review_answers(body: dict[str, Any], questions: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Validate a mixed NouL/Choice review reply before it can enter the cache."""
+    if not isinstance(body, dict):
+        raise JevReviewValidationError("response_object")
+    answers = body.get("answers")
+    expected_keys = set(questions)
+    if not isinstance(answers, dict):
+        raise JevReviewValidationError("answers_object")
+    if set(answers) != expected_keys:
+        raise JevReviewValidationError(
+            "answers_keys",
+            {"expected_count": len(expected_keys), "actual_count": len(answers)},
+        )
+    parsed: dict[str, Any] = {}
+    for key, answer in answers.items():
+        if not isinstance(answer, dict):
+            raise JevReviewValidationError("answer_object")
+        if key == "evidence":
+            value = answer.get("noul")
+            numeric = _finite_float(value)
+            if numeric is None or not 0 <= numeric <= 1:
+                details = {"actual": numeric} if numeric is not None else None
+                raise JevReviewValidationError("evidence_probability", details)
+            parsed[key] = numeric
+            continue
+        criteria = questions[key].get("criteria")
+        if not isinstance(criteria, dict):
+            raise JevReviewValidationError("choice_criteria_object")
+        if not criteria:
+            raise JevReviewValidationError(
+                "choice_criteria_empty", {"expected_count": 1, "actual_count": 0}
+            )
+        choice = answer.get("choice")
+        confidence = answer.get("confidence")
+        probabilities = answer.get("probabilities")
+        if not isinstance(choice, str) or not isinstance(probabilities, dict):
+            raise JevReviewValidationError("choice_answer_shape")
+        confidence_numeric = _finite_float(confidence)
+        if confidence_numeric is None or not 0 <= confidence_numeric <= 1:
+            details = {"actual": confidence_numeric} if confidence_numeric is not None else None
+            raise JevReviewValidationError("choice_confidence", details)
+        parsed_probs: dict[str, float] = {}
+        for option, value in probabilities.items():
+            numeric = _finite_float(value)
+            if not isinstance(option, str) or numeric is None or not 0 <= numeric <= 1:
+                details = {"actual": numeric} if numeric is not None else None
+                raise JevReviewValidationError("choice_probability", details)
+            parsed_probs[option] = numeric
+        if set(parsed_probs) != set(criteria) or choice not in parsed_probs:
+            raise JevReviewValidationError(
+                "choice_probability_keys",
+                {"expected_count": len(criteria), "actual_count": len(parsed_probs)},
+            )
+        total = math.fsum(parsed_probs.values())
+        if abs(total - 1.0) > 1e-6:
+            raise JevReviewValidationError(
+                "choice_probability_sum",
+                {"expected_total": 1.0, "actual_total": total, "tolerance": 1e-6},
+            )
+        winner = max(parsed_probs.values())
+        if parsed_probs[choice] != winner:
+            raise JevReviewValidationError(
+                "choice_winner",
+                {"selected_probability": parsed_probs[choice], "max_probability": winner},
+            )
+        parsed[key] = {
+            "choice": choice,
+            "confidence": confidence_numeric,
+            "probabilities": parsed_probs,
+        }
+    usage = body.get("usage", {})
+    if usage is None:
+        usage = {}
+    elif not isinstance(usage, dict):
+        raise JevReviewValidationError("usage_object")
+    return {
+        "answers": parsed,
+        "input_tokens": _usage_tokens(usage, "input_tokens"),
+        "output_tokens": _usage_tokens(usage, "output_tokens"),
+    }
+
+
+def jev_review_questions(
+    *,
+    state: dict[str, Any],
+    questions: dict[str, dict[str, Any]],
+    url: str,
+    api_key: str,
+    timeout: float,
+    cache_path: str,
+    model: str,
+    uid: str | None = None,
+    max_retries: int = 2,
+    retry_after_max: float = 5.0,
+    request_deadline: float = 75.0,
+    deadline_at: float | None = None,
+    cache_max_entries: int = 10_000,
+    fetcher: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Evaluate focused review questions through the validated shared cache."""
+    end = deadline_at if deadline_at is not None else time.monotonic() + request_deadline
+    full_state = dict(state)
+    if uid is not None:
+        full_state["uid"] = uid
+    payload = {"state": full_state, "model": model, "questions": questions}
+    cache = JsonCache(cache_path, max_entries=cache_max_entries)
+    send = fetcher or call_payload
+
+    def _fetch() -> dict[str, Any]:
+        metrics.record_cache(False)
+        kwargs: dict[str, Any] = {"url": url, "api_key": api_key, "timeout": timeout, "max_retries": max_retries}
+        if fetcher is None:
+            kwargs.update(retry_after_max=retry_after_max, deadline_at=end)
+        return _review_answers(send(payload, **kwargs), questions)
+
+    def _valid(entry: dict[str, Any]) -> bool:
+        if not isinstance(entry.get("input_tokens"), int) or isinstance(entry.get("input_tokens"), bool) or entry["input_tokens"] < 0:
+            return False
+        if not isinstance(entry.get("output_tokens"), int) or isinstance(entry.get("output_tokens"), bool) or entry["output_tokens"] < 0:
+            return False
+        answers = entry.get("answers")
+        if not isinstance(answers, dict) or set(answers) != set(questions):
+            return False
+        normalized = {"answers": {}, "usage": {"input_tokens": entry.get("input_tokens"), "output_tokens": entry.get("output_tokens")}}
+        for key, value in answers.items():
+            if key == "evidence" and isinstance(value, (int, float)) and not isinstance(value, bool):
+                normalized["answers"][key] = {"noul": value}
+            elif key != "evidence" and isinstance(value, dict):
+                normalized["answers"][key] = value
+            else:
+                return False
+        try:
+            _review_answers(normalized, questions)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    entry, hit = cache.get_or_fetch(payload, _fetch, valid=_valid)
+    if hit:
+        metrics.record_cache(True)
+    if time.monotonic() > end:
+        raise httpx.TimeoutException("Jev request deadline exceeded")
+    return {
+        "answers": entry["answers"],
+        "cache_hit": hit,
+        "usage": {"input_tokens": int(entry["input_tokens"]), "output_tokens": int(entry["output_tokens"])},
     }
 
 

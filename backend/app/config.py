@@ -4,7 +4,7 @@ Application configuration module.
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     # Application
     APP_NAME: str = Field(default="Jev Proxy", description="Application name")
-    APP_VERSION: str = Field(default="0.1.0", description="Application version")
+    APP_VERSION: str = Field(default="0.1.4", description="Application version")
     APP_DESCRIPTION: str = Field(
         default="Thin HTTP proxy around the TypeSafe Jev System One endpoint",
         description="Application description",
@@ -73,10 +73,40 @@ class Settings(BaseSettings):
         default=4, ge=1, description="Maximum simultaneous upstream requests per worker"
     )
     JEV_ENTER: float = Field(
-        default=0.95, description="Span-open probability threshold (noul >= enter)"
+        default=0.95,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        description="Span-open probability threshold (noul >= enter)",
     )
     JEV_STAY: float = Field(
-        default=0.40, description="Span-extend probability threshold (noul >= stay)"
+        default=0.40,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        description="Span-extend probability threshold (noul >= stay)",
+    )
+    JEV_REVIEW_EVIDENCE_THRESHOLD: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        description="Review evidence threshold; defaults to JEV_ENTER",
+    )
+    JEV_REVIEW_CHOICE_THRESHOLD: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        description="Review Choice threshold; defaults to JEV_ENTER",
+    )
+    JEV_SETTINGS_PATH: str = Field(
+        default="./data/runtime-settings.json",
+        description="Atomic persistent file for runtime threshold settings",
+    )
+    JEV_REVIEW_REFINE_BOUNDARIES: bool = Field(
+        default=False,
+        description="Use Jev Choice questions and supplied word timings to refine review boundaries",
     )
     JEV_CATEGORY_PASS: bool = Field(
         default=True, description="Run the per-span category second pass"
@@ -91,7 +121,7 @@ class Settings(BaseSettings):
     # Sponsor lookup (MinusPod password login -> session cookies)
     MINUSPOD_BASE_URL: str | None = Field(
         default=None,
-        description="MinusPod base URL (e.g. https://podsrv.ttlequals0.com); the proxy "
+        description="MinusPod base URL (e.g. https://example.com); the proxy "
         "derives /api/v1/auth/login and /api/v1/sponsors from it. None uses SEED_SPONSORS",
     )
     MINUSPOD_PASSWORD: str | None = Field(
@@ -132,6 +162,21 @@ class Settings(BaseSettings):
         case_sensitive=True,
         extra="allow",
     )
+
+    @model_validator(mode="after")
+    def validate_threshold_relationship(self) -> "Settings":
+        if self.JEV_STAY > self.JEV_ENTER:
+            raise ValueError("JEV_STAY must be less than or equal to JEV_ENTER")
+        return self
+
+    @field_validator(
+        "JEV_REVIEW_EVIDENCE_THRESHOLD",
+        "JEV_REVIEW_CHOICE_THRESHOLD",
+        mode="before",
+    )
+    @classmethod
+    def blank_review_threshold_is_default(cls, value: object) -> object:
+        return None if value == "" else value
 
 @lru_cache
 def get_settings() -> Settings:

@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse, Response
 
 from app.api.health import router as health_router
 from app.api.openai import router as openai_router
+from app.api.settings import router as settings_router
 from app.api.status import router as status_router
 from app.api.v1.router import api_router as v1_router
 from app.config import settings
@@ -74,6 +75,7 @@ app.add_middleware(
 # HEALTHCHECK.
 app.include_router(health_router, prefix="/api", tags=["health"])
 app.include_router(status_router, prefix="/api", tags=["status"])
+app.include_router(settings_router, prefix="/api", tags=["settings"])
 app.include_router(v1_router, prefix="/api/v1")
 
 # OpenAI-compatible surface at the root, mounted twice so MinusPod reaches it

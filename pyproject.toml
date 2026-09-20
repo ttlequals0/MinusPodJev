@@ -1,6 +1,6 @@
 [project]
 name = "jev-proxy"
-version = "0.1.0"
+version = "0.1.4"
 description = "Thin FastAPI proxy/client around the TypeSafe Jev System One endpoint"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -11,6 +11,7 @@ dependencies = [
     "pydantic-settings>=2.6.1",
     "httpx>=0.28.1",
     "python-dotenv>=1.0.1",
+    "supervisor==4.3.0",
 ]
 
 [dependency-groups]

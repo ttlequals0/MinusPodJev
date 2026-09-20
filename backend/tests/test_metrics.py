@@ -93,12 +93,51 @@ def test_metrics_records_are_thread_safe():
     def record(_: int) -> None:
         metrics.record_proxy_request(1.0, True)
         metrics.record_cache(True)
+        metrics.record_review("adjusted", 2.0)
+        metrics.record_review_refinement("attempted")
+        metrics.record_review_refinement("completed", changed=True)
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(record, range(100)))
     snapshot = metrics.snapshot()
     assert snapshot["proxy_requests"]["count"] == 100
     assert snapshot["cache"]["hits"] == 100
+    assert snapshot["review"]["count"] == 100
+    assert snapshot["review"]["outcomes"]["adjusted"] == 100
+    assert snapshot["review"]["refinement"]["attempted"] == 100
+    assert snapshot["review"]["refinement"]["completed"] == 100
+    assert snapshot["review"]["refinement"]["changed"] == 100
+
+
+def test_review_metrics_use_fixed_safe_values_and_reset():
+    metrics.record_review("confirmed", 12.0, "insufficient_evidence")
+    metrics.record_review("unexpected", 8.0, "request contents must not be retained")
+    snapshot = metrics.snapshot()
+    assert snapshot["review"]["count"] == 2
+    assert snapshot["review"]["outcomes"] == {
+        "confirmed": 1,
+        "adjusted": 0,
+        "rejected": 0,
+        "inconclusive": 0,
+        "upstream_error": 0,
+        "invalid_request": 0,
+        "internal_error": 1,
+    }
+    assert snapshot["review"]["reasons"] == {
+        "ambiguous_spans": 0,
+        "insufficient_evidence": 1,
+        "choice_inconclusive": 0,
+        "malformed_context": 0,
+        "invalid_choice": 0,
+        "upstream_failure": 0,
+        "upstream_invalid_response": 0,
+        "invalid_request": 0,
+        "internal_error": 0,
+        "unknown": 1,
+    }
+    assert snapshot["review"]["latency_ms"]["average"] == pytest.approx(10.0)
+    metrics.reset()
+    assert metrics.snapshot()["review"]["count"] == 0
 
 
 async def test_stats_schema_and_inference_path_scope(client):
@@ -125,6 +164,43 @@ async def test_stats_schema_and_inference_path_scope(client):
     }
     assert set(snapshot["cache"]) == {"hits", "misses"}
     assert set(snapshot["cost"]) == {"estimated_input_usd"}
+    assert set(snapshot["review"]) == {"count", "outcomes", "reasons", "latency_ms", "refinement"}
+    assert set(snapshot["review"]["outcomes"]) == {
+        "confirmed",
+        "adjusted",
+        "rejected",
+        "inconclusive",
+        "upstream_error",
+        "invalid_request",
+        "internal_error",
+    }
+    assert set(snapshot["review"]["reasons"]) == {
+        "ambiguous_spans",
+        "insufficient_evidence",
+        "choice_inconclusive",
+        "malformed_context",
+        "invalid_choice",
+        "upstream_failure",
+        "upstream_invalid_response",
+        "invalid_request",
+        "internal_error",
+        "unknown",
+    }
+    assert snapshot["review"]["refinement"] == {
+        "attempted": 0,
+        "completed": 0,
+        "changed": 0,
+        "unchanged": 0,
+        "inconclusive": 0,
+        "upstream_error": 0,
+        "skipped": {
+            "disabled": 0,
+            "missing_word_timings": 0,
+            "insufficient_evidence": 0,
+            "ambiguous_spans": 0,
+            "no_overlapping_span": 0,
+        },
+    }
     assert set(snapshot["proxy_requests"]["latency_ms"]) == {
         "count",
         "sum",

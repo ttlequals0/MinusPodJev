@@ -1,3 +1,5 @@
+<img src="assets/minuspodjev-logo.png" alt="MinusPodJev logo" width="128" />
+
 # MinusPodJev
 
 Two things live here:
@@ -110,6 +112,7 @@ Endpoints:
 - `GET /v1/models`, `GET /models` - advertise `typesafe/jev`
 - `POST /api/v1/jev/ask` - native segments-in, spans-out
 - `GET /api/status`, `GET /api/health`, `GET /api/stats`
+- `GET /api/settings`, `PUT /api/settings` - runtime threshold settings
 - `GET /api/docs` when `PRODUCTION=false`
 
 ### Pointing MinusPod at it (settings only, no app-code change)
@@ -138,9 +141,23 @@ and [API documentation](https://docs.typesafe.ai/api) for the current upstream c
 bearer token nor `TYPESAFE_API_KEY` is rejected with 503. When a fallback key is configured,
 a bearer token is still required unless `JEV_ALLOW_UNAUTHENTICATED_FALLBACK=true`.
 
-Jev review remains available when routed to the proxy, but it is correlated with Jev detection
-and is not an independent judgment. An unavailable Jev review returns 503 and does not confirm
-or move the candidate. Sponsor naming: set `MINUSPOD_BASE_URL` +
+Jev review is correlated with Jev detection, not an independent judgment. It uses coarse context and
+separate word timing. Evidence NouL adds an upstream call unless cached.
+
+`JEV_REVIEW_REFINE_BOUNDARIES=false` disables word-boundary refinement by default. Set it to `true` to use
+supplied word times; the proxy handles Jev's 255-option Choice limit without truncating options.
+`GET /api/status` reports effective enabled state, model, evidence threshold, and Choice threshold.
+Enabled does not guarantee refinement: both word-timing edges, sufficient evidence, and confident
+Choice answers are required.
+
+Review logs include request ID, stage, evidence score and threshold, word counts, Choice
+confidence, and skip or failure reason. An inconclusive start selection stops before end selection.
+An inconclusive review returns 422 with
+`x-should-retry: false` and does not confirm or move the candidate. An upstream or invalid-upstream
+review error returns 503. Diagnostics identify invalid-upstream validation failures but do not
+repair the response.
+
+MinusPod's local breaker still counts non-rate errors. Sponsor naming: set `MINUSPOD_BASE_URL` +
 `MINUSPOD_PASSWORD` and the proxy logs into MinusPod (cached session) to read
 `GET /api/v1/sponsors`. It emits `sponsor_name` only for one known sponsor with local ad
 evidence, using the `jev-` namespace, for example `jev-ButcherBox`. The prefix identifies a
@@ -148,6 +165,33 @@ proxy-generated learned record and the suffix is the matched canonical brand; an
 leaves the field absent, preventing false sponsor evidence. Its `Based on transcript:` rationale
 quotes source evidence rather than synthetic ad wording, and the compatibility parser recognizes
 it as rationale. Unset `MINUSPOD_BASE_URL` falls back to the gazetteer.
+
+### Runtime threshold settings
+
+`JEV_ENTER` opens an ad span (default `0.95`). Optional
+`JEV_REVIEW_EVIDENCE_THRESHOLD` and `JEV_REVIEW_CHOICE_THRESHOLD` overrides inherit `JEV_ENTER`
+when unset. `JEV_REVIEW_EVIDENCE_THRESHOLD` gates advertising evidence before refinement.
+`JEV_REVIEW_CHOICE_THRESHOLD` gates selected boundary words. These are `0` to `1` probability
+scores, not measured accuracy. Detection enter must be at least `JEV_STAY`; review evidence and
+Choice thresholds are independent of detection enter. The status page reads `GET /api/settings`
+and saves all three thresholds atomically with `PUT /api/settings`. Saving requires
+`Authorization: Bearer <MinusPod password>`; the proxy checks that password locally and does not
+log in to MinusPod. The password is not saved in browser storage.
+
+Changes apply to new requests. In-flight requests keep their existing snapshot, so avoid changing
+thresholds during an episode if its windows must use one policy. Saved overrides use
+`JEV_SETTINGS_PATH` (default `./data/runtime-settings.json`) and survive restarts when that
+directory is persistent. A saved file overrides environment defaults until it is changed or
+removed. Corrupt or unreadable state returns 503 rather than silently resetting to defaults. The
+Compose file mounts `/app/data` to a named volume. Existing deployments must add an equivalent
+persistent mount; replacing only the image does not preserve the settings file. Without
+`MINUSPOD_PASSWORD`, settings are visible but not editable.
+
+If either settings endpoint returns 503, inspect proxy logs for `runtime settings
+storage failure operation=read|write errno=<number>`. The message omits paths
+and file contents. The `/app/data` mount must be writable by UID/GID 1000.
+Existing volume ownership overrides image defaults, so verify the mounted
+directory before applying a nonrecursive `chown` to UID/GID 1000.
 
 ### MinusPod runtime ownership
 
@@ -182,6 +226,14 @@ parseable `WORKERS` environment hint, or `null` when unavailable. Metrics reset 
   to response headers. Health, models, status, and stats requests are excluded.
 - `jev_http` counts every actual upstream POST, including retry attempts. Its latency is the Jev
   HTTP attempt time, not the full MinusPod request path.
+- `review` counts fixed outcomes and safe reason codes with review latency. It stores no request
+  IDs, transcripts, boundaries, or secrets. Request IDs and numeric bounds are logged for
+  diagnosis.
+- `review.refinement` reports attempts, completed selections, changed and unchanged results,
+  inconclusive and upstream-error counts, plus skip counts for disabled refinement, missing word
+  timings, insufficient evidence, ambiguous spans, and no overlap. Counters live in process memory
+  and reset on restart. Changed and unchanged compare the final word pair with the candidate at
+  the 0.1 s tolerance; they are separate from coarse span adjustments in review outcomes.
 - `cache` separates cache hits and misses. `cost.estimated_input_usd` charges only successful,
   uncached upstream responses with valid reported input tokens, at Jev's published $0.042 per
   million input tokens. It is an estimate and excludes output token charges, fees, and taxes.
@@ -206,18 +258,18 @@ uv run pytest backend/tests -q   # upstream calls mocked; no network
 - `GET /api/status` reports whether Jev and MinusPod are reachable and whether a MinusPod
   session is active, using cheap probes only (no billable Jev call, no login), so it is safe
   to poll. `GET /api/health` is liveness.
-- `GET /api/stats` is available immediately after startup. It reports one process's proxy and
-  upstream-attempt counts, latency, cache activity, uptime, and an estimated input cost. It
-  resets on restart and is not a container-wide total when multiple workers are configured. The
-  configured-worker field is an optional environment hint, not a discovered worker count.
-  Proxy handling time is request receipt to response headers, not full MinusPod round-trip time.
-  Jev timing is per upstream HTTP attempt, including retries. Estimated cost includes only
-  successful uncached calls with valid upstream input-token usage. Cache hits do not call Jev; failed cache
-  fetches are cache misses.
+- `GET /api/stats` is available immediately after startup. It reports process-scoped proxy and
+  upstream counts, latency, cache activity, uptime, configured workers, and estimated input cost.
+  It resets on restart and is not container-wide with multiple workers. Proxy timing runs from
+  request receipt to response headers; Jev timing covers each upstream HTTP attempt, including
+  retries. Estimated cost includes only successful uncached calls with valid input-token usage.
+  Cache hits do not call Jev; failed fetches are cache misses.
 - Logs go to stdout at `LOG_LEVEL` (`DEBUG` for verbose tracing). The TypeSafe key, MinusPod
   password, session cookies, and Authorization header are never logged.
-- The included status page calls `/api/health`, `/api/status`, and `/api/stats` directly. It
-  reports live reachability and performs no inference or MinusPod login.
+  Review validation failures log a fixed rule and stage with numeric expected/actual option counts
+  and probability totals, without upstream payloads.
+- The included status page calls `/api/health`, `/api/status`, `/api/settings`, and `/api/stats`
+  directly. It reports live reachability and performs no inference or MinusPod login.
 
 ### Status page
 
@@ -227,8 +279,13 @@ probe, it refreshes stats.
 
 ![Jev Proxy status page](assets/status-page.png)
 
-- **Connections** - three cards: Proxy (health, environment, version), TypeSafe Jev
-  (connection, host), and MinusPod (connection, host, session).
+*Local test instance showing a saved example override; thresholds and runtime statistics are not defaults or live production data.*
+
+- **Connections** - four cards: Proxy (health, environment, version), TypeSafe Jev
+  (connection, host), MinusPod (connection, host, session), and Jev review settings.
+- **Review settings** - shows effective thresholds and lets an authenticated operator edit them.
+  Draft values survive status refreshes. The password is cleared after each save attempt and is
+  not saved in browser storage.
 - **Runtime stats** - process-scoped counters from `/api/stats`: proxy calls, average proxy
   handling time, Jev HTTP attempts, average Jev round-trip, cache hit rate, estimated input
   cost, process uptime, and configured workers. Counters reset when the process restarts and

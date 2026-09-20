@@ -7,6 +7,10 @@ __pycache__/
 *.egg-info/
 .installed.cfg
 *.egg
+*.pem
+*.key
+*.pfx
+*credentials*
 
 # Virtual Environments
 .venv/
@@ -31,6 +35,9 @@ coverage.xml
 node_modules/
 frontend/dist/
 frontend/node_modules/
+dist/
+build/
+coverage/
 
 # IDE
 .vscode/
@@ -63,7 +70,8 @@ Dockerfile*
 logs/
 *.log
 
-# Database
+# Runtime and database data
+data/
 *.db
 *.sqlite
 *.sqlite3
