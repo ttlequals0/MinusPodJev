@@ -70,6 +70,8 @@ async def test_status_reports_effective_review_settings(client: AsyncClient, mon
     assert response.json()["review"] == {
         "refine_boundaries": refine_boundaries,
         "model": "jev-test-model",
+        "detection_threshold": 0.9137,
+        "detection_stay_threshold": 0.4,
         "evidence_threshold": 0.9137,
         "choice_threshold": 0.9137,
     }

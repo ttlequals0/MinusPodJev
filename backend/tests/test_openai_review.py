@@ -134,7 +134,17 @@ def minuspod_review_verdict(content, original_start, original_end, *, pool="acce
     return ("confirmed" if unchanged else "adjust"), new_start, new_end, method
 
 
-def _run(prompt, fake, tmp_path, *, refine_boundaries=False, review_request_id=None, enter=0.95):
+def _run(
+    prompt,
+    fake,
+    tmp_path,
+    *,
+    refine_boundaries=False,
+    review_request_id=None,
+    enter=0.95,
+    review_evidence_enter=None,
+    review_choice_enter=None,
+):
     return run_review(
         messages=[
             {"role": "system", "content": "review ads"},
@@ -149,9 +159,76 @@ def _run(prompt, fake, tmp_path, *, refine_boundaries=False, review_request_id=N
         enter=enter,
         stay=0.40,
         refine_boundaries=refine_boundaries,
+        review_evidence_enter=review_evidence_enter,
+        review_choice_enter=review_choice_enter,
         review_request_id=review_request_id,
         fetcher=fake,
     )
+
+
+def test_review_evidence_threshold_is_independent(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "back to the topic")],
+        [(100.0, 110.0, "This episode is sponsored by BetterHelp"),
+         (110.0, 120.0, "Use promo code SHOW")],
+        [(120.0, 126.0, "and we are back")],
+    )
+    with pytest.raises(ReviewInconclusiveError, match="sufficient advertising evidence"):
+        _run(
+            prompt,
+            make_text_fake(),
+            tmp_path,
+            review_evidence_enter=0.99,
+        )
+
+
+def test_review_choice_threshold_is_independent(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "back to the topic")],
+        [(100.0, 110.0, "This episode is sponsored by BetterHelp"),
+         (110.0, 120.0, "Use promo code SHOW")],
+        [(120.0, 126.0, "and we are back")],
+    )
+    with pytest.raises(ReviewInconclusiveError, match="boundary Choice"):
+        _run(
+            _with_word_edges(prompt),
+            make_text_fake(),
+            tmp_path,
+            refine_boundaries=True,
+            review_choice_enter=0.99,
+        )
+
+
+def test_lower_evidence_threshold_reuses_cached_review_answer(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "back to the topic")],
+        [(100.0, 110.0, "This episode is sponsored by BetterHelp"),
+         (110.0, 120.0, "Use promo code SHOW")],
+        [(120.0, 126.0, "and we are back")],
+    )
+    calls = []
+    base = make_text_fake()
+
+    def fake(payload, **kwargs):
+        calls.append(payload["questions"])
+        body = base(payload, **kwargs)
+        if "evidence" in body["answers"]:
+            body["answers"]["evidence"]["noul"] = 0.86
+        return body
+
+    with pytest.raises(ReviewInconclusiveError, match="sufficient advertising evidence"):
+        _run(prompt, fake, tmp_path, review_evidence_enter=0.95)
+    assert len(calls) == 2
+
+    response = _run(prompt, fake, tmp_path, review_evidence_enter=0.85)
+    assert json.loads(response["choices"][0]["message"]["content"])["ads"]
+    assert len(calls) == 2
 
 
 def _with_word_edges(prompt, start=(99.5, 100.0, "This"), end=(119.5, 120.5, "BetterHelp")):

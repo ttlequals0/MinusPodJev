@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.3 - 2026-09-20
+
+- Added persistent runtime threshold settings with authenticated status-page editing.
+- Fail closed on malformed saved settings instead of silently resetting to defaults.
+- Added MinusPodJev logo, favicon, and status-page branding.
+- Changes tracked in [PR #2](https://github.com/ttlequals0/MinusPodJev/pull/2).
+
 ## 0.1.2 - 2026-09-20
 
 - Added effective review settings and thresholds to `/api/status`.

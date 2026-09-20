@@ -1,3 +1,5 @@
+<img src="assets/minuspodjev-logo.png" alt="MinusPodJev logo" width="128" />
+
 # MinusPodJev
 
 Two things live here:
@@ -110,6 +112,7 @@ Endpoints:
 - `GET /v1/models`, `GET /models` - advertise `typesafe/jev`
 - `POST /api/v1/jev/ask` - native segments-in, spans-out
 - `GET /api/status`, `GET /api/health`, `GET /api/stats`
+- `GET /api/settings`, `PUT /api/settings` - runtime threshold settings
 - `GET /api/docs` when `PRODUCTION=false`
 
 ### Pointing MinusPod at it (settings only, no app-code change)
@@ -158,6 +161,27 @@ proxy-generated learned record and the suffix is the matched canonical brand; an
 leaves the field absent, preventing false sponsor evidence. Its `Based on transcript:` rationale
 quotes source evidence rather than synthetic ad wording, and the compatibility parser recognizes
 it as rationale. Unset `MINUSPOD_BASE_URL` falls back to the gazetteer.
+
+### Runtime threshold settings
+
+`JEV_ENTER` opens an ad span (default `0.95`). Optional
+`JEV_REVIEW_EVIDENCE_THRESHOLD` and `JEV_REVIEW_CHOICE_THRESHOLD` overrides inherit `JEV_ENTER`
+when unset. `JEV_REVIEW_EVIDENCE_THRESHOLD` gates advertising evidence before refinement.
+`JEV_REVIEW_CHOICE_THRESHOLD` gates selected boundary words. These are `0` to `1` probability
+scores, not measured accuracy. Detection enter must be at least `JEV_STAY`; review evidence and
+Choice thresholds are independent of detection enter. The status page reads `GET /api/settings`
+and saves all three thresholds atomically with `PUT /api/settings`. Saving requires
+`Authorization: Bearer <MinusPod password>`; the proxy checks that password locally and does not
+log in to MinusPod. The password is not saved in browser storage.
+
+Changes apply to new requests. In-flight requests keep their existing snapshot, so avoid changing
+thresholds during an episode if its windows must use one policy. Saved overrides use
+`JEV_SETTINGS_PATH` (default `./data/runtime-settings.json`) and survive restarts when that
+directory is persistent. A saved file overrides environment defaults until it is changed or
+removed. Corrupt or unreadable state returns 503 rather than silently resetting to defaults. The
+Compose file mounts `/app/data` to a named volume. Existing deployments must add an equivalent
+persistent mount; replacing only the image does not preserve the settings file. Without
+`MINUSPOD_PASSWORD`, settings are visible but not editable.
 
 ### MinusPod runtime ownership
 
@@ -234,8 +258,8 @@ uv run pytest backend/tests -q   # upstream calls mocked; no network
   fetches are cache misses.
 - Logs go to stdout at `LOG_LEVEL` (`DEBUG` for verbose tracing). The TypeSafe key, MinusPod
   password, session cookies, and Authorization header are never logged.
-- The included status page calls `/api/health`, `/api/status`, and `/api/stats` directly. It
-  reports live reachability and performs no inference or MinusPod login.
+- The included status page calls `/api/health`, `/api/status`, `/api/settings`, and `/api/stats`
+  directly. It reports live reachability and performs no inference or MinusPod login.
 
 ### Status page
 
@@ -245,8 +269,13 @@ probe, it refreshes stats.
 
 ![Jev Proxy status page](assets/status-page.png)
 
-- **Connections** - three cards: Proxy (health, environment, version), TypeSafe Jev
-  (connection, host), and MinusPod (connection, host, session).
+*Local test instance showing a saved example override; thresholds and runtime statistics are not defaults or live production data.*
+
+- **Connections** - four cards: Proxy (health, environment, version), TypeSafe Jev
+  (connection, host), MinusPod (connection, host, session), and Jev review settings.
+- **Review settings** - shows effective thresholds and lets an authenticated operator edit them.
+  Draft values survive status refreshes. The password is cleared after each save attempt and is
+  not saved in browser storage.
 - **Runtime stats** - process-scoped counters from `/api/stats`: proxy calls, average proxy
   handling time, Jev HTTP attempts, average Jev round-trip, cache hit rate, estimated input
   cost, process uptime, and configured workers. Counters reset when the process restarts and

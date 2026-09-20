@@ -5,7 +5,8 @@ money or tripping rate limits: it never sends a real inference, never needs a
 key, and never logs in. Each probe is a cheap HEAD with a short timeout; any HTTP
 response (200/401/404/405/...) counts as reachable, only a connect/DNS/timeout
 error is unreachable. The response is host-only and carries no key, password,
-cookie, or credentialed URL. Nothing here raises.
+cookie, or credentialed URL. Upstream probes never raise; an invalid runtime
+settings file returns a safe 503 so it cannot be mistaken for defaults.
 """
 
 from __future__ import annotations
@@ -14,10 +15,11 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from app.config import settings
 from app.services import sponsors
+from app.services.runtime_settings import RuntimeSettingsError, defaults_from_settings, read
 from app.utils.metrics import metrics
 
 router = APIRouter()
@@ -56,6 +58,14 @@ def _probe(url: str, timeout: float = _PROBE_TIMEOUT_SECONDS) -> tuple[bool, str
 @router.get("/status")
 def status_check() -> dict[str, Any]:
     """Report upstream reachability without spending money or logging in."""
+    try:
+        thresholds, _ = read(
+            settings.JEV_SETTINGS_PATH,
+            defaults_from_settings(settings),
+        )
+    except RuntimeSettingsError as exc:
+        raise HTTPException(status_code=503, detail="Runtime settings unavailable") from exc
+
     jev_url = settings.TYPESAFE_API_URL
     jev_reachable, jev_reason = _probe(jev_url)
     jev: dict[str, Any] = {
@@ -90,7 +100,9 @@ def status_check() -> dict[str, Any]:
         "review": {
             "refine_boundaries": settings.JEV_REVIEW_REFINE_BOUNDARIES,
             "model": settings.JEV_MODEL,
-            "evidence_threshold": settings.JEV_ENTER,
-            "choice_threshold": settings.JEV_ENTER,
+            "detection_threshold": thresholds.detection_enter,
+            "detection_stay_threshold": thresholds.detection_stay,
+            "evidence_threshold": thresholds.review_evidence,
+            "choice_threshold": thresholds.review_choice,
         },
     }

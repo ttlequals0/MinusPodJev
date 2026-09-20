@@ -15,6 +15,11 @@ from httpx import ASGITransport, AsyncClient
 settings.TESTING = True
 
 
+@pytest.fixture(autouse=True)
+def isolate_runtime_settings(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "JEV_SETTINGS_PATH", str(tmp_path / "runtime-settings.json"))
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     """Create an instance of the default event loop for the test session."""

@@ -240,11 +240,15 @@ def run_chat_completion(
     request_deadline: float = 75.0,
     cache_max_entries: int = 10_000,
     refine_boundaries: bool = False,
+    review_evidence_enter: float | None = None,
+    review_choice_enter: float | None = None,
     review_request_id: str | None = None,
     fetcher: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Parse the prompt, detect ad spans, classify them, and build the envelope."""
     echo_model = request_model or model
+    review_evidence_enter = enter if review_evidence_enter is None else review_evidence_enter
+    review_choice_enter = enter if review_choice_enter is None else review_choice_enter
     deadline_at = time.monotonic() + request_deadline
     user_text = extract_user_text(messages)
     system_text = extract_system_text(messages)
@@ -261,6 +265,8 @@ def run_chat_completion(
             model=model,
             enter=enter,
             stay=stay,
+            review_evidence_enter=review_evidence_enter,
+            review_choice_enter=review_choice_enter,
             uid=uid,
             max_retries=max_retries,
             retry_after_max=retry_after_max,
@@ -548,12 +554,16 @@ def run_review(
     deadline_at: float | None = None,
     cache_max_entries: int = 10_000,
     refine_boundaries: bool = False,
+    review_evidence_enter: float | None = None,
+    review_choice_enter: float | None = None,
     review_request_id: str | None = None,
     guidance: str = GUIDANCE,
     fetcher: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Review one candidate ad with Jev and emit the ads-wrapped review verdict."""
     echo_model = request_model or model
+    review_evidence_enter = enter if review_evidence_enter is None else review_evidence_enter
+    review_choice_enter = enter if review_choice_enter is None else review_choice_enter
     end = deadline_at if deadline_at is not None else time.monotonic() + request_deadline
     text = extract_user_text(messages)
     pool = _review_pool(text)
@@ -572,8 +582,8 @@ def run_review(
         refine_boundaries,
         len(word_edges["start"]),
         len(word_edges["end"]),
-        enter,
-        enter,
+        review_evidence_enter,
+        review_choice_enter,
     )
     if not any(
         min(float(segment["end"]), cand[1]) > max(float(segment["start"]), cand[0])
@@ -684,9 +694,9 @@ def run_review(
         "review request_id=%s stage=evidence score=%s threshold=%s",
         review_request_id,
         evidence_score,
-        enter,
+        review_evidence_enter,
     )
-    if evidence_score < enter:
+    if evidence_score < review_evidence_enter:
         metrics.record_review_refinement("skipped", skip_reason="insufficient_evidence")
         logger.info(
             "review request_id=%s refinement=skipped reason=insufficient_evidence original_start=%.3f original_end=%.3f",
@@ -724,14 +734,14 @@ def run_review(
             start_word = _select_word(
                 prefix="start",
                 words=word_edges["start"],
-                enter=enter,
+                enter=review_choice_enter,
                 request=review_questions,
                 review_request_id=review_request_id,
             )
             end_word = _select_word(
                 prefix="end",
                 words=word_edges["end"],
-                enter=enter,
+                enter=review_choice_enter,
                 request=review_questions,
                 review_request_id=review_request_id,
             )

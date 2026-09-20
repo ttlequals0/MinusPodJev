@@ -70,7 +70,8 @@ Dockerfile*
 logs/
 *.log
 
-# Database
+# Runtime and database data
+data/
 *.db
 *.sqlite
 *.sqlite3

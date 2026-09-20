@@ -30,6 +30,7 @@ from app.services.openai_adapter import (
     parse_candidate_bounds,
     run_chat_completion,
 )
+from app.services.runtime_settings import RuntimeSettingsError, effective_from_settings
 from app.utils.metrics import metrics
 
 router = APIRouter()
@@ -100,6 +101,10 @@ def chat_completions(
     reason_code: str | None = None
     try:
         try:
+            thresholds = effective_from_settings(settings)
+        except RuntimeSettingsError as exc:
+            raise HTTPException(status_code=503, detail="Runtime settings unavailable") from exc
+        try:
             response = run_chat_completion(
                 messages=messages,
                 request_model=request.model or settings.JEV_PUBLIC_MODEL,
@@ -108,8 +113,10 @@ def chat_completions(
                 timeout=settings.JEV_TIMEOUT_SECONDS,
                 cache_path=settings.JEV_CACHE_PATH,
                 model=settings.JEV_MODEL,
-                enter=settings.JEV_ENTER,
-                stay=settings.JEV_STAY,
+                enter=thresholds.detection_enter,
+                stay=thresholds.detection_stay,
+                review_evidence_enter=thresholds.review_evidence,
+                review_choice_enter=thresholds.review_choice,
                 category_pass=settings.JEV_CATEGORY_PASS,
                 category_context=settings.JEV_CATEGORY_CONTEXT,
                 default_category=settings.JEV_DEFAULT_CATEGORY,
