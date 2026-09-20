@@ -11,6 +11,7 @@ dependencies = [
     "pydantic-settings>=2.6.1",
     "httpx>=0.28.1",
     "python-dotenv>=1.0.1",
+    "supervisor==4.3.0",
 ]
 
 [dependency-groups]

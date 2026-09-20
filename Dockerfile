@@ -15,39 +15,35 @@ COPY frontend/ ./
 RUN npm run build
 
 # Stage 2: Python Backend Build
-FROM python:3.11-slim AS backend-builder
+FROM python:3.11.16-alpine3.24 AS backend-builder
 
 WORKDIR /app
 
-# Install uv, then the locked runtime deps into the system site-packages
-RUN pip install --no-cache-dir uv
+# Install uv only in the builder, then create an empty production virtual environment.
+RUN pip install --no-cache-dir uv \
+    && python -m venv --without-pip /opt/venv
 
 COPY pyproject.toml uv.lock ./
 
-# Export locked deps (no dev group, not the project itself) and pip-install them
+# Export locked runtime dependencies and install them into the production virtual environment.
 RUN uv export --frozen --no-dev --no-emit-project > requirements.txt \
-    && pip install --no-cache-dir -r requirements.txt
+    && uv pip install --python /opt/venv/bin/python --no-cache-dir -r requirements.txt
 
 # Copy backend source and the vendored compat package the app imports at runtime
 COPY backend/ ./backend/
 COPY compat/ ./compat/
 
 # Stage 3: Final Production Image
-FROM python:3.11-slim
+FROM python:3.11.16-alpine3.24
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    nginx \
-    supervisor \
-    netcat-openbsd \
-    && rm -rf /var/lib/apt/lists/*
+# Install nginx and remove Python build tools from the base image.
+RUN apk add --no-cache nginx \
+    && python -m pip uninstall --yes pip setuptools wheel
 
 WORKDIR /app
 
-# Copy Python packages from builder
-COPY --from=backend-builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=backend-builder /usr/local/bin /usr/local/bin
+# Copy only locked production Python dependencies and runtime commands.
+COPY --from=backend-builder /opt/venv /opt/venv
 
 # Copy backend application and the vendored compat package
 COPY --from=backend-builder /app/backend ./backend
@@ -70,11 +66,11 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 # Create necessary directories for nginx and fix permissions
 RUN mkdir -p /var/cache/nginx /var/log/nginx /run && \
     touch /run/nginx.pid && \
-    chown -R www-data:www-data /var/cache/nginx /var/log/nginx /run/nginx.pid && \
-    chown -R www-data:www-data /usr/share/nginx/html
+    chown -R nginx:nginx /var/cache/nginx /var/log/nginx /run/nginx.pid && \
+    chown -R nginx:nginx /usr/share/nginx/html
 
 # Create app user
-RUN useradd -m -u 1000 appuser && \
+RUN adduser -D -u 1000 appuser && \
     chown -R appuser:appuser /app
 
 # Create directories for logs and data
@@ -82,7 +78,8 @@ RUN mkdir -p /app/logs /app/data && \
     chown -R appuser:appuser /app/logs /app/data
 
 # Environment variables
-ENV PYTHONPATH=/app \
+ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONPATH=/app \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8080 \
@@ -93,7 +90,7 @@ EXPOSE 8080
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/api/health || exit 1
+    CMD python -c 'from urllib.request import urlopen; urlopen("http://localhost:8080/api/health", timeout=5).close()'
 
 # Start application
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
