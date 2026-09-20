@@ -14,6 +14,7 @@ services:
       - MINUSPOD_BASE_URL=${MINUSPOD_BASE_URL:-}
       - MINUSPOD_PASSWORD=${MINUSPOD_PASSWORD:-}
       - JEV_ALLOW_UNAUTHENTICATED_FALLBACK=${JEV_ALLOW_UNAUTHENTICATED_FALLBACK:-false}
+      - JEV_REVIEW_REFINE_BOUNDARIES=${JEV_REVIEW_REFINE_BOUNDARIES:-false}
       # Keep the fallback unset in normal deployments. If you set it, callers
       # still need a bearer token unless JEV_ALLOW_UNAUTHENTICATED_FALLBACK=true.
       # - TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-}

@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     JEV_STAY: float = Field(
         default=0.40, description="Span-extend probability threshold (noul >= stay)"
     )
+    JEV_REVIEW_REFINE_BOUNDARIES: bool = Field(
+        default=False,
+        description="Use Jev Choice questions and supplied word timings to refine review boundaries",
+    )
     JEV_CATEGORY_PASS: bool = Field(
         default=True, description="Run the per-span category second pass"
     )

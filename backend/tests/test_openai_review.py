@@ -15,6 +15,7 @@ from app.services.openai_adapter import (
     ReviewUnavailableError,
     is_review_request,
     parse_candidate_bounds,
+    parse_review_context,
     parse_review_segments,
     run_review,
 )
@@ -45,6 +46,20 @@ def make_text_fake(*, keywords=_AD_KW, input_tokens=1200, output_tokens=6, raise
             sid_text[f"s{int(tag[1:])}"] = body.lower()
         answers: dict[str, Any] = {}
         for key in payload["questions"]:
+            if key == "evidence":
+                answers[key] = {"noul": 0.98 if any(kw in text for text in sid_text.values() for kw in _AD_KW) else 0.02}
+                continue
+            question = payload["questions"][key]
+            criteria = question.get("criteria", {})
+            if question.get("type") == "choice":
+                option = next(name for name in criteria if name != "unknown")
+                remainder = 0.01 / max(len(criteria) - 1, 1)
+                answers[key] = {
+                    "choice": option,
+                    "confidence": 0.98,
+                    "probabilities": {name: 0.99 if name == option else remainder for name in criteria},
+                }
+                continue
             if not key.startswith("s"):
                 continue
             text = sid_text.get(key, "")
@@ -111,7 +126,7 @@ def minuspod_review_verdict(content, original_start, original_end, *, pool="acce
     return ("confirmed" if unchanged else "adjust"), new_start, new_end, method
 
 
-def _run(prompt, fake, tmp_path):
+def _run(prompt, fake, tmp_path, *, refine_boundaries=False):
     return run_review(
         messages=[
             {"role": "system", "content": "review ads"},
@@ -125,6 +140,7 @@ def _run(prompt, fake, tmp_path):
         model="jev-latest",
         enter=0.95,
         stay=0.40,
+        refine_boundaries=refine_boundaries,
         fetcher=fake,
     )
 
@@ -307,7 +323,7 @@ def test_high_score_without_advertising_cue_is_unavailable(jev_env, tmp_path):
         [(100.0, 110.0, "This unrelated editorial sentence has no promotion")],
         [(110.0, 116.0, "context after")],
     )
-    with pytest.raises(ReviewUnavailableError, match="transcript-grounded"):
+    with pytest.raises(ReviewUnavailableError, match="sufficient advertising evidence"):
         _run(prompt, make_text_fake(keywords=("unrelated",)), tmp_path)
 
 
@@ -395,7 +411,63 @@ async def test_review_failure_returns_503(jev_env, client, monkeypatch):
         headers={"Authorization": "Bearer test-key"},
     )
     assert response.status_code == 503
-    assert response.json()["detail"] == "Review unavailable"
+    assert response.json()["error"]["code"] == "jev_review_upstream_failure"
+    assert "x-should-retry" not in response.headers
+
+
+async def test_inconclusive_review_returns_non_retryable_422(jev_env, client, monkeypatch):
+    import app.services.jev as jev
+
+    monkeypatch.setattr(jev, "call_payload", make_text_fake())
+    prompt = build_review_prompt(
+        100.0, 200.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 105.0, "This is sponsored by BetterHelp"),
+         (105.0, 155.0, "The hosts return to their discussion"),
+         (155.0, 200.0, "Use promo code SHOW at betterhelp.com")],
+        [(200.0, 206.0, "context after")],
+    )
+    response = await client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": prompt}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+    assert response.status_code == 422
+    assert response.headers["x-should-retry"] == "false"
+    assert response.headers["x-request-id"]
+    assert response.json()["error"]["code"] == "jev_review_inconclusive"
+
+
+def test_word_timing_is_not_mixed_into_coarse_review_segments():
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 120.0, "This episode is sponsored by BetterHelp")],
+        [(120.0, 126.0, "context after")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[99.9s-100.0s] This\n"
+        "End edge:\n[120.0s-120.0s] end\n"
+    )
+    segments, words = parse_review_context(prompt)
+    assert all(segment["text"] not in {"This", "end"} for segment in segments)
+    assert words["start"][0]["text"] == "This"
+    assert words["end"][0]["end"] == 120.0
+
+
+def test_opt_in_refinement_uses_word_edges(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 120.0, "This episode is sponsored by BetterHelp")],
+        [(120.0, 126.0, "context after")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[99.5s-100.0s] This\n"
+        "End edge:\n[119.5s-120.5s] BetterHelp\n"
+    )
+    response = _run(prompt, make_text_fake(), tmp_path, refine_boundaries=True)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+    assert (ad["start"], ad["end"]) == (99.5, 120.5)
 
 
 def test_review_upstream_failure_is_unavailable(jev_env, tmp_path):

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -19,7 +20,14 @@ from typing import Any, NoReturn
 
 from minuspod_compat import SEGMENT_CATEGORIES, SPONSOR_PRIORITY_FIELDS
 
-from app.services.jev import CATEGORY_GUIDANCE, GUIDANCE, jev_ask, jev_category
+from app.services.jev import (
+    CATEGORY_GUIDANCE,
+    GUIDANCE,
+    build_state,
+    jev_ask,
+    jev_category,
+    jev_review_questions,
+)
 from app.services.sponsors import matched_sponsor_for_span
 
 logger = logging.getLogger(__name__)
@@ -51,16 +59,22 @@ _REVIEW_SYSTEM_SIGNATURES = (
     "taking a second look at a segment that the validator already rejected",
 )
 _EVIDENCE_MAX_CHARS = 400
-_AD_EVIDENCE_RE = re.compile(
-    r"\b(?:sponsored by|brought to you by|promo(?:tion)? code|discount code|use code|"
-    r"visit|subscribe|rate|review|follow|check out|patreon|www\.|dot com|\.com\b)"
-    r"|\b[A-Za-z0-9-]+\.(?:com|org|net|io|co)\b",
-    re.IGNORECASE,
-)
 
 
 class ReviewUnavailableError(RuntimeError):
     """The proxy cannot produce a safe review verdict."""
+
+
+class ReviewInconclusiveError(ReviewUnavailableError):
+    """The valid review input did not support a safe verdict."""
+
+
+class ReviewInvalidRequestError(ReviewUnavailableError):
+    """The caller's review framing cannot be evaluated."""
+
+
+class ReviewUpstreamInvalidResponseError(ReviewUnavailableError):
+    """Jev returned a response that did not match the requested review schema."""
 
 
 def _detection_guidance(system_text: str) -> str:
@@ -83,10 +97,6 @@ def _category_guidance(system_text: str) -> str:
         f"{CATEGORY_GUIDANCE}\n\nCaller policy for category selection:\n"
         f"{policy}\n\nAnswer only the supplied noul questions."
     )
-
-
-def _has_transcript_ad_evidence(text: str) -> bool:
-    return bool(_AD_EVIDENCE_RE.search(text))
 
 
 def _jev_sponsor_label(sponsor: str) -> str:
@@ -228,6 +238,8 @@ def run_chat_completion(
     retry_after_max: float = 5.0,
     request_deadline: float = 75.0,
     cache_max_entries: int = 10_000,
+    refine_boundaries: bool = False,
+    review_request_id: str | None = None,
     fetcher: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Parse the prompt, detect ad spans, classify them, and build the envelope."""
@@ -254,6 +266,8 @@ def run_chat_completion(
             request_deadline=request_deadline,
             deadline_at=deadline_at,
             cache_max_entries=cache_max_entries,
+            refine_boundaries=refine_boundaries,
+            review_request_id=review_request_id,
             guidance=detection_guidance,
             fetcher=fetcher,
         )
@@ -373,45 +387,136 @@ def _review_pool(text: str) -> str:
 
 
 def parse_candidate_bounds(text: str) -> tuple[float, float] | None:
-    """Candidate [start, end] from the CANDIDATE markers, else the framing line."""
+    """Candidate [start, end] from the precise framing line, then markers."""
+    bounds_m = _REVIEW_BOUNDS_RE.search(text)
+    if bounds_m:
+        return float(bounds_m.group(1)), float(bounds_m.group(2))
     start_m = _REVIEW_START_RE.search(text)
     end_m = _REVIEW_END_RE.search(text)
     if start_m and end_m:
         return float(start_m.group(1)), float(end_m.group(1))
-    bounds_m = _REVIEW_BOUNDS_RE.search(text)
-    if bounds_m:
-        return float(bounds_m.group(1)), float(bounds_m.group(2))
     return None
 
 
-def parse_review_segments(text: str) -> list[dict[str, Any]]:
-    """Unique timestamped transcript segments from a review prompt, sid by order.
+def _review_line(line: str, *, allow_zero: bool = False) -> dict[str, Any] | None:
+    m = _TS_LINE.match(line)
+    if not m:
+        return None
+    start, end = float(m.group(1)), float(m.group(2))
+    if not math.isfinite(start) or not math.isfinite(end) or end < start or (end == start and not allow_zero):
+        raise ValueError("timestamped review interval is invalid")
+    return {"start": start, "end": end, "text": m.group(3).strip()}
 
-    get_timestamped_transcript_for_range renders overlapping segments in both the
-    context and candidate sections, so the same line can appear twice; dedupe on
-    (start, end, text) and reassign sids so Jev scores each segment once.
-    """
-    seen: set[tuple[float, float, str]] = set()
+
+def parse_review_context(text: str) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """Split coarse transcript context from labeled boundary word timings."""
+    seen: dict[str, set[tuple[float, float, str]]] = {"coarse": set(), "start": set(), "end": set()}
     segs: list[dict[str, Any]] = []
+    words: dict[str, list[dict[str, Any]]] = {"start": [], "end": []}
+    section: str | None = None
     for line in text.splitlines():
-        m = _TS_LINE.match(line)
-        if not m:
+        if line.strip() == "Boundary word timing, use these timestamps for corrections:":
+            section = "words"
             continue
-        start, end, body = float(m.group(1)), float(m.group(2)), m.group(3).strip()
-        key = (start, end, body)
-        if key in seen:
+        if section == "words" and line.strip() == "Start edge:":
+            section = "start"
             continue
-        seen.add(key)
-        segs.append({"start": start, "end": end, "text": body})
+        if section in {"words", "start"} and line.strip() == "End edge:":
+            section = "end"
+            continue
+        record = _review_line(line, allow_zero=section in words)
+        if record is None:
+            continue
+        key = (record["start"], record["end"], record["text"])
+        target = section if section in words else "coarse"
+        if key in seen[target]:
+            continue
+        seen[target].add(key)
+        if section in words:
+            words[section].append(record)
+        else:
+            segs.append(record)
     segs.sort(key=lambda s: (s["start"], s["end"]))
     for i, seg in enumerate(segs):
         seg["sid"] = i
-    return segs
+    for values in words.values():
+        values.sort(key=lambda s: (s["start"], s["end"], s["text"]))
+    return segs, words
+
+
+def parse_review_segments(text: str) -> list[dict[str, Any]]:
+    """Compatibility wrapper returning only the coarse transcript context."""
+    return parse_review_context(text)[0]
 
 
 def _review_unavailable(pool: str, reason: str) -> NoReturn:
     logger.warning("review unavailable (%s, pool=%s)", reason, pool)
-    raise ReviewUnavailableError(reason)
+    raise ReviewInconclusiveError(reason)
+
+
+def _review_state(segments: Sequence[dict[str, Any]], cand: tuple[float, float], guidance: str) -> dict[str, Any]:
+    return {
+        "guidance": guidance,
+        "transcript": build_state(segments),
+        "candidate": {"start": cand[0], "end": cand[1]},
+        "timeline": [
+            {"line": f"L{int(s['sid']):04d}", "start": float(s["start"]), "end": float(s["end"])}
+            for s in segments
+        ],
+    }
+
+
+def _word_option(index: int) -> str:
+    return f"w{index:04d}"
+
+
+def _choice_questions(prefix: str, words: Sequence[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Batch Choice questions in provider-sized groups, retaining every word."""
+    questions: dict[str, dict[str, Any]] = {}
+    lookup: dict[str, dict[str, Any]] = {}
+    for group_index, offset in enumerate(range(0, len(words), 254)):
+        group = words[offset : offset + 254]
+        criteria: dict[str, str] = {"unknown": "No supported boundary appears in this group."}
+        for index, word in enumerate(group, offset):
+            option = _word_option(index)
+            lookup[option] = word
+            edge = "before" if prefix == "start" else "after"
+            criteria[option] = f"Set the {prefix} boundary {edge} [{word['start']:.2f}s-{word['end']:.2f}s] {word['text']}"
+        questions[f"{prefix}_{group_index}"] = {
+            "type": "choice",
+            "instructions": f"Choose the best {prefix} boundary word in this group for the advertising candidate. Choose unknown only when this group has no supported boundary.",
+            "criteria": criteria,
+        }
+    return questions, lookup
+
+
+def _select_word(
+    *,
+    prefix: str,
+    words: Sequence[dict[str, Any]],
+    enter: float,
+    request: Callable[[dict[str, dict[str, Any]], str], dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Reduce Choice groups without dropping candidates; unknown is inconclusive."""
+    current = list(words)
+    while current:
+        questions, lookup = _choice_questions(prefix, current)
+        result = request(questions, f"choice_{prefix}")
+        winners: list[dict[str, Any]] = []
+        for key in questions:
+            answer = result["answers"][key]
+            choice = answer["choice"]
+            if answer["confidence"] < enter:
+                return None
+            if choice == "unknown":
+                continue
+            winners.append(lookup[choice])
+        if not winners:
+            return None
+        if len(winners) == 1:
+            return winners[0]
+        current = winners
+    return None
 
 
 def run_review(
@@ -431,6 +536,8 @@ def run_review(
     request_deadline: float = 75.0,
     deadline_at: float | None = None,
     cache_max_entries: int = 10_000,
+    refine_boundaries: bool = False,
+    review_request_id: str | None = None,
     guidance: str = GUIDANCE,
     fetcher: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -440,11 +547,22 @@ def run_review(
     text = extract_user_text(messages)
     pool = _review_pool(text)
     cand = parse_candidate_bounds(text)
-    segments = parse_review_segments(text)
-    if cand is None or not segments:
-        _review_unavailable(pool, "candidate bounds or transcript could not be parsed")
+    try:
+        segments, word_edges = parse_review_context(text)
+    except ValueError as exc:
+        raise ReviewInvalidRequestError("malformed review transcript context") from exc
+    if cand is None or not all(math.isfinite(value) for value in cand) or cand[1] <= cand[0] or not segments:
+        raise ReviewInvalidRequestError("candidate bounds or transcript could not be parsed")
+    context_start = min(float(segment["start"]) for segment in segments)
+    context_end = max(float(segment["end"]) for segment in segments)
+    if not any(
+        min(float(segment["end"]), cand[1]) > max(float(segment["start"]), cand[0])
+        for segment in segments
+    ):
+        raise ReviewInvalidRequestError("candidate does not overlap the review transcript")
 
     try:
+        detection_started = time.monotonic()
         detection = jev_ask(
             segments,
             url=url,
@@ -463,15 +581,21 @@ def run_review(
             guidance=guidance,
             fetcher=fetcher,
         )
-    except Exception as exc:  # noqa: BLE001 - return an explicit unavailable status
+        logger.info("review request_id=%s stage=detection cache_hit=%s elapsed_ms=%.0f", review_request_id, detection["cache_hit"], (time.monotonic() - detection_started) * 1000)
+    except ValueError as exc:
+        raise ReviewUpstreamInvalidResponseError("Jev review response was invalid") from exc
+    except Exception as exc:  # noqa: BLE001 - classify the upstream service failure
         raise ReviewUnavailableError("Jev review request failed") from exc
 
     cand_start, cand_end = cand
     by_sid = {int(segment["sid"]): segment for segment in segments}
     overlapping = []
     for span in detection["spans"]:
-        span_start = float(by_sid[int(span["start_id"])]["start"])
-        span_end = float(by_sid[int(span["end_id"])]["end"])
+        span_members = [
+            by_sid[sid] for sid in range(int(span["start_id"]), int(span["end_id"]) + 1)
+        ]
+        span_start = min(float(member["start"]) for member in span_members)
+        span_end = max(float(member["end"]) for member in span_members)
         if min(span_end, cand_end) > max(span_start, cand_start):
             overlapping.append((span_start, span_end, float(span["confidence"])))
     if not overlapping:
@@ -480,13 +604,69 @@ def run_review(
         _review_unavailable(pool, "Jev did not produce one unambiguous overlapping span")
 
     ad_start, ad_end, confidence = overlapping[0]
-    candidate_text = " ".join(
-        str(segment.get("text", ""))
-        for segment in segments
-        if float(segment["end"]) > cand_start and float(segment["start"]) < cand_end
+    state = _review_state(segments, cand, guidance)
+    review_input_tokens = 0
+    review_output_tokens = 0
+
+    def review_questions(questions: dict[str, dict[str, Any]], stage: str) -> dict[str, Any]:
+        nonlocal review_input_tokens, review_output_tokens
+        started = time.monotonic()
+        try:
+            result = jev_review_questions(
+                state=state,
+                questions=questions,
+                url=url,
+                api_key=api_key,
+                timeout=timeout,
+                cache_path=cache_path,
+                model=model,
+                uid=uid,
+                max_retries=max_retries,
+                retry_after_max=retry_after_max,
+                request_deadline=request_deadline,
+                deadline_at=end,
+                cache_max_entries=cache_max_entries,
+                fetcher=fetcher,
+            )
+            review_input_tokens += int(result["usage"]["input_tokens"])
+            review_output_tokens += int(result["usage"]["output_tokens"])
+            logger.info("review request_id=%s stage=%s cache_hit=%s elapsed_ms=%.0f", review_request_id, stage, result["cache_hit"], (time.monotonic() - started) * 1000)
+            return result
+        except ValueError as exc:
+            raise ReviewUpstreamInvalidResponseError("Jev review response was invalid") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise ReviewUnavailableError("Jev review request failed") from exc
+
+    evidence = review_questions(
+        {
+            "evidence": {
+                "type": "noul",
+                "instructions": "The candidate interval contains transcript-grounded advertising or promotional content covered by the supplied guidance, not merely editorial discussion or a brand mention.",
+            }
+        }, "evidence"
     )
-    if not _has_transcript_ad_evidence(candidate_text):
-        _review_unavailable(pool, "candidate lacks transcript-grounded advertising evidence")
+    if evidence["answers"]["evidence"] < enter:
+        _review_unavailable(pool, "Jev did not find sufficient advertising evidence")
+
+    if refine_boundaries and word_edges["start"] and word_edges["end"]:
+        start_word = _select_word(
+            prefix="start", words=word_edges["start"], enter=enter, request=review_questions
+        )
+        end_word = _select_word(
+            prefix="end", words=word_edges["end"], enter=enter, request=review_questions
+        )
+        if start_word is None or end_word is None:
+            _review_unavailable(pool, "Jev boundary Choice was inconclusive")
+        refined_start, refined_end = float(start_word["start"]), float(end_word["end"])
+        if (
+            refined_end <= refined_start
+            or refined_start < context_start
+            or refined_end > context_end
+            or min(refined_end, cand_end) <= max(refined_start, cand_start)
+            or min(refined_end, ad_end) <= max(refined_start, ad_start)
+        ):
+            _review_unavailable(pool, "Jev boundary Choice returned an invalid pair")
+        ad_start, ad_end = refined_start, refined_end
     verdict = {
         "is_ad": True,
         "start": ad_start,
@@ -502,5 +682,9 @@ def run_review(
             enter,
         ),
     }
-    logger.info("review: corroborated %.1fs-%.1fs (pool=%s)", ad_start, ad_end, pool)
-    return _envelope(echo_model, {"ads": [verdict]}, detection["usage"])
+    logger.info("review request_id=%s corroborated_start=%.3f corroborated_end=%.3f pool=%s", review_request_id, ad_start, ad_end, pool)
+    usage = {
+        "input_tokens": int(detection["usage"]["input_tokens"]) + review_input_tokens,
+        "output_tokens": int(detection["usage"]["output_tokens"]) + review_output_tokens,
+    }
+    return _envelope(echo_model, {"ads": [verdict]}, usage)

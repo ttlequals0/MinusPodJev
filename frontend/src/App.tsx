@@ -4,12 +4,27 @@ type Health = { status: string; environment: string; version: string }
 type Upstream = { configured: boolean; reachable: boolean; authenticated?: boolean; url: string; reason?: string }
 type Status = { status: string; jev: Upstream; minuspod: Upstream }
 type Latency = { count: number; sum: number; min: number; max: number; average: number }
+type Review = {
+  count: number
+  outcomes: {
+    confirmed: number
+    adjusted: number
+    rejected: number
+    inconclusive: number
+    upstream_error: number
+    invalid_request: number
+    internal_error: number
+  }
+  reasons: Record<string, number>
+  latency_ms: Latency
+}
 type Stats = {
   scope: { kind: 'process'; pid: number; configured_workers: number | null }
   reset_on_restart: boolean
   uptime_seconds: number
   proxy_requests: { count: number; success: number; failure: number; latency_ms: Latency }
   jev_http: { attempts: number; success: number; failure: number; unknown_usage: number; latency_ms: Latency }
+  review?: Review
   cache: { hits: number; misses: number }
   cost: { estimated_input_usd: number }
 }
@@ -143,7 +158,7 @@ function App() {
           <div className="section-heading"><div><h2 id="runtime-title">Runtime stats</h2><p>Current proxy process only. Counters reset when the process restarts.</p></div><span className="badge">Process scoped</span></div>
           {statsUpdatedAt && <p className="stats-updated">Stats updated {statsUpdatedAt.toLocaleTimeString()}</p>}
           {state.statsError && <div className="notice error" role="status">{state.stats ? `Stats refresh failed. Showing last received values: ${state.statsError}` : `Runtime stats unavailable: ${state.statsError}`}</div>}
-          <RuntimeStats stats={state.stats} />
+          <RuntimeStats stats={state.stats} statsError={state.statsError} />
         </section>
       </main>
     </div>
@@ -164,8 +179,8 @@ function UpstreamCard({ name, upstream }: { name: string; upstream: Upstream | u
   </dl></article>
 }
 
-function RuntimeStats({ stats }: { stats: Stats | null }) {
-  if (!stats) return <div className="notice" role="status">Loading runtime statistics...</div>
+function RuntimeStats({ stats, statsError }: { stats: Stats | null; statsError: string | null }) {
+  if (!stats) return <div className="notice" role="status">{statsError ? 'Runtime statistics unavailable.' : 'Loading runtime statistics...'}</div>
   const cacheTotal = stats.cache.hits + stats.cache.misses
   const cacheRate = cacheTotal ? `${Math.round((stats.cache.hits / cacheTotal) * 100)}%` : 'No samples'
   return <>
@@ -176,6 +191,12 @@ function RuntimeStats({ stats }: { stats: Stats | null }) {
       <Metric label="Average Jev round-trip" value={formatLatency(stats.jev_http.latency_ms.average, stats.jev_http.latency_ms.count)} detail="Upstream POST attempts, including retries" />
       <Metric label="Cache hit rate" value={cacheRate} detail={`${stats.cache.hits} hits, ${stats.cache.misses} misses`} />
       <Metric label="Estimated input cost" value={formatUsd(stats.cost.estimated_input_usd)} detail={`Uncached successful calls; ${stats.jev_http.unknown_usage} unknown usage`} />
+      {stats.review && <>
+        <Metric label="Review outcomes" value={stats.review.count.toLocaleString()} detail={`${stats.review.outcomes.confirmed} confirmed, ${stats.review.outcomes.adjusted} adjusted, ${stats.review.outcomes.rejected} rejected`} />
+        <Metric label="Review inconclusive" value={stats.review.outcomes.inconclusive.toLocaleString()} detail={`${stats.review.outcomes.invalid_request} invalid requests, ${stats.review.outcomes.internal_error} internal errors`} />
+        <Metric label="Review upstream failures" value={stats.review.outcomes.upstream_error.toLocaleString()} detail="Upstream failures are separate from inconclusive reviews" />
+        <Metric label="Average review latency" value={formatLatency(stats.review.latency_ms.average, stats.review.latency_ms.count)} detail="Completed review attempts in this process" />
+      </>}
     </div>
     <div className="runtime-details">
       <div><span>Process uptime</span><strong>{formatDuration(stats.uptime_seconds)}</strong></div>

@@ -88,7 +88,11 @@ def build_payload(
 
 def parse_response(body: dict[str, Any]) -> dict[str, Any]:
     """Normalize an upstream reply into cache-entry shape."""
+    if not isinstance(body, dict):
+        raise ValueError("upstream response must be an object")
     answers = body.get("answers") or {}
+    if not isinstance(answers, dict):
+        raise ValueError("upstream answers must be an object")
     probs: dict[str, float] = {}
     for key, ans in answers.items():
         if not key.startswith("s") or not isinstance(ans, dict):
@@ -97,6 +101,8 @@ def parse_response(body: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
             probs[key] = float(value)
     usage = body.get("usage") or {}
+    if not isinstance(usage, dict):
+        raise ValueError("upstream usage must be an object")
     return {
         "probabilities": probs,
         "input_tokens": _usage_tokens(usage, "input_tokens"),
@@ -330,6 +336,123 @@ def jev_ask(
         },
         "estimated_cost_usd": estimate_cost_usd(input_tokens),
         "spans": spans_from_probabilities(segments, probabilities, enter=enter, stay=stay),
+    }
+
+
+def _review_answers(body: dict[str, Any], questions: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Validate a mixed NouL/Choice review reply before it can enter the cache."""
+    if not isinstance(body, dict):
+        raise ValueError("upstream review response must be an object")
+    answers = body.get("answers")
+    expected_keys = set(questions)
+    if not isinstance(answers, dict) or set(answers) != expected_keys:
+        raise ValueError("upstream review answers do not match requested questions")
+    parsed: dict[str, Any] = {}
+    for key, answer in answers.items():
+        if not isinstance(answer, dict):
+            raise ValueError("upstream review answer must be an object")
+        if key == "evidence":
+            value = answer.get("noul")
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError("upstream review evidence must be a finite probability")
+            parsed[key] = float(value)
+            continue
+        criteria = questions[key].get("criteria")
+        if not isinstance(criteria, dict):
+            raise ValueError("review Choice criteria are invalid")
+        choice = answer.get("choice")
+        confidence = answer.get("confidence")
+        probabilities = answer.get("probabilities")
+        if not isinstance(choice, str) or not isinstance(probabilities, dict):
+            raise ValueError("upstream review Choice answer is malformed")
+        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+            raise ValueError("upstream review Choice confidence is invalid")
+        parsed_probs: dict[str, float] = {}
+        for option, value in probabilities.items():
+            if not isinstance(option, str) or not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError("upstream review Choice probabilities are invalid")
+            parsed_probs[option] = float(value)
+        if set(parsed_probs) != set(criteria) or choice not in parsed_probs:
+            raise ValueError("upstream review Choice selected an unknown option")
+        if abs(sum(parsed_probs.values()) - 1.0) > 1e-6:
+            raise ValueError("upstream review Choice probabilities do not sum to one")
+        if parsed_probs[choice] != max(parsed_probs.values()):
+            raise ValueError("upstream review Choice winner is inconsistent")
+        parsed[key] = {"choice": choice, "confidence": float(confidence), "probabilities": parsed_probs}
+    usage = body.get("usage") or {}
+    if not isinstance(usage, dict):
+        raise ValueError("upstream review usage must be an object")
+    return {
+        "answers": parsed,
+        "input_tokens": _usage_tokens(usage, "input_tokens"),
+        "output_tokens": _usage_tokens(usage, "output_tokens"),
+    }
+
+
+def jev_review_questions(
+    *,
+    state: dict[str, Any],
+    questions: dict[str, dict[str, Any]],
+    url: str,
+    api_key: str,
+    timeout: float,
+    cache_path: str,
+    model: str,
+    uid: str | None = None,
+    max_retries: int = 2,
+    retry_after_max: float = 5.0,
+    request_deadline: float = 75.0,
+    deadline_at: float | None = None,
+    cache_max_entries: int = 10_000,
+    fetcher: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Evaluate focused review questions through the validated shared cache."""
+    end = deadline_at if deadline_at is not None else time.monotonic() + request_deadline
+    full_state = dict(state)
+    if uid is not None:
+        full_state["uid"] = uid
+    payload = {"state": full_state, "model": model, "questions": questions}
+    cache = JsonCache(cache_path, max_entries=cache_max_entries)
+    send = fetcher or call_payload
+
+    def _fetch() -> dict[str, Any]:
+        metrics.record_cache(False)
+        kwargs: dict[str, Any] = {"url": url, "api_key": api_key, "timeout": timeout, "max_retries": max_retries}
+        if fetcher is None:
+            kwargs.update(retry_after_max=retry_after_max, deadline_at=end)
+        return _review_answers(send(payload, **kwargs), questions)
+
+    def _valid(entry: dict[str, Any]) -> bool:
+        if not isinstance(entry.get("input_tokens"), int) or isinstance(entry.get("input_tokens"), bool) or entry["input_tokens"] < 0:
+            return False
+        if not isinstance(entry.get("output_tokens"), int) or isinstance(entry.get("output_tokens"), bool) or entry["output_tokens"] < 0:
+            return False
+        answers = entry.get("answers")
+        if not isinstance(answers, dict) or set(answers) != set(questions):
+            return False
+        normalized = {"answers": {}, "usage": {"input_tokens": entry.get("input_tokens"), "output_tokens": entry.get("output_tokens")}}
+        for key, value in answers.items():
+            if key == "evidence" and isinstance(value, (int, float)) and not isinstance(value, bool):
+                normalized["answers"][key] = {"noul": value}
+            elif key != "evidence" and isinstance(value, dict):
+                normalized["answers"][key] = value
+            else:
+                return False
+        try:
+            _review_answers(normalized, questions)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    entry, hit = cache.get_or_fetch(payload, _fetch, valid=_valid)
+    if hit:
+        metrics.record_cache(True)
+    if time.monotonic() > end:
+        raise httpx.TimeoutException("Jev request deadline exceeded")
+    return {
+        "answers": entry["answers"],
+        "cache_hit": hit,
+        "usage": {"input_tokens": int(entry["input_tokens"]), "output_tokens": int(entry["output_tokens"])},
     }
 
 

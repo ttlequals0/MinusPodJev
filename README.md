@@ -139,8 +139,13 @@ bearer token nor `TYPESAFE_API_KEY` is rejected with 503. When a fallback key is
 a bearer token is still required unless `JEV_ALLOW_UNAUTHENTICATED_FALLBACK=true`.
 
 Jev review remains available when routed to the proxy, but it is correlated with Jev detection
-and is not an independent judgment. An unavailable Jev review returns 503 and does not confirm
-or move the candidate. Sponsor naming: set `MINUSPOD_BASE_URL` +
+and is not an independent judgment. It uses coarse segment context and parses word timing
+separately. The focused evidence NouL question adds an upstream call unless cached.
+`JEV_REVIEW_REFINE_BOUNDARIES=false` disables optional word-boundary refinement by default. Set it
+to `true` when provided word times should refine boundaries; the proxy handles Jev's 255-option
+Choice limit without truncating the supplied options. An inconclusive review returns 422 with
+`x-should-retry: false` and does not confirm or move the candidate. An upstream or invalid-upstream
+review error returns 503. MinusPod's local breaker still counts non-rate errors. Sponsor naming: set `MINUSPOD_BASE_URL` +
 `MINUSPOD_PASSWORD` and the proxy logs into MinusPod (cached session) to read
 `GET /api/v1/sponsors`. It emits `sponsor_name` only for one known sponsor with local ad
 evidence, using the `jev-` namespace, for example `jev-ButcherBox`. The prefix identifies a
@@ -182,6 +187,9 @@ parseable `WORKERS` environment hint, or `null` when unavailable. Metrics reset 
   to response headers. Health, models, status, and stats requests are excluded.
 - `jev_http` counts every actual upstream POST, including retry attempts. Its latency is the Jev
   HTTP attempt time, not the full MinusPod request path.
+- `review` counts fixed outcomes and safe reason codes with review latency. It stores no request
+  IDs, transcripts, boundaries, or secrets. Request IDs and numeric bounds are logged for
+  diagnosis.
 - `cache` separates cache hits and misses. `cost.estimated_input_usd` charges only successful,
   uncached upstream responses with valid reported input tokens, at Jev's published $0.042 per
   million input tokens. It is an estimate and excludes output token charges, fees, and taxes.

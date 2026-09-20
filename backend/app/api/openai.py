@@ -7,20 +7,33 @@ probes with the configured Jev model id.
 
 from __future__ import annotations
 
+import json
+import logging
 import threading
 import time
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from app.config import settings
 from app.services.openai_adapter import (
+    ReviewInconclusiveError,
+    ReviewInvalidRequestError,
     ReviewUnavailableError,
+    ReviewUpstreamInvalidResponseError,
+    extract_system_text,
+    extract_user_text,
+    is_review_request,
+    parse_candidate_bounds,
     run_chat_completion,
 )
+from app.utils.metrics import metrics
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 _REQUEST_SLOTS = threading.BoundedSemaphore(
     settings.JEV_MAX_CONCURRENT_REQUESTS
 )
@@ -70,19 +83,25 @@ class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-@router.post("/chat/completions")
+@router.post("/chat/completions", response_model=None)
 def chat_completions(
     request: ChatCompletionRequest, authorization: str | None = Header(default=None)
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """Turn an OpenAI chat request into a Jev detection and shape the reply."""
     api_key = _resolve_api_key(authorization)
     if not _REQUEST_SLOTS.acquire(blocking=False):
         raise HTTPException(status_code=429, detail="Proxy is at capacity")
 
+    messages = [m.model_dump() for m in request.messages]
+    review = is_review_request(extract_user_text(messages), extract_system_text(messages))
+    request_id = uuid.uuid4().hex if review else None
+    started = time.monotonic()
+    outcome: str | None = None
+    reason_code: str | None = None
     try:
         try:
-            return run_chat_completion(
-                messages=[m.model_dump() for m in request.messages],
+            response = run_chat_completion(
+                messages=messages,
                 request_model=request.model or settings.JEV_PUBLIC_MODEL,
                 url=settings.TYPESAFE_API_URL,
                 api_key=api_key,
@@ -98,11 +117,72 @@ def chat_completions(
                 cache_max_entries=settings.JEV_CACHE_MAX_ENTRIES,
                 request_deadline=settings.JEV_REQUEST_DEADLINE_SECONDS,
                 retry_after_max=settings.JEV_RETRY_AFTER_MAX_SECONDS,
+                refine_boundaries=settings.JEV_REVIEW_REFINE_BOUNDARIES,
+                review_request_id=request_id,
             )
-        except ReviewUnavailableError as exc:
-            raise HTTPException(status_code=503, detail="Review unavailable") from exc
+            if review:
+                outcome = _review_outcome(response, extract_user_text(messages))
+                return JSONResponse(content=response, headers={"X-Request-ID": request_id or ""})
+            return response
+        except ReviewInvalidRequestError:
+            outcome, reason_code = "invalid_request", "invalid_request"
+            return _review_error(422, "jev_review_invalid_request", "Review request is invalid", request_id)
+        except ReviewInconclusiveError as exc:
+            outcome, reason_code = "inconclusive", _inconclusive_reason(str(exc))
+            return _review_error(422, "jev_review_inconclusive", "Review is inconclusive", request_id)
+        except ReviewUpstreamInvalidResponseError:
+            outcome, reason_code = "upstream_error", "upstream_invalid_response"
+            return _review_error(503, "jev_review_upstream_invalid_response", "Review unavailable", request_id)
+        except ReviewUnavailableError:
+            outcome, reason_code = "upstream_error", "upstream_failure"
+            return _review_error(503, "jev_review_upstream_failure", "Review unavailable", request_id)
+        except Exception:
+            if review:
+                outcome, reason_code = "internal_error", "internal_error"
+            raise
     finally:
         _REQUEST_SLOTS.release()
+        if review:
+            metrics.record_review(outcome or "internal_error", (time.monotonic() - started) * 1000, reason_code)
+            logger.info("review request_id=%s outcome=%s reason=%s bounds=%s elapsed_ms=%.0f", request_id, outcome or "internal_error", reason_code or "unknown", parse_candidate_bounds(extract_user_text(messages)), (time.monotonic() - started) * 1000)
+
+
+def _inconclusive_reason(message: str) -> str:
+    lowered = message.lower()
+    if "unambiguous" in lowered:
+        return "ambiguous_spans"
+    if "evidence" in lowered:
+        return "insufficient_evidence"
+    if "choice" in lowered:
+        return "choice_inconclusive"
+    return "malformed_context"
+
+
+def _review_error(status: int, code: str, message: str, request_id: str | None) -> JSONResponse:
+    headers: dict[str, str] = {}
+    if status == 422:
+        headers["x-should-retry"] = "false"
+    if request_id is not None:
+        headers["X-Request-ID"] = request_id
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"message": message, "type": "invalid_request_error" if status == 422 else "api_error", "code": code}},
+        headers=headers,
+    )
+
+
+def _review_outcome(response: dict[str, Any], user_text: str) -> str:
+    content = response["choices"][0]["message"]["content"]
+    ads = json.loads(content).get("ads", [])
+    if not ads:
+        return "rejected"
+    bounds = parse_candidate_bounds(user_text)
+    if bounds is None:
+        return "confirmed"
+    ad = ads[0]
+    if abs(float(ad.get("start", bounds[0])) - bounds[0]) > 0.1 or abs(float(ad.get("end", bounds[1])) - bounds[1]) > 0.1:
+        return "adjusted"
+    return "confirmed"
 
 
 @router.get("/models")
