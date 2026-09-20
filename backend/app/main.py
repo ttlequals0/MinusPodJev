@@ -35,6 +35,8 @@ def _configure_logging() -> None:
 
 _configure_logging()
 logger = logging.getLogger(__name__)
+for _transport_logger in ("httpx", "httpcore"):
+    logging.getLogger(_transport_logger).setLevel(logging.INFO)
 
 
 @asynccontextmanager

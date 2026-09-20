@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from app.config import settings
 from app.services.openai_adapter import (
+    ReviewUnavailableError,
     is_review_request,
     parse_candidate_bounds,
     parse_review_segments,
@@ -35,7 +36,7 @@ def make_text_fake(*, keywords=_AD_KW, input_tokens=1200, output_tokens=6, raise
     proxy's internal sid assignment.
     """
 
-    def fake(payload: dict[str, Any], *, url: str, api_key: str, timeout: float) -> dict[str, Any]:
+    def fake(payload: dict[str, Any], *, url: str, api_key: str, timeout: float, max_retries: int = 2, **_kwargs: Any) -> dict[str, Any]:
         if raises:
             raise RuntimeError("upstream boom")
         sid_text: dict[str, str] = {}
@@ -282,10 +283,38 @@ def test_resurrection_miss_keeps_rejected(jev_env, tmp_path):
     assert verdict == "reject"  # keep-rejected: no content cut
 
 
+def test_ambiguous_overlapping_spans_are_unavailable(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        100.0,
+        200.0,
+        [(94.0, 100.0, "context before")],
+        [
+            (100.0, 105.0, "This is sponsored by BetterHelp"),
+            (105.0, 155.0, "The hosts return to their discussion"),
+            (155.0, 200.0, "Use promo code SHOW at betterhelp.com"),
+        ],
+        [(200.0, 206.0, "context after")],
+    )
+    with pytest.raises(ReviewUnavailableError, match="unambiguous"):
+        _run(prompt, make_text_fake(), tmp_path)
+
+
+def test_high_score_without_advertising_cue_is_unavailable(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        100.0,
+        110.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 110.0, "This unrelated editorial sentence has no promotion")],
+        [(110.0, 116.0, "context after")],
+    )
+    with pytest.raises(ReviewUnavailableError, match="transcript-grounded"):
+        _run(prompt, make_text_fake(keywords=("unrelated",)), tmp_path)
+
+
 # ---------------- safe degrade ----------------
 
 
-def test_degrade_no_transcript_confirms_original_accepted(jev_env, tmp_path):
+def test_degrade_no_transcript_is_unavailable(jev_env, tmp_path):
     # Markers present (routes to review) but no [start-end] lines to score.
     prompt = build_review_prompt(
         100.0, 120.0,
@@ -296,14 +325,11 @@ def test_degrade_no_transcript_confirms_original_accepted(jev_env, tmp_path):
     )
     assert is_review_request(prompt) is True
     assert parse_review_segments(prompt) == []
-    resp = _run(prompt, make_text_fake(), tmp_path)
-    content = resp["choices"][0]["message"]["content"]
-    verdict, start, end, _ = minuspod_review_verdict(content, 100.0, 120.0)
-    assert verdict == "confirmed"  # original span left untouched
-    assert (start, end) == (100.0, 120.0)
+    with pytest.raises(ReviewUnavailableError, match="could not be parsed"):
+        _run(prompt, make_text_fake(), tmp_path)
 
 
-def test_degrade_no_transcript_keeps_rejected_resurrection(jev_env, tmp_path):
+def test_degrade_no_transcript_resurrection_is_unavailable(jev_env, tmp_path):
     prompt = build_review_prompt(
         100.0, 120.0,
         [(94.0, 100.0, "context before")],
@@ -312,9 +338,8 @@ def test_degrade_no_transcript_keeps_rejected_resurrection(jev_env, tmp_path):
         pool="resurrection",
         with_timestamps=False,
     )
-    resp = _run(prompt, make_text_fake(), tmp_path)
-    content = resp["choices"][0]["message"]["content"]
-    assert json.loads(content) == {"ads": []}
+    with pytest.raises(ReviewUnavailableError, match="could not be parsed"):
+        _run(prompt, make_text_fake(), tmp_path)
 
 
 async def test_review_routes_through_the_endpoint(jev_env, client, monkeypatch):
@@ -336,7 +361,9 @@ async def test_review_routes_through_the_endpoint(jev_env, client, monkeypatch):
         ],
         "response_format": {"type": "json_object"},
     }
-    resp = await client.post("/v1/chat/completions", json=body)
+    resp = await client.post(
+        "/v1/chat/completions", json=body, headers={"Authorization": "Bearer test-key"}
+    )
     assert resp.status_code == 200
     data = resp.json()
     assert data["object"] == "chat.completion"
@@ -348,7 +375,30 @@ async def test_review_routes_through_the_endpoint(jev_env, client, monkeypatch):
     assert method == "json_object_ads_key"
 
 
-def test_degrade_on_upstream_failure_does_not_crash(jev_env, tmp_path):
+async def test_review_failure_returns_503(jev_env, client, monkeypatch):
+    import app.services.jev as jev
+
+    monkeypatch.setattr(jev, "call_payload", make_text_fake(raises=True))
+    prompt = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 110.0, "This episode is sponsored by BetterHelp")],
+        [
+            (110.0, 120.0, "Use promo code SHOW at betterhelp.com"),
+            (120.0, 126.0, "context after"),
+        ],
+    )
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": prompt}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Review unavailable"
+
+
+def test_review_upstream_failure_is_unavailable(jev_env, tmp_path):
     prompt = build_review_prompt(
         100.0, 120.0,
         [(94.0, 100.0, "context before")],
@@ -356,8 +406,5 @@ def test_degrade_on_upstream_failure_does_not_crash(jev_env, tmp_path):
          (110.0, 120.0, "Use promo code SHOW at betterhelp.com")],
         [(120.0, 126.0, "context after")],
     )
-    resp = _run(prompt, make_text_fake(raises=True), tmp_path)
-    content = resp["choices"][0]["message"]["content"]
-    verdict, start, end, _ = minuspod_review_verdict(content, 100.0, 120.0)
-    assert verdict == "confirmed"  # Jev failure -> no-change, not a crash
-    assert (start, end) == (100.0, 120.0)
+    with pytest.raises(ReviewUnavailableError, match="Jev review request failed"):
+        _run(prompt, make_text_fake(raises=True), tmp_path)

@@ -78,6 +78,9 @@ logs/
 docker-compose.override.yml
 jev_cache.json
 .DS_Store
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
 .idea/
 *.tsbuildinfo
 jev-benchmark-archive-2026-09-19.zip
@@ -93,3 +96,9 @@ jev-benchmark-archive-2026-09-19.zip
 benchmark/.venv/
 benchmark/results/archive/
 .DS_Store
+
+# --- agent context: keep out of git and the image ---
+CLAUDE.md
+AGENTS.md
+superpowers/
+.superpowers/

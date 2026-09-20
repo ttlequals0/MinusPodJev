@@ -93,7 +93,7 @@ def _bridged(
 
     The gap must contain at least one segment: an empty gap is silence, and
     silence between two breaks is what separates them. Without timing fields
-    the spanned gap is 0.0 seconds, so only directly adjacent runs merge.
+    there is no safe basis for bridging, so segment-id mode keeps runs separate.
     """
     if not runs:
         return []
@@ -101,6 +101,9 @@ def _bridged(
     for lo, hi in runs[1:]:
         prev_lo, prev_hi = out[-1]
         between = ordered[prev_hi + 1 : lo]
+        if any("start" not in s or "end" not in s for s in [*between, ordered[prev_hi], ordered[lo]]):
+            out.append((lo, hi))
+            continue
         spanned = sum(
             _time(s, "end", 0.0) - _time(s, "start", 0.0) for s in between
         )

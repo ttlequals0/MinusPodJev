@@ -1,21 +1,12 @@
-# Multi-stage Dockerfile for Python Web App Template
-# Builds both frontend and backend into a single image
+# Builds the status frontend and proxy backend into one image.
 
 # Stage 1: Frontend Build
 FROM node:20-alpine AS frontend-builder
 
 WORKDIR /app/frontend
 
-# Copy package files
-COPY frontend/package*.json ./
-COPY frontend/yarn.lock* ./
-COPY frontend/pnpm-lock.yaml* ./
-
-# Install dependencies
-RUN if [ -f yarn.lock ]; then yarn install --frozen-lockfile; \
-    elif [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm install --frozen-lockfile; \
-    elif [ -f package-lock.json ]; then npm ci; \
-    else npm install; fi
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
 
 # Copy frontend source
 COPY frontend/ ./

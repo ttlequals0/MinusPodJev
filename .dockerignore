@@ -73,3 +73,13 @@ logs/
 .env.*
 !.env.example
 jev-benchmark-archive-2026-09-19.zip
+jev_cache.json
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+
+# --- agent context: keep out of git and the image ---
+CLAUDE.md
+AGENTS.md
+superpowers/
+.superpowers/

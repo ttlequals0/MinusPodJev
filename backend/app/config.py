@@ -42,10 +42,39 @@ class Settings(BaseSettings):
         description="Model id advertised on /models and echoed to OpenAI callers",
     )
     JEV_CACHE_PATH: str = Field(
-        default="./jev_cache.json", description="Path of the on-disk JSON response cache"
+        default="./jev_cache.json",
+        description="Legacy JSON cache path; active SQLite cache is stored beside it",
+    )
+    JEV_CACHE_MAX_ENTRIES: int = Field(
+        default=10_000, ge=1, description="Maximum cached Jev response entries"
     )
     JEV_TIMEOUT_SECONDS: float = Field(
-        default=60.0, description="Upstream HTTP timeout in seconds"
+        default=60.0, gt=0.0, allow_inf_nan=False, description="Upstream HTTP timeout in seconds"
+    )
+    JEV_MAX_RETRIES: int = Field(
+        default=2, ge=0, description="Retries on transient upstream failures before giving up"
+    )
+    JEV_RETRY_AFTER_MAX_SECONDS: float = Field(
+        default=5.0,
+        ge=0.0,
+        allow_inf_nan=False,
+        description="Maximum delay honored from an upstream Retry-After",
+    )
+    JEV_REQUEST_DEADLINE_SECONDS: float = Field(
+        default=75.0,
+        gt=0.0,
+        allow_inf_nan=False,
+        description="Cooperative request budget for one Jev operation including retries",
+    )
+    JEV_ALLOW_UNAUTHENTICATED_FALLBACK: bool = Field(
+        default=False, description="Allow using TYPESAFE_API_KEY when a caller omits bearer auth"
+    )
+    JEV_MAX_SEGMENTS: int = Field(default=300, ge=1, description="Maximum segments per request")
+    JEV_MAX_TRANSCRIPT_CHARS: int = Field(
+        default=200_000, ge=1, description="Maximum transcript characters per request"
+    )
+    JEV_MAX_CONCURRENT_REQUESTS: int = Field(
+        default=4, ge=1, description="Maximum simultaneous upstream requests per worker"
     )
     JEV_ENTER: float = Field(
         default=0.95, description="Span-open probability threshold (noul >= enter)"
@@ -75,6 +104,12 @@ class Settings(BaseSettings):
     SPONSOR_CACHE_TTL_SECONDS: float = Field(
         default=3600.0, description="TTL of the cached MinusPod sponsor matcher in seconds"
     )
+    SPONSOR_FAILURE_COOLDOWN_SECONDS: float = Field(
+        default=900.0,
+        ge=0.0,
+        allow_inf_nan=False,
+        description="Delay before retrying a failed sponsor refresh",
+    )
     MINUSPOD_SESSION_TTL_SECONDS: float = Field(
         default=1800.0, description="How long to reuse a login session before re-logging-in"
     )
@@ -101,16 +136,6 @@ class Settings(BaseSettings):
         case_sensitive=True,
         extra="allow",
     )
-
-    def require_jev_api_key(self) -> str:
-        """Return the upstream bearer token or raise a clear config error."""
-        if not self.TYPESAFE_API_KEY:
-            raise ValueError(
-                "TYPESAFE_API_KEY is not set. Export it or put it in .env before "
-                "calling the Jev endpoint."
-            )
-        return self.TYPESAFE_API_KEY
-
 
 @lru_cache
 def get_settings() -> Settings:

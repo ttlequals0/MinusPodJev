@@ -61,11 +61,10 @@ print_success "Using SQLite for tests"
 run_check "Backend tests with coverage" "TESTING=true uv run pytest -q --cov=backend/app --cov-report=term"
 
 print_section "Python Linting"
-if ! run_check "Ruff" "uv run ruff check backend/"; then
-    if [ "$AUTO_FIX" = true ]; then
-        echo -e "${YELLOW}Auto-fixing Ruff issues...${NC}"
-        uv run ruff check backend/ --fix || true
-    fi
+if [ "$AUTO_FIX" = true ]; then
+    run_check "Ruff (auto-fix)" "uv run ruff check backend/ --fix"
+else
+    run_check "Ruff" "uv run ruff check backend/ --no-fix"
 fi
 run_check "MyPy" "uv run mypy backend/app/ --ignore-missing-imports"
 
@@ -76,6 +75,7 @@ if command -v node >/dev/null 2>&1; then
     run_check "Frontend TypeScript check" "npm run type-check"
     run_check "Frontend lint" "npm run lint"
     run_check "Frontend build" "npm run build"
+    run_check "Frontend production dependency audit" "npm audit --omit=dev --audit-level=high"
     cd "$PROJECT_ROOT"
 else
     print_warning "Node.js not installed. Skipping frontend checks."

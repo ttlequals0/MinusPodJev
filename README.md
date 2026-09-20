@@ -27,20 +27,21 @@ flowchart TD
 
   det -->|primary| proxy
   ver -->|primary| proxy
-  rev -->|primary| proxy
-  chap -->|secondary| real["Real chat model"]
+  rev -->|secondary| real["Real chat model"]
+  rev -.->|optional primary| proxy
+  chap -->|secondary| real
 
   subgraph proxy["jevproxy  POST /v1/chat/completions"]
     disc{"candidate markers or review prompt?"}
     parse["parse Xs-Ys lines to segments"]
     detf["detection: assemble spans + category"]
     revf["review: verdict"]
-    spon["sponsor_name: match MinusPod /sponsors, else jev-uuid"]
+    spon["sponsor_name: confirmed match -> jev-<brand>, else omitted"]
     disc -->|no| parse --> detf --> spon
     disc -->|yes| revf
   end
 
-  proxy -->|"noul per segment, no model field, bearer = TypeSafe key"| jev[("TypeSafe Jev System One")]
+  proxy -->|"noul per segment, model = jev-latest, bearer = TypeSafe key"| jev[("TypeSafe Jev System One")]
   jev -->|per-segment probabilities| proxy
   spon -.->|"login + GET /api/v1/sponsors"| mpapi[("MinusPod API")]
 
@@ -62,11 +63,11 @@ One `/chat/completions` handler covers three of MinusPod's four LLM phases:
 - **detection** - the window prompt.
 - **verification** - re-detection on the re-cut audio, same prompt, handled identically.
 - **review** - per-ad prompts (marked `>>> CANDIDATE AD START` / `<<< CANDIDATE AD END`) get
-  Jev's verdict schema (is_ad, boundaries, confidence); resurrection too. Trim-recovery needs
-  generation, so it degrades to a no-change verdict.
+  Jev's verdict schema (is_ad, boundaries, confidence), including resurrection candidates.
 
-The fourth phase, chapter generation, is generative and Jev cannot do it, so chapters route
-to a real model (see the table).
+> Note: Jev Proxy does not support chapter generation. You still need a chat model for
+> chapter titles. Configure a secondary chat-model provider and set `chapters_provider` to
+> `secondary`; do not route chapter generation to this proxy.
 
 Endpoints:
 - `POST /v1/chat/completions`, `POST /chat/completions` - the OpenAI surface MinusPod calls
@@ -77,29 +78,60 @@ Endpoints:
 
 ### Pointing MinusPod at it (settings only, no app-code change)
 
-MinusPod routes a provider per phase (`llm_route.py`). Set the **primary** provider to the
-proxy (`openai_compatible`, your proxy's base URL, model `typesafe/jev`, addressing mode
-`timestamps`, API key = your **TypeSafe key**, which the proxy forwards to Jev). Set a
-**secondary** provider to a real chat model for chapters.
+MinusPod routes a provider per phase (`llm_route.py`). Set the detection and verification
+provider to the proxy (`openai_compatible`, your proxy's base URL, model `typesafe/jev`,
+addressing mode `timestamps`, API key = your **TypeSafe key**, which the proxy forwards to Jev).
+For independent review, you can configure a separate chat model as the secondary provider for
+review and chapter titles. This is a recommended POC configuration, not a change applied to
+MinusPod by this repository.
+
+The caller's system policy is forwarded to Jev's detection and category classification guidance.
+Policies over 12,000 characters are rejected with 422; they are never silently truncated.
 
 | phase | provider slot | goes to |
 |---|---|---|
 | `detection_provider` | primary | proxy -> Jev |
 | `verification_provider` | primary | proxy -> Jev |
-| `review_provider` | primary | proxy -> Jev |
+| `review_provider` | secondary | independent chat model |
 | `chapters_provider` | secondary | a real chat model |
 
-`typesafe/jev` maps to the upstream Jev model internally; the proxy returns 503 only if
-neither a bearer token nor `TYPESAFE_API_KEY` is present.
+`typesafe/jev` maps to the upstream Jev model internally. A request with neither a caller
+bearer token nor `TYPESAFE_API_KEY` is rejected with 503. When a fallback key is configured,
+a bearer token is still required unless `JEV_ALLOW_UNAUTHENTICATED_FALLBACK=true`.
 
-Sponsor naming: set `MINUSPOD_BASE_URL` + `MINUSPOD_PASSWORD` and the proxy logs into MinusPod
-(cached session) to read `GET /api/v1/sponsors`, matching name and aliases into
-`sponsor_name`. No match gets a unique `jev-<7char>` placeholder, so pattern learning never
-clusters unnamed ads. Unset `MINUSPOD_BASE_URL` falls back to the gazetteer.
+Jev review remains available when routed to the proxy, but it is correlated with Jev detection
+and is not an independent judgment. An unavailable Jev review returns 503 and does not confirm
+or move the candidate. Sponsor naming: set `MINUSPOD_BASE_URL` +
+`MINUSPOD_PASSWORD` and the proxy logs into MinusPod (cached session) to read
+`GET /api/v1/sponsors`. It emits `sponsor_name` only for one known sponsor with local ad
+evidence, using the `jev-` namespace, for example `jev-ButcherBox`. The prefix identifies a
+proxy-generated learned record and the suffix is the matched canonical brand; an unmatched span
+leaves the field absent, preventing false sponsor evidence. Its `Based on transcript:` rationale
+quotes source evidence rather than synthetic ad wording, and the compatibility parser recognizes
+it as rationale. Unset `MINUSPOD_BASE_URL` falls back to the gazetteer.
 
-Review tunables (`config.py`): the review route reuses `JEV_ENTER`/`JEV_STAY` and emits Jev's
-segment-edge boundaries, so a disagreement reads as "adjust" (MinusPod clamps it). Switch to
-confirm-in-place to never move a boundary.
+### MinusPod runtime ownership
+
+Jev Proxy is a POC shim. It does not change the MinusPod runtime that controls holds,
+autoapproval, or verification logs. `compat/minuspod_compat` is an import-free snapshot used
+only for offline validation. Keep production operations in the existing MinusPod application
+until Jev is mature.
+
+### Request safety and cache
+
+- A caller bearer token is required by default and is forwarded as the TypeSafe key. Set
+  `JEV_ALLOW_UNAUTHENTICATED_FALLBACK=true` only for a protected internal deployment that must
+  permit a configured `TYPESAFE_API_KEY` without a caller bearer token.
+- Requests are bounded by `JEV_MAX_CONCURRENT_REQUESTS=4` per worker, `JEV_MAX_SEGMENTS=300`,
+  and `JEV_MAX_TRANSCRIPT_CHARS=200000`. The Docker default of 2 workers therefore permits up
+  to 8 concurrent requests. Requests outside the configured size or segment limits are rejected
+  before an upstream inference call.
+- `JEV_REQUEST_DEADLINE_SECONDS=75` is a cooperative request budget covering retries and retry
+  waits. Keep it below nginx's 90 second response-inactivity timeout when changing either value.
+- `JEV_CACHE_PATH` is retained as the legacy JSON import source. Active responses are stored in
+  a SQLite sidecar beside it and capped at `JEV_CACHE_MAX_ENTRIES=10000` entries. Failed sponsor
+  refreshes pause for `SPONSOR_FAILURE_COOLDOWN_SECONDS=900` seconds before another attempt.
+  This cooldown is per worker, so account for workers and replicas against MinusPod's login limit.
 
 ### Run it
 
@@ -123,6 +155,14 @@ uv run pytest backend/tests -q   # upstream calls mocked; no network
   to poll. `GET /api/health` is liveness.
 - Logs go to stdout at `LOG_LEVEL` (`DEBUG` for verbose tracing). The TypeSafe key, MinusPod
   password, session cookies, and Authorization header are never logged.
+- The included status page uses `/api/health` and `/api/status` directly. It reports live
+  reachability and performs no inference or MinusPod login.
+
+### Docker Compose exposure
+
+`docker compose up -d` publishes `127.0.0.1:8080` by default, so only the host can reach the
+proxy. For intentional LAN or reverse-proxy exposure, set `JEVPROXY_BIND_ADDRESS=0.0.0.0` in
+your environment and provide appropriate network access controls.
 
 ## benchmark
 

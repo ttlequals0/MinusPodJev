@@ -1,9 +1,9 @@
 """Sponsor matching from MinusPod's live sponsor list, with a SEED fallback.
 
 MinusPod clusters ad patterns by sponsor name. Jev never names a sponsor, so
-for a real sponsor we look one up from MinusPod's GET /api/v1/sponsors, and for
-an unknown span we emit a unique jev-<7char> placeholder so pattern creation
-does not cluster unrelated unnamed spans.
+for a real sponsor we look one up from MinusPod's GET /api/v1/sponsors. The
+authoritative matcher returns no name for incidental or ambiguous mentions;
+the legacy sponsor_for_span API retains its unique jev-<7char> fallback.
 
 MinusPod requires a password login that returns session cookies (there is no
 static token). We log in once, cache the cookies in-memory, reuse them for the
@@ -42,9 +42,13 @@ _FETCH_TIMEOUT_SECONDS = 5.0
 # Login is a POST that can be slower; mirrors the benchmark reference.
 _LOGIN_TIMEOUT_SECONDS = 15.0
 _PLACEHOLDER_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
+_SPONSOR_CUE = r"(?:sponsored by|brought to you by|thanks to our sponsor)"
+_PROMO_CUE = r"(?:promo|discount)\s+code"
 
 _lock = threading.Lock()
-_cache: dict[str, Any] = {"rows": None, "built_at": 0.0, "url": None}
+_cache: dict[str, Any] = {"rows": None, "built_at": 0.0, "url": None, "failure_until": 0.0}
+
+_refresh_lock = threading.Lock()
 
 _session_lock = threading.Lock()
 _session: dict[str, Any] = {"cookies": None, "created_at": 0.0}
@@ -57,7 +61,7 @@ class SponsorAuthError(Exception):
 def reset_cache() -> None:
     """Drop the cached matcher and session; used by tests and after a config change."""
     with _lock:
-        _cache.update(rows=None, built_at=0.0, url=None)
+        _cache.update(rows=None, built_at=0.0, url=None, failure_until=0.0)
     with _session_lock:
         _session.update(cookies=None, created_at=0.0)
 
@@ -104,7 +108,8 @@ def fetch_sponsors(url: str, cookies: dict[str, str], timeout: float) -> dict[st
 
 
 def _acquire_session(
-    base_url: str, password: str, *, stale: dict[str, str] | None = None
+    base_url: str, password: str, *, stale: dict[str, str] | None = None,
+    deadline_at: float | None = None,
 ) -> dict[str, str]:
     """Return live session cookies, logging in under a lock when needed.
 
@@ -126,7 +131,10 @@ def _acquire_session(
             return cookies  # a peer logged in while we waited
         if stale is not None and cookies is not None and cookies is not stale:
             return cookies  # a peer already replaced the rejected session
-        new_cookies = login(base_url, password, _LOGIN_TIMEOUT_SECONDS)
+        timeout = _LOGIN_TIMEOUT_SECONDS
+        if deadline_at is not None:
+            timeout = min(timeout, max(0.01, deadline_at - time.monotonic()))
+        new_cookies = login(base_url, password, timeout)
         _session.update(cookies=new_cookies, created_at=time.monotonic())
         return new_cookies
 
@@ -139,80 +147,117 @@ def _sorted(rows: _Rows) -> _Rows:
 def _rows_from_live(data: Any) -> _Rows:
     """Flatten {"sponsors":[{"name":..,"aliases":[..]}]} into (name, term) rows."""
     sponsors = data.get("sponsors") if isinstance(data, dict) else None
+    if not isinstance(sponsors, list):
+        return []
     rows: _Rows = []
     for entry in sponsors or []:
         if not isinstance(entry, dict):
             continue
         name = str(entry.get("name") or "").strip()
-        if not name:
+        if not name or name.lower().startswith("jev-"):
             continue
-        for term in [name, *(str(a).strip() for a in entry.get("aliases") or [])]:
+        aliases = entry.get("aliases") or []
+        if not isinstance(aliases, list):
+            return []
+        for term in [name, *(str(a).strip() for a in aliases)]:
             if term:
                 rows.append((name, term))
     return _sorted(rows)
 
 
 def _rows_from_seed() -> _Rows:
-    """SEED_SPONSORS names only: the offline fallback matcher."""
-    return _sorted([(e["name"], e["name"]) for e in SEED_SPONSORS if e.get("name")])
+    """SEED_SPONSORS names and aliases: the offline fallback matcher."""
+    rows: _Rows = []
+    for entry in SEED_SPONSORS:
+        name = str(entry.get("name") or "").strip()
+        if not name or name.lower().startswith("jev-"):
+            continue
+        aliases = entry.get("aliases") or []
+        rows.extend((name, term) for term in [name, *aliases] if str(term).strip())
+    return _sorted(rows)
 
 
-def _load_rows(base_url: str, password: str) -> _Rows:
+def _load_rows(base_url: str, password: str, deadline_at: float | None = None) -> tuple[_Rows, bool]:
     """Build the matcher from the live list, else the SEED names."""
     sponsors_url = base_url.rstrip("/") + _SPONSORS_PATH
+    if deadline_at is not None and time.monotonic() >= deadline_at:
+        return _rows_from_seed(), True
     try:
-        cookies = _acquire_session(base_url, password)
+        cookies = _acquire_session(base_url, password, deadline_at=deadline_at)
     except Exception as exc:  # noqa: BLE001 - never break the request path
-        logger.warning("sponsors: login failed (%s); using SEED_SPONSORS", exc)
-        return _rows_from_seed()
+        logger.warning("sponsors: login failed (%s); using SEED_SPONSORS", type(exc).__name__)
+        return _rows_from_seed(), True
     try:
-        data = fetch_sponsors(sponsors_url, cookies, _FETCH_TIMEOUT_SECONDS)
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            return _rows_from_seed(), True
+        timeout = _FETCH_TIMEOUT_SECONDS if deadline_at is None else max(0.01, min(_FETCH_TIMEOUT_SECONDS, deadline_at - time.monotonic()))
+        data = fetch_sponsors(sponsors_url, cookies, timeout)
     except SponsorAuthError:
         # Session rejected: re-login once, then retry the GET a single time.
         try:
-            cookies = _acquire_session(base_url, password, stale=cookies)
-            data = fetch_sponsors(sponsors_url, cookies, _FETCH_TIMEOUT_SECONDS)
+            if deadline_at is not None and time.monotonic() >= deadline_at:
+                return _rows_from_seed(), True
+            cookies = _acquire_session(base_url, password, stale=cookies, deadline_at=deadline_at)
+            timeout = _FETCH_TIMEOUT_SECONDS if deadline_at is None else max(0.01, min(_FETCH_TIMEOUT_SECONDS, deadline_at - time.monotonic()))
+            data = fetch_sponsors(sponsors_url, cookies, timeout)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("sponsors: re-login/refetch failed (%s); using SEED_SPONSORS", exc)
-            return _rows_from_seed()
+            logger.warning("sponsors: re-login/refetch failed (%s); using SEED_SPONSORS", type(exc).__name__)
+            return _rows_from_seed(), True
     except Exception as exc:  # noqa: BLE001
-        logger.warning("sponsors: fetch failed (%s); using SEED_SPONSORS", exc)
-        return _rows_from_seed()
+        logger.warning("sponsors: fetch failed (%s); using SEED_SPONSORS", type(exc).__name__)
+        return _rows_from_seed(), True
     rows = _rows_from_live(data)
     if rows:
-        return rows
+        return rows, False
     logger.warning("sponsors: live list empty; using SEED_SPONSORS")
-    return _rows_from_seed()
+    return _rows_from_seed(), True
 
 
-def _get_rows() -> _Rows:
+def _get_rows(deadline_at: float | None = None) -> _Rows:
     """Cached matcher rows, refetched when base_url changes or the TTL lapses."""
     base_url = settings.MINUSPOD_BASE_URL
     password = settings.MINUSPOD_PASSWORD
     now = time.monotonic()
     with _lock:
         rows: list[tuple[str, str]] | None = _cache["rows"]
-        if (
-            rows is not None
-            and _cache["url"] == base_url
-            and now - _cache["built_at"] < settings.SPONSOR_CACHE_TTL_SECONDS
-        ):
-            return rows
-    if not base_url or not password:
-        rows = _rows_from_seed()  # unconfigured -> offline gazetteer
-    else:
-        rows = _load_rows(base_url, password)  # fetch outside the lock
-    with _lock:
-        _cache.update(rows=rows, built_at=now, url=base_url)
-    return rows
+        if rows is not None and _cache["url"] == base_url:
+            age = now - _cache["built_at"]
+            failure_until = _cache["failure_until"]
+            if (failure_until and now < failure_until) or (not failure_until and age < settings.SPONSOR_CACHE_TTL_SECONDS):
+                return rows
+    wait = None if deadline_at is None else max(0.0, deadline_at - now)
+    acquired = _refresh_lock.acquire(timeout=wait) if wait is not None else _refresh_lock.acquire()
+    if not acquired:
+        return rows if _cache.get("url") == base_url and rows is not None else _rows_from_seed()
+    try:
+        now = time.monotonic()
+        with _lock:
+            rows = _cache["rows"]
+            if rows is not None and _cache["url"] == base_url:
+                age = now - _cache["built_at"]
+                failure_until = _cache["failure_until"]
+                if (failure_until and now < failure_until) or (not failure_until and age < settings.SPONSOR_CACHE_TTL_SECONDS):
+                    return rows
+        if not base_url or not password:
+            rows, failed = _rows_from_seed(), False
+        else:
+            rows, failed = _load_rows(base_url, password, deadline_at)
+        completed_at = time.monotonic()
+        cooldown = settings.SPONSOR_FAILURE_COOLDOWN_SECONDS
+        with _lock:
+            _cache.update(rows=rows, built_at=completed_at, url=base_url,
+                          failure_until=completed_at + cooldown if failed else 0.0)
+        return rows
+    finally:
+        _refresh_lock.release()
 
 
-def match_sponsor(text: str) -> str | None:
+def match_sponsor(text: str, deadline_at: float | None = None) -> str | None:
     """Canonical name of the first sponsor term found on a word-ish boundary.
 
     Case-insensitive; terms are tried longest first so a specific name wins.
     """
-    for name, term in _get_rows():
+    for name, term in _get_rows(deadline_at):
         pattern = rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])"
         if re.search(pattern, text, re.IGNORECASE):
             return name
@@ -223,10 +268,56 @@ def _placeholder() -> str:
     return "jev-" + "".join(secrets.choice(_PLACEHOLDER_ALPHABET) for _ in range(7))
 
 
-def sponsor_for_span(text: str) -> str:
+def sponsor_for_span(text: str, deadline_at: float | None = None) -> str:
     """A matched canonical sponsor, else a fresh jev-<7char> placeholder.
 
     The placeholder is unique per unmatched span so MinusPod's per-sponsor
     pattern clustering never groups unrelated unnamed spans together.
     """
-    return match_sponsor(text) or _placeholder()
+    return match_sponsor(text, deadline_at) or _placeholder()
+
+
+def matched_sponsor_for_span(text: str, deadline_at: float | None = None) -> str | None:
+    """Return one known sponsor with evidence bound to that sponsor mention."""
+    rows = _get_rows(deadline_at)
+    terms_by_name: dict[str, set[str]] = {}
+    for name, term in rows:
+        terms_by_name.setdefault(name, set()).add(term)
+    matched_names = {
+        name for name, terms in terms_by_name.items()
+        if any(
+            re.search(rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])", text, re.IGNORECASE)
+            for term in terms
+        )
+    }
+    if not matched_names:
+        return None
+    grounded: set[str] = set()
+    for name in matched_names:
+        terms = terms_by_name[name]
+        direct = False
+        for term in terms:
+            cue = re.compile(
+                rf"\b{_SPONSOR_CUE}\s+(?:the\s+)?{re.escape(term)}\b",
+                re.IGNORECASE,
+            )
+            promo = re.compile(
+                rf"\b{re.escape(term)}\b[^.!?]{{0,40}}\b{_PROMO_CUE}\b",
+                re.IGNORECASE,
+            )
+            use_code = re.compile(
+                rf"\buse\s+(?:promo\s+)?code\s+\w+\s+(?:at|with|from)\s+{re.escape(term)}\b",
+                re.IGNORECASE,
+            )
+            for match in cue.finditer(text):
+                if not re.search(r"\bnot\s+$", text[max(0, match.start() - 24) : match.start()], re.IGNORECASE):
+                    direct = True
+            negated = re.search(
+                rf"\bnot\s+(?:an?\s+)?sponsor(?:ed)?(?:\s+by)?\s+{re.escape(term)}\b",
+                text,
+                re.IGNORECASE,
+            )
+            direct = direct or (not negated and bool(promo.search(text))) or (not negated and bool(use_code.search(text)))
+        if direct:
+            grounded.add(name)
+    return next(iter(grounded)) if len(grounded) == 1 else None

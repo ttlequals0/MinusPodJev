@@ -32,12 +32,13 @@ def clean_session():
 def _fake_fetcher(ad_sids):
     ad_sids = set(ad_sids)
 
-    def fake(payload: dict[str, Any], *, url: str, api_key: str, timeout: float) -> dict[str, Any]:
-        answers = {
-            key: {"noul": 0.98 if int(key[1:]) in ad_sids else 0.02}
-            for key in payload["questions"]
-            if key.startswith("s")
-        }
+    def fake(payload: dict[str, Any], *, url: str, api_key: str, timeout: float, max_retries: int = 2, **_kwargs: Any) -> dict[str, Any]:
+        answers = {}
+        for key in payload["questions"]:
+            if key.startswith("s"):
+                answers[key] = {"noul": 0.98 if int(key[1:]) in ad_sids else 0.02}
+            elif key.startswith("c"):
+                answers[key] = {"noul": 0.97 if key == "c0" else 0.05}
         return {"answers": answers, "usage": {"input_tokens": 1000, "output_tokens": 5}}
 
     return fake
@@ -48,6 +49,11 @@ def test_redact_masks_bearer_and_password():
     assert redact('{"password": "hunter2"}') == '{"password": [REDACTED]}'
     assert redact("password=hunter2 next") == "password=[REDACTED] next"
     assert redact("nothing to redact here") == "nothing to redact here"
+
+
+def test_http_transport_debug_logging_is_suppressed():
+    assert logging.getLogger("httpx").level >= logging.INFO
+    assert logging.getLogger("httpcore").level >= logging.INFO
 
 
 def test_call_payload_never_logs_the_bearer(caplog):

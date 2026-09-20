@@ -5,7 +5,12 @@ from typing import Any
 
 import pytest
 from app.config import settings
-from app.services.openai_adapter import extract_user_text, parse_transcript
+from app.services.openai_adapter import (
+    CallerPolicyTooLongError,
+    extract_user_text,
+    parse_transcript,
+    run_chat_completion,
+)
 from minuspod_compat import (
     AD_DETECTION_JSON_SCHEMA,
     format_window_prompt,
@@ -30,7 +35,7 @@ def make_fake(ad_sids, *, cat_index=0, input_tokens=1000, output_tokens=5):
     """Fetcher that scores s<sid> detection and c<index> category questions."""
     ad_sids = set(ad_sids)
 
-    def fake(payload: dict[str, Any], *, url: str, api_key: str, timeout: float) -> dict[str, Any]:
+    def fake(payload: dict[str, Any], *, url: str, api_key: str, timeout: float, max_retries: int = 2, **_kwargs: Any) -> dict[str, Any]:
         answers: dict[str, Any] = {}
         for key in payload["questions"]:
             if key.startswith("s"):
@@ -118,7 +123,9 @@ async def test_chat_completions_timestamps_round_trip(jev_env, client, monkeypat
         "response_format": {"type": "json_object"},
         "temperature": 0,
     }
-    resp = await client.post("/v1/chat/completions", json=body)
+    resp = await client.post(
+        "/v1/chat/completions", json=body, headers={"Authorization": "Bearer test-key"}
+    )
     assert resp.status_code == 200
     data = resp.json()
 
@@ -131,18 +138,18 @@ async def test_chat_completions_timestamps_round_trip(jev_env, client, monkeypat
 
     content = data["choices"][0]["message"]["content"]
     assert isinstance(content, str)
-    # every emitted ad key is part of the detection schema
+    # The proxy adds only its provenance label beyond MinusPod's base schema.
     for raw_ad in json.loads(content)["ads"]:
-        assert set(raw_ad) <= _SCHEMA_AD_KEYS, set(raw_ad) - _SCHEMA_AD_KEYS
+        assert set(raw_ad) <= _SCHEMA_AD_KEYS
     ads = parse_ads_from_response(content)
     assert len(ads) == 1
     ad = ads[0]
     assert ad["start"] == 18.0
     assert ad["end"] == 36.0
     assert ad["category"] == "sponsor"
-    assert ad["sponsor"] == "BetterHelp"
+    assert ad["sponsor"] == "jev-BetterHelp"
     assert ad["end_text"].startswith("Use code SHOW")
-    assert ad["reason"] == "jev ad: 3/3 segments >= enter"
+    assert ad["reason"].startswith("Based on transcript: This episode is sponsored by BetterHelp.")
 
 
 async def test_chat_completions_no_ads(jev_env, client, monkeypatch):
@@ -152,7 +159,9 @@ async def test_chat_completions_no_ads(jev_env, client, monkeypatch):
 
     prompt = format_window_prompt("My Podcast", "Ep 1", "", TS_LINES, 0, 1, 0.0, 600.0)
     body = {"model": "jev-latest", "messages": [{"role": "user", "content": prompt}]}
-    resp = await client.post("/chat/completions", json=body)
+    resp = await client.post(
+        "/chat/completions", json=body, headers={"Authorization": "Bearer test-key"}
+    )
     assert resp.status_code == 200
     data = resp.json()
     assert data["object"] == "chat.completion"
@@ -163,11 +172,28 @@ async def test_chat_completions_no_ads(jev_env, client, monkeypatch):
 
 async def test_chat_completions_empty_prompt(jev_env, client):
     body = {"model": "jev-latest", "messages": [{"role": "user", "content": "no lines here"}]}
-    resp = await client.post("/v1/chat/completions", json=body)
+    resp = await client.post(
+        "/v1/chat/completions", json=body, headers={"Authorization": "Bearer test-key"}
+    )
     assert resp.status_code == 200
     data = resp.json()
     assert json.loads(data["choices"][0]["message"]["content"]) == {"ads": []}
     assert data["usage"]["total_tokens"] == 0
+
+
+async def test_chat_completions_rejects_oversized_system_policy(jev_env, client):
+    body = {
+        "model": "jev-latest",
+        "messages": [
+            {"role": "system", "content": "p" * 12_001},
+            {"role": "user", "content": "[0.0s - 1.0s] hi"},
+        ],
+    }
+    resp = await client.post(
+        "/v1/chat/completions", json=body, headers={"Authorization": "Bearer test-key"}
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "System policy exceeds configured size limit"
 
 
 async def test_chat_completions_segment_ids_round_trip(jev_env, client, monkeypatch):
@@ -186,7 +212,9 @@ async def test_chat_completions_segment_ids_round_trip(jev_env, client, monkeypa
         "My Podcast", "Ep 2", "", lines, 0, 1, 0.0, 600.0, addressing_mode="segment_ids"
     )
     body = {"model": "jev-latest", "messages": [{"role": "user", "content": prompt}]}
-    resp = await client.post("/v1/chat/completions", json=body)
+    resp = await client.post(
+        "/v1/chat/completions", json=body, headers={"Authorization": "Bearer test-key"}
+    )
     assert resp.status_code == 200
     content = resp.json()["choices"][0]["message"]["content"]
     parsed = json.loads(content)
@@ -207,7 +235,7 @@ async def test_chat_completions_segment_ids_round_trip(jev_env, client, monkeypa
     resolved = resolve_segment_id_ads(id_ads, window)
     assert len(resolved) == 1
     assert resolved[0]["start"] == 120.0 and resolved[0]["end"] == 132.0
-    assert resolved[0]["sponsor"] == "Squarespace"
+    assert resolved[0]["sponsor"] == "jev-Squarespace"
 
 
 async def test_chat_completions_requires_api_key(jev_env, client, monkeypatch):
@@ -217,7 +245,7 @@ async def test_chat_completions_requires_api_key(jev_env, client, monkeypatch):
         json={"model": "m", "messages": [{"role": "user", "content": "[0.0s - 1.0s] hi"}]},
     )
     assert resp.status_code == 503
-    assert "TYPESAFE_API_KEY" in resp.json()["detail"]
+    assert "TypeSafe API key" in resp.json()["detail"]
 
 
 async def test_models_endpoints(client):
@@ -232,8 +260,6 @@ async def test_models_endpoints(client):
 
 def test_category_pass_off_uses_default_category(jev_env, tmp_path, monkeypatch):
     import app.services.jev as jev
-    from app.services.openai_adapter import run_chat_completion
-
     monkeypatch.setattr(jev, "call_payload", make_fake({3, 4, 5}))
     prompt = format_window_prompt("Pod", "Ep", "", TS_LINES, 0, 1, 0.0, 600.0)
     resp = run_chat_completion(
@@ -254,3 +280,94 @@ def test_category_pass_off_uses_default_category(jev_env, tmp_path, monkeypatch)
     assert ad["category"] == "sponsor"
     # category pass off -> only the detection call is billed
     assert resp["usage"]["prompt_tokens"] == 1000
+
+
+def test_policy_is_forwarded_and_separates_cache_entries(jev_env, tmp_path):
+    prompt = format_window_prompt("Pod", "Ep", "", TS_LINES, 0, 1, 0.0, 600.0)
+    calls: list[dict[str, Any]] = []
+
+    def fetcher(payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        calls.append(payload)
+        return make_fake({3, 4, 5})(payload, **kwargs)
+
+    common = {
+        "request_model": "jev-latest",
+        "url": "u",
+        "api_key": "k",
+        "timeout": 1.0,
+        "cache_path": str(tmp_path / "c.json"),
+        "model": "jev-latest",
+        "enter": 0.95,
+        "stay": 0.40,
+        "category_pass": False,
+        "category_context": 2,
+        "default_category": "sponsor",
+        "fetcher": fetcher,
+    }
+    run_chat_completion(
+        messages=[{"role": "system", "content": "Keep host banter."}, {"role": "user", "content": prompt}],
+        **common,
+    )
+    run_chat_completion(
+        messages=[{"role": "system", "content": "Keep intros."}, {"role": "user", "content": prompt}],
+        **common,
+    )
+    assert len(calls) == 2
+    assert "Keep host banter." in calls[0]["state"]["guidance"]
+    assert "Keep intros." in calls[1]["state"]["guidance"]
+    assert set(calls[0]["questions"]) == {f"s{i}" for i in range(len(TS_LINES))}
+
+
+def test_direct_adapter_rejects_oversized_system_policy(jev_env, tmp_path):
+    with pytest.raises(CallerPolicyTooLongError):
+        run_chat_completion(
+            messages=[{"role": "system", "content": "p" * 12_001}],
+            request_model="jev-latest",
+            url="u",
+            api_key="k",
+            timeout=1.0,
+            cache_path=str(tmp_path / "c.json"),
+            model="jev-latest",
+            enter=0.95,
+            stay=0.40,
+            category_pass=False,
+            category_context=2,
+            default_category="sponsor",
+        )
+
+
+def test_unknown_sponsor_uses_grounded_reason_without_minting_label(jev_env, tmp_path, monkeypatch):
+    import app.services.openai_adapter as adapter
+
+    monkeypatch.setattr(adapter, "matched_sponsor_for_span", lambda *_args, **_kwargs: None)
+    prompt = format_window_prompt(
+        "Pod",
+        "Ep",
+        "",
+        ["[0.0s - 10.0s] Sponsored by Unknown Brand, visit unknown.example today."],
+        0,
+        1,
+        0.0,
+        600.0,
+    )
+    response = run_chat_completion(
+        messages=[{"role": "user", "content": prompt}],
+        request_model="jev-latest",
+        url="u",
+        api_key="k",
+        timeout=1.0,
+        cache_path=str(tmp_path / "c.json"),
+        model="jev-latest",
+        enter=0.95,
+        stay=0.40,
+        category_pass=False,
+        category_context=2,
+        default_category="sponsor",
+        fetcher=make_fake({0}),
+    )
+    content = response["choices"][0]["message"]["content"]
+    raw_ad = json.loads(content)["ads"][0]
+    assert "sponsor" not in raw_ad
+    assert raw_ad["reason"] == "Based on transcript: Sponsored by Unknown Brand, visit unknown.example today."
+    parsed = parse_ads_from_response(content)
+    assert "sponsor" not in parsed[0]

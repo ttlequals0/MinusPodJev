@@ -10,8 +10,10 @@ evaluated in parallel against the shared state.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Callable, Sequence
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -69,17 +71,18 @@ def build_questions(segments: Sequence[dict[str, Any]]) -> dict[str, dict[str, A
 
 
 def build_payload(
-    segments: Sequence[dict[str, Any]], *, uid: str | None = None
+    segments: Sequence[dict[str, Any]],
+    *,
+    model: str,
+    uid: str | None = None,
+    guidance: str = GUIDANCE,
 ) -> dict[str, Any]:
-    """One request covering a whole window.
-
-    No model field: System One selects the model, and omitting it keeps the
-    payload (and the cache key) independent of any caller-supplied model id.
-    """
-    state: dict[str, Any] = {"guidance": GUIDANCE, "transcript": build_state(segments)}
+    """One request covering a whole window. System One requires the model field
+    (omitting it returns 422 Unprocessable Entity)."""
+    state: dict[str, Any] = {"guidance": guidance, "transcript": build_state(segments)}
     if uid is not None:
         state["uid"] = uid
-    return {"state": state, "questions": build_questions(segments)}
+    return {"state": state, "model": model, "questions": build_questions(segments)}
 
 
 def parse_response(body: dict[str, Any]) -> dict[str, Any]:
@@ -90,14 +93,45 @@ def parse_response(body: dict[str, Any]) -> dict[str, Any]:
         if not key.startswith("s") or not isinstance(ans, dict):
             continue
         value = ans.get("noul")
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
             probs[key] = float(value)
     usage = body.get("usage") or {}
     return {
         "probabilities": probs,
-        "input_tokens": int(usage.get("input_tokens") or 0),
-        "output_tokens": int(usage.get("output_tokens") or 0),
+        "input_tokens": _usage_tokens(usage, "input_tokens"),
+        "output_tokens": _usage_tokens(usage, "output_tokens"),
     }
+
+
+# Transient upstream statuses worth retrying (SDK RetryPolicy: 408/429/5xx).
+RETRY_STATUSES = frozenset({408, 429, *range(500, 600)})
+RETRY_BACKOFF_INITIAL = 0.5
+RETRY_BACKOFF_MAX = 5.0
+
+
+def _retry_after_seconds(resp: httpx.Response) -> float | None:
+    """Retry-After as a non-negative delay from a header or Jev response body."""
+    header = resp.headers.get("Retry-After")
+    if header:
+        try:
+            value = float(header)
+            if math.isfinite(value) and value >= 0:
+                return value
+        except ValueError:
+            try:
+                value = parsedate_to_datetime(header).timestamp() - time.time()
+                if math.isfinite(value):
+                    return max(value, 0.0)
+            except (TypeError, ValueError, IndexError, OverflowError):
+                pass
+    try:
+        ms = resp.json().get("retry_after_ms")
+    except Exception:
+        return None
+    if not isinstance(ms, (int, float)) or isinstance(ms, bool):
+        return None
+    value = float(ms) / 1000.0
+    return value if math.isfinite(value) and value >= 0 else None
 
 
 def call_payload(
@@ -106,32 +140,110 @@ def call_payload(
     url: str,
     api_key: str,
     timeout: float = 60.0,
+    max_retries: int = 2,
+    retry_after_max: float = 5.0,
+    deadline_at: float | None = None,
+    request_deadline: float = 75.0,
     client: httpx.Client | None = None,
 ) -> dict[str, Any]:
-    """POST the payload to the upstream endpoint and return the decoded body."""
+    """POST upstream, retrying transient failures within one total deadline."""
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    start = time.monotonic()
-    if client is not None:
-        resp = client.post(url, json=payload, headers=headers)
-    else:
-        with httpx.Client(timeout=timeout) as own_client:
-            resp = own_client.post(url, json=payload, headers=headers)
-    # URL, status, latency, and payload size only: never headers or the key.
-    logger.debug(
-        "jev upstream POST %s -> %d (%d questions) in %.0f ms",
-        url,
-        resp.status_code,
-        len(payload.get("questions", {})),
-        (time.monotonic() - start) * 1000,
-    )
-    resp.raise_for_status()
-    result: dict[str, Any] = resp.json()
-    return result
+    own = client or httpx.Client(timeout=timeout)
+    end = deadline_at if deadline_at is not None else time.monotonic() + request_deadline
+    try:
+        for attempt in range(max_retries + 1):
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                raise httpx.TimeoutException("Jev request deadline exceeded")
+            start = time.monotonic()
+            try:
+                resp = own.post(url, json=payload, headers=headers, timeout=min(timeout, remaining))
+            except httpx.TransportError as exc:
+                if attempt >= max_retries:
+                    raise
+                delay = min(RETRY_BACKOFF_INITIAL * 2**attempt, RETRY_BACKOFF_MAX, retry_after_max)
+                delay = min(delay, max(0.0, end - time.monotonic()))
+                logger.warning(
+                    "jev upstream transport error (%s), retry %d/%d in %.1fs",
+                    type(exc).__name__,
+                    attempt + 1,
+                    max_retries,
+                    delay,
+                )
+                if delay > 0:
+                    time.sleep(delay)
+                continue
+            # URL, status, latency, and payload size only: never headers or the key.
+            logger.debug(
+                "jev upstream POST %s -> %d (%d questions) in %.0f ms",
+                url,
+                resp.status_code,
+                len(payload.get("questions", {})),
+                (time.monotonic() - start) * 1000,
+            )
+            if time.monotonic() > end:
+                raise httpx.TimeoutException("Jev request deadline exceeded")
+            if resp.status_code in RETRY_STATUSES and attempt < max_retries:
+                backoff = min(RETRY_BACKOFF_INITIAL * 2**attempt, RETRY_BACKOFF_MAX)
+                retry_after = _retry_after_seconds(resp)
+                delay = retry_after if retry_after is not None else backoff
+                remaining = max(0.0, end - time.monotonic())
+                if retry_after is not None and (delay > retry_after_max or delay > remaining):
+                    resp.raise_for_status()
+                delay = min(delay, remaining)
+                logger.warning(
+                    "jev upstream %d, retry %d/%d in %.1fs",
+                    resp.status_code,
+                    attempt + 1,
+                    max_retries,
+                    delay,
+                )
+                if delay > 0:
+                    time.sleep(delay)
+                continue
+            resp.raise_for_status()
+            result: dict[str, Any] = resp.json()
+            return result
+        raise RuntimeError("unreachable")  # loop always returns or raises
+    finally:
+        if client is None:
+            own.close()
 
 
 def estimate_cost_usd(input_tokens: int) -> float:
     """Input tokens at INPUT_COST_PER_MTOK per Mtok; output is not billed."""
     return round(input_tokens / 1_000_000 * INPUT_COST_PER_MTOK, 6)
+
+
+def _usage_tokens(usage: dict[str, Any], key: str) -> int:
+    value = usage.get(key, 0)
+    if value is None:
+        return 0
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+        or int(value) != value
+    ):
+        raise ValueError(f"upstream usage.{key} must be a non-negative integer")
+    return int(value)
+
+
+def _valid_answers(entry: dict[str, Any], expected_keys: set[str]) -> bool:
+    probabilities = entry.get("probabilities")
+    if not isinstance(probabilities, dict):
+        return False
+    for key in expected_keys:
+        value = probabilities.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return False
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            return False
+    return all(
+        isinstance(entry.get(key), int) and not isinstance(entry[key], bool) and entry[key] >= 0
+        for key in ("input_tokens", "output_tokens")
+    )
 
 
 def jev_ask(
@@ -145,18 +257,38 @@ def jev_ask(
     uid: str | None = None,
     enter: float | None = None,
     stay: float | None = None,
+    max_retries: int = 2,
+    retry_after_max: float = 5.0,
+    request_deadline: float = 75.0,
+    deadline_at: float | None = None,
+    cache_max_entries: int = 10_000,
+    guidance: str = GUIDANCE,
     fetcher: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the payload, serve from cache or upstream, and shape the reply."""
-    payload = build_payload(segments, uid=uid)
-    cache = JsonCache(cache_path)
+    end = deadline_at if deadline_at is not None else time.monotonic() + request_deadline
+    payload = build_payload(segments, model=model, uid=uid, guidance=guidance)
+    cache = JsonCache(cache_path, max_entries=cache_max_entries)
     send = fetcher or call_payload
+    expected_keys = set(payload["questions"])
 
     def _fetch() -> dict[str, Any]:
-        body = send(payload, url=url, api_key=api_key, timeout=timeout)
+        kwargs: dict[str, Any] = {
+            "url": url,
+            "api_key": api_key,
+            "timeout": timeout,
+            "max_retries": max_retries,
+        }
+        if fetcher is None:
+            kwargs.update(retry_after_max=retry_after_max, deadline_at=end)
+        body = send(payload, **kwargs)
         return parse_response(body)
 
-    entry, hit = cache.get_or_fetch(payload, _fetch)
+    entry, hit = cache.get_or_fetch(
+        payload, _fetch, valid=lambda entry: _valid_answers(entry, expected_keys)
+    )
+    if time.monotonic() > end:
+        raise httpx.TimeoutException("Jev request deadline exceeded")
     probabilities: dict[str, float] = entry["probabilities"]
     input_tokens = int(entry["input_tokens"])
     return {
@@ -208,14 +340,16 @@ def build_category_payload(
     context: Sequence[dict[str, Any]],
     categories: Sequence[str],
     *,
+    model: str,
     uid: str | None = None,
+    guidance: str = CATEGORY_GUIDANCE,
 ) -> dict[str, Any]:
     """One request: span + context state, one noul per category keyed c<index>."""
     merged = {int(s["sid"]): s for s in [*context, *focus]}
     ordered = [merged[k] for k in sorted(merged)]
     ids = _focus_ids(focus)
     state: dict[str, Any] = {
-        "guidance": CATEGORY_GUIDANCE,
+        "guidance": guidance,
         "transcript": build_state(ordered),
         "focus": ids,
     }
@@ -230,7 +364,7 @@ def build_category_payload(
         }
         for i, cat in enumerate(categories)
     }
-    return {"state": state, "questions": questions}
+    return {"state": state, "model": model, "questions": questions}
 
 
 def parse_category_response(body: dict[str, Any]) -> dict[str, Any]:
@@ -241,13 +375,13 @@ def parse_category_response(body: dict[str, Any]) -> dict[str, Any]:
         if not key.startswith("c") or not isinstance(ans, dict):
             continue
         value = ans.get("noul")
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
             probs[key] = float(value)
     usage = body.get("usage") or {}
     return {
         "probabilities": probs,
-        "input_tokens": int(usage.get("input_tokens") or 0),
-        "output_tokens": int(usage.get("output_tokens") or 0),
+        "input_tokens": _usage_tokens(usage, "input_tokens"),
+        "output_tokens": _usage_tokens(usage, "output_tokens"),
     }
 
 
@@ -260,19 +394,42 @@ def jev_category(
     api_key: str,
     timeout: float,
     cache_path: str,
+    model: str,
     uid: str | None = None,
+    max_retries: int = 2,
+    retry_after_max: float = 5.0,
+    request_deadline: float = 75.0,
+    deadline_at: float | None = None,
+    cache_max_entries: int = 10_000,
+    guidance: str = CATEGORY_GUIDANCE,
     fetcher: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Argmax category for one span, cached and shaped like jev_ask."""
-    payload = build_category_payload(focus, context, categories, uid=uid)
-    cache = JsonCache(cache_path)
+    end = deadline_at if deadline_at is not None else time.monotonic() + request_deadline
+    payload = build_category_payload(
+        focus, context, categories, model=model, uid=uid, guidance=guidance
+    )
+    cache = JsonCache(cache_path, max_entries=cache_max_entries)
     send = fetcher or call_payload
+    expected_keys = set(payload["questions"])
 
     def _fetch() -> dict[str, Any]:
-        body = send(payload, url=url, api_key=api_key, timeout=timeout)
+        kwargs: dict[str, Any] = {
+            "url": url,
+            "api_key": api_key,
+            "timeout": timeout,
+            "max_retries": max_retries,
+        }
+        if fetcher is None:
+            kwargs.update(retry_after_max=retry_after_max, deadline_at=end)
+        body = send(payload, **kwargs)
         return parse_category_response(body)
 
-    entry, hit = cache.get_or_fetch(payload, _fetch)
+    entry, hit = cache.get_or_fetch(
+        payload, _fetch, valid=lambda entry: _valid_answers(entry, expected_keys)
+    )
+    if time.monotonic() > end:
+        raise httpx.TimeoutException("Jev request deadline exceeded")
     probs: dict[str, float] = entry["probabilities"]
     best_cat = categories[0] if categories else ""
     best_p = -1.0
