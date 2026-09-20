@@ -183,6 +183,12 @@ Compose file mounts `/app/data` to a named volume. Existing deployments must add
 persistent mount; replacing only the image does not preserve the settings file. Without
 `MINUSPOD_PASSWORD`, settings are visible but not editable.
 
+If either settings endpoint returns 503, inspect proxy logs for `runtime settings
+storage failure operation=read|write errno=<number>`. The message omits paths
+and file contents. The `/app/data` mount must be writable by UID/GID 1000.
+Existing volume ownership overrides image defaults, so verify the mounted
+directory before applying a nonrecursive `chown` to UID/GID 1000.
+
 ### MinusPod runtime ownership
 
 Jev Proxy is a POC shim. It does not change the MinusPod runtime that controls holds,
@@ -258,6 +264,9 @@ uv run pytest backend/tests -q   # upstream calls mocked; no network
   fetches are cache misses.
 - Logs go to stdout at `LOG_LEVEL` (`DEBUG` for verbose tracing). The TypeSafe key, MinusPod
   password, session cookies, and Authorization header are never logged.
+  Review validation failures log a fixed rule and stage with numeric expected/actual option counts
+  and probability totals, without upstream payloads. If start-word selection is inconclusive,
+  refinement stops instead of issuing an end-selection request.
 - The included status page calls `/api/health`, `/api/status`, `/api/settings`, and `/api/stats`
   directly. It reports live reachability and performs no inference or MinusPod login.
 

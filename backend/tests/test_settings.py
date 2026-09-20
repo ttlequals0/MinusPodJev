@@ -1,6 +1,8 @@
 """Tests for persistent local runtime threshold settings."""
 
+import errno
 import json
+import logging
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -115,11 +117,37 @@ async def test_settings_corruption_is_explicit_and_put_can_repair(client, settin
     assert json.loads(settings_file.read_text()) == update
 
 
-async def test_settings_write_storage_error_is_safe(client, settings_file):
+async def test_settings_read_storage_error_logs_safe_diagnostic(client, settings_file, caplog):
+    settings_file.mkdir()
+    with caplog.at_level(logging.WARNING, logger=runtime_settings.__name__):
+        response = await client.get("/api/settings")
+    assert response.status_code == 503
+    assert "runtime settings storage failure operation=read" in caplog.text
+    assert f"errno={errno.EISDIR}" in caplog.text
+    assert str(settings_file) not in caplog.text
+
+
+async def test_settings_write_directory_error_is_safe(client, settings_file):
     settings_file.mkdir()
     update = {"detection_enter": 0.82, "review_evidence": 0.92, "review_choice": 0.88}
     response = await client.put("/api/settings", json=update, headers=_headers())
     assert response.status_code == 503
+    assert "runtime-settings" not in response.text
+
+
+async def test_settings_write_storage_error_logs_safe_diagnostic(client, settings_file, caplog, monkeypatch):
+    update = {"detection_enter": 0.82, "review_evidence": 0.92, "review_choice": 0.88}
+    def fail_replace(*_args):
+        raise PermissionError(errno.EACCES, "permission denied", str(settings_file))
+
+    monkeypatch.setattr(runtime_settings.os, "replace", fail_replace)
+    with caplog.at_level(logging.WARNING, logger=runtime_settings.__name__):
+        response = await client.put("/api/settings", json=update, headers=_headers())
+    assert response.status_code == 503
+    assert "runtime settings storage failure operation=write" in caplog.text
+    assert f"errno={errno.EACCES}" in caplog.text
+    assert str(settings_file) not in caplog.text
+    assert "permission denied" not in caplog.text
     assert "runtime-settings" not in response.text
 
 

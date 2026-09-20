@@ -23,6 +23,7 @@ from minuspod_compat import SEGMENT_CATEGORIES, SPONSOR_PRIORITY_FIELDS
 from app.services.jev import (
     CATEGORY_GUIDANCE,
     GUIDANCE,
+    JevReviewValidationError,
     build_state,
     jev_ask,
     jev_category,
@@ -612,7 +613,20 @@ def run_review(
             fetcher=fetcher,
         )
         logger.info("review request_id=%s stage=detection cache_hit=%s elapsed_ms=%.0f", review_request_id, detection["cache_hit"], (time.monotonic() - detection_started) * 1000)
+    except JevReviewValidationError as exc:
+        logger.warning(
+            "review request_id=%s stage=%s validation_failed reason=%s details=%s",
+            review_request_id,
+            "detection",
+            exc.rule,
+            exc.numeric_details,
+        )
+        raise ReviewUpstreamInvalidResponseError("Jev review response was invalid") from exc
     except ValueError as exc:
+        logger.warning(
+            "review request_id=%s stage=detection validation_failed reason=invalid_response details={}",
+            review_request_id,
+        )
         raise ReviewUpstreamInvalidResponseError("Jev review response was invalid") from exc
     except Exception as exc:  # noqa: BLE001 - classify the upstream service failure
         raise ReviewUnavailableError("Jev review request failed") from exc
@@ -676,7 +690,21 @@ def run_review(
             review_output_tokens += int(result["usage"]["output_tokens"])
             logger.info("review request_id=%s stage=%s cache_hit=%s elapsed_ms=%.0f", review_request_id, stage, result["cache_hit"], (time.monotonic() - started) * 1000)
             return result
+        except JevReviewValidationError as exc:
+            logger.warning(
+                "review request_id=%s stage=%s validation_failed reason=%s details=%s",
+                review_request_id,
+                stage,
+                exc.rule,
+                exc.numeric_details,
+            )
+            raise ReviewUpstreamInvalidResponseError("Jev review response was invalid") from exc
         except ValueError as exc:
+            logger.warning(
+                "review request_id=%s stage=%s validation_failed reason=invalid_response details={}",
+                review_request_id,
+                stage,
+            )
             raise ReviewUpstreamInvalidResponseError("Jev review response was invalid") from exc
         except Exception as exc:  # noqa: BLE001
             raise ReviewUnavailableError("Jev review request failed") from exc
@@ -738,12 +766,16 @@ def run_review(
                 request=review_questions,
                 review_request_id=review_request_id,
             )
-            end_word = _select_word(
-                prefix="end",
-                words=word_edges["end"],
-                enter=review_choice_enter,
-                request=review_questions,
-                review_request_id=review_request_id,
+            end_word = (
+                _select_word(
+                    prefix="end",
+                    words=word_edges["end"],
+                    enter=review_choice_enter,
+                    request=review_questions,
+                    review_request_id=review_request_id,
+                )
+                if start_word is not None
+                else None
             )
         except ReviewUnavailableError:
             metrics.record_review_refinement("upstream_error")

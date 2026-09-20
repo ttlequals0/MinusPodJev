@@ -704,6 +704,216 @@ def test_refinement_choice_failures_are_counted(jev_env, tmp_path):
     assert refinement["upstream_error"] == 2
 
 
+@pytest.mark.parametrize("mode", ["low_confidence", "unknown"])
+def test_inconclusive_start_choice_does_not_request_end(jev_env, tmp_path, mode):
+    base = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 120.0, "This episode is sponsored by BetterHelp")],
+        [(120.0, 126.0, "context after")],
+    )
+    normal = make_text_fake()
+    stages = []
+
+    def fake(payload, **kwargs):
+        choice_questions = [
+            key for key, question in payload["questions"].items() if question.get("type") == "choice"
+        ]
+        if not choice_questions:
+            return normal(payload, **kwargs)
+        stage = choice_questions[0]
+        stages.append(stage)
+        if stage.startswith("end_"):
+            raise AssertionError("end Choice must not run after an inconclusive start")
+        result = normal(payload, **kwargs)
+        for key in choice_questions:
+            answer = result["answers"][key]
+            if mode == "low_confidence":
+                answer["confidence"] = 0.5
+            else:
+                criteria = payload["questions"][key]["criteria"]
+                remainder = 0.01 / (len(criteria) - 1)
+                answer["choice"] = "unknown"
+                answer["confidence"] = 0.98
+                answer["probabilities"] = {
+                    option: 0.99 if option == "unknown" else remainder
+                    for option in criteria
+                }
+        return result
+
+    with pytest.raises(ReviewInconclusiveError):
+        _run(_with_word_edges(base), fake, tmp_path, refine_boundaries=True)
+
+    assert stages == ["start_0"]
+    refinement = metrics.snapshot()["review"]["refinement"]
+    assert refinement["attempted"] == 1
+    assert refinement["inconclusive"] == 1
+    assert refinement["upstream_error"] == 0
+
+
+async def test_inconclusive_start_choice_returns_422_without_end_request(
+    jev_env, client, monkeypatch
+):
+    import app.services.jev as jev
+
+    monkeypatch.setattr(settings, "JEV_REVIEW_REFINE_BOUNDARIES", True)
+    normal = make_text_fake()
+    stages = []
+
+    def fake(payload, **kwargs):
+        choice_questions = [
+            key for key, question in payload["questions"].items() if question.get("type") == "choice"
+        ]
+        if not choice_questions:
+            return normal(payload, **kwargs)
+        stage = choice_questions[0]
+        stages.append(stage)
+        if stage.startswith("end_"):
+            raise RuntimeError("end Choice must not run after an inconclusive start")
+        result = normal(payload, **kwargs)
+        for answer in result["answers"].values():
+            answer["confidence"] = 0.5
+        return result
+
+    monkeypatch.setattr(jev, "call_payload", fake)
+    prompt = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 120.0, "This episode is sponsored by BetterHelp")],
+        [(120.0, 126.0, "context after")],
+    )
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": _with_word_edges(prompt)}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "jev_review_inconclusive"
+    assert stages == ["start_0"]
+
+
+async def test_valid_start_choice_still_requests_end_and_preserves_503(
+    jev_env, client, monkeypatch
+):
+    import app.services.jev as jev
+
+    monkeypatch.setattr(settings, "JEV_REVIEW_REFINE_BOUNDARIES", True)
+    normal = make_text_fake()
+    stages = []
+
+    def fake(payload, **kwargs):
+        choice_questions = [
+            key for key, question in payload["questions"].items() if question.get("type") == "choice"
+        ]
+        if choice_questions:
+            stages.append(choice_questions[0])
+            if choice_questions[0].startswith("end_"):
+                raise RuntimeError("end Choice upstream failure")
+        return normal(payload, **kwargs)
+
+    monkeypatch.setattr(jev, "call_payload", fake)
+    prompt = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 120.0, "This episode is sponsored by BetterHelp")],
+        [(120.0, 126.0, "context after")],
+    )
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": _with_word_edges(prompt)}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "jev_review_upstream_failure"
+    assert stages == ["start_0", "end_0"]
+
+
+async def test_malformed_choice_returns_503_with_safe_validation_diagnostic(
+    jev_env, client, monkeypatch, caplog
+):
+    import logging
+
+    import app.services.jev as jev
+
+    monkeypatch.setattr(settings, "JEV_REVIEW_REFINE_BOUNDARIES", True)
+    normal = make_text_fake()
+
+    def malformed(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if any(question.get("type") == "choice" for question in payload["questions"].values()):
+            result["answers"][next(iter(result["answers"]))]["probabilities"] = {"bad": 1.0}
+        return result
+
+    monkeypatch.setattr(jev, "call_payload", malformed)
+    prompt = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 120.0, "This episode is sponsored by BetterHelp")],
+        [(120.0, 126.0, "context after")],
+    )
+    with caplog.at_level(logging.WARNING, logger="app.services.openai_adapter"):
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": _with_word_edges(prompt)}]},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "jev_review_upstream_invalid_response"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "stage=choice_start validation_failed reason=choice_probability_keys" in message
+        for message in messages
+    )
+    assert all("bad" not in message for message in messages)
+
+
+async def test_foreign_validation_error_uses_generic_safe_diagnostic(
+    jev_env, client, monkeypatch, caplog
+):
+    import logging
+
+    import app.services.jev as jev
+
+    monkeypatch.setattr(settings, "JEV_REVIEW_REFINE_BOUNDARIES", True)
+    normal = make_text_fake()
+
+    def invalid(payload, **kwargs):
+        if any(question.get("type") == "choice" for question in payload["questions"].values()):
+            raise ValueError("sensitive upstream response")
+        return normal(payload, **kwargs)
+
+    monkeypatch.setattr(jev, "call_payload", invalid)
+    prompt = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 120.0, "This episode is sponsored by BetterHelp")],
+        [(120.0, 126.0, "context after")],
+    )
+    with caplog.at_level(logging.WARNING, logger="app.services.openai_adapter"):
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": _with_word_edges(prompt)}]},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "jev_review_upstream_invalid_response"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "stage=choice_start validation_failed reason=invalid_response details={}" in message
+        for message in messages
+    )
+    assert all("sensitive upstream response" not in message for message in messages)
+
+
 def test_refinement_logs_effective_context_and_precise_thresholds(jev_env, tmp_path, caplog):
     import logging
 

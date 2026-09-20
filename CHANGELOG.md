@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4 - 2026-09-20
+
+- Skip end-boundary selection when the start boundary is inconclusive.
+- Add safe review-validation and settings-storage diagnostics; reject malformed review usage.
+- Changes tracked in [PR #2](https://github.com/ttlequals0/MinusPodJev/pull/2).
+
 ## 0.1.3 - 2026-09-20
 
 - Added persistent runtime threshold settings with authenticated status-page editing.

@@ -76,8 +76,16 @@ def read(path: str, defaults: Thresholds) -> tuple[Thresholds, bool]:
         raw = settings_path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return defaults, False
-    except (OSError, UnicodeError) as exc:
-        logger.warning("runtime settings read failed")
+    except OSError as exc:
+        logger.warning(
+            "runtime settings storage failure operation=read errno=%s",
+            exc.errno or "unknown",
+        )
+        raise RuntimeSettingsError("runtime settings are unavailable") from exc
+    except UnicodeError as exc:
+        logger.warning(
+            "runtime settings storage failure operation=read errno=invalid-encoding"
+        )
         raise RuntimeSettingsError("runtime settings are unavailable") from exc
     try:
         document = json.loads(raw)
@@ -126,6 +134,9 @@ def write(path: str, values: dict[str, object], defaults: Thresholds) -> Thresho
             except FileNotFoundError:
                 pass
     except OSError as exc:
-        logger.warning("runtime settings write failed")
+        logger.warning(
+            "runtime settings storage failure operation=write errno=%s",
+            exc.errno or "unknown",
+        )
         raise RuntimeSettingsError("runtime settings could not be saved") from exc
     return thresholds
