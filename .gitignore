@@ -102,3 +102,8 @@ CLAUDE.md
 AGENTS.md
 superpowers/
 .superpowers/
+
+# Credentials, including files beneath re-included benchmark data.
+*.pem
+*.key
+*.pfx

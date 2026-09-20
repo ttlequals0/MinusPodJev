@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     # Application
     APP_NAME: str = Field(default="Jev Proxy", description="Application name")
-    APP_VERSION: str = Field(default="0.1.0", description="Application version")
+    APP_VERSION: str = Field(default="0.1.1", description="Application version")
     APP_DESCRIPTION: str = Field(
         default="Thin HTTP proxy around the TypeSafe Jev System One endpoint",
         description="Application description",
@@ -95,7 +95,7 @@ class Settings(BaseSettings):
     # Sponsor lookup (MinusPod password login -> session cookies)
     MINUSPOD_BASE_URL: str | None = Field(
         default=None,
-        description="MinusPod base URL (e.g. https://podsrv.ttlequals0.com); the proxy "
+        description="MinusPod base URL (e.g. https://example.com); the proxy "
         "derives /api/v1/auth/login and /api/v1/sponsors from it. None uses SEED_SPONSORS",
     )
     MINUSPOD_PASSWORD: str | None = Field(
