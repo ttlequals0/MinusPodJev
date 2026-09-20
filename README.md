@@ -225,8 +225,6 @@ Served at the proxy root (`http://<proxy>:8080/`), with an Overview and a Runtim
 Runtime stats refresh every 5 seconds. Manual Refresh probes health and status; after a successful
 probe, it refreshes stats.
 
-![Jev Proxy status page](assets/status-page.png)
-
 - **Connections** - three cards: Proxy (health, environment, version), TypeSafe Jev
   (connection, host), and MinusPod (connection, host, session).
 - **Runtime stats** - process-scoped counters from `/api/stats`: proxy calls, average proxy
