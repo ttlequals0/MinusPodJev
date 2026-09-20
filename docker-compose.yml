@@ -1,6 +1,6 @@
 services:
   jevproxy:
-    build: .
+    image: ttlequals0/minuspodjev:latest
     container_name: jevproxy
     ports:
       # Loopback-only by default. Set JEVPROXY_BIND_ADDRESS=0.0.0.0 only when

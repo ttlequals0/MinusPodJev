@@ -126,8 +126,8 @@ until Jev is mature.
 - A caller bearer token is required by default and is forwarded as the TypeSafe key. Set
   `JEV_ALLOW_UNAUTHENTICATED_FALLBACK=true` only for a protected internal deployment that must
   permit a configured `TYPESAFE_API_KEY` without a caller bearer token.
-- Requests are bounded by `JEV_MAX_CONCURRENT_REQUESTS=4` per worker. The Docker default of 2
-  workers therefore permits up to 8 concurrent requests. The shim does not apply text, segment,
+- Requests are bounded by `JEV_MAX_CONCURRENT_REQUESTS=4` per worker. The Docker default of 1
+  worker permits up to 4 concurrent requests. The shim does not apply text, segment,
   or request-body limits; Jev enforces its current upstream model limits.
 - `JEV_REQUEST_DEADLINE_SECONDS=75` is a cooperative request budget covering retries and retry
   waits. Keep it below nginx's 90 second response-inactivity timeout when changing either value.
@@ -135,6 +135,21 @@ until Jev is mature.
   a SQLite sidecar beside it and capped at `JEV_CACHE_MAX_ENTRIES=10000` entries. Failed sponsor
   refreshes pause for `SPONSOR_FAILURE_COOLDOWN_SECONDS=900` seconds before another attempt.
   This cooldown is per worker, so account for workers and replicas against MinusPod's login limit.
+
+### Runtime metrics
+
+`GET /api/stats` reports ephemeral metrics for the responding process. Docker defaults to one
+worker so its totals describe the container. If `WORKERS` is raised above one, the response remains
+process-scoped and is not a container-wide aggregate. `scope.configured_workers` is only the
+parseable `WORKERS` environment hint, or `null` when unavailable. Metrics reset on process restart.
+
+- `proxy_requests` counts only inference endpoints and measures proxy handling from request receipt
+  to response headers. Health, models, status, and stats requests are excluded.
+- `jev_http` counts every actual upstream POST, including retry attempts. Its latency is the Jev
+  HTTP attempt time, not the full MinusPod request path.
+- `cache` separates cache hits and misses. `cost.estimated_input_usd` charges only successful,
+  uncached upstream responses with valid reported input tokens, at Jev's published $0.042 per
+  million input tokens. It is an estimate and excludes output token charges, fees, and taxes.
 
 ### Run it
 
@@ -156,10 +171,32 @@ uv run pytest backend/tests -q   # upstream calls mocked; no network
 - `GET /api/status` reports whether Jev and MinusPod are reachable and whether a MinusPod
   session is active, using cheap probes only (no billable Jev call, no login), so it is safe
   to poll. `GET /api/health` is liveness.
+- `GET /api/stats` is available immediately after startup. It reports one process's proxy and
+  upstream-attempt counts, latency, cache activity, uptime, and an estimated input cost. It
+  resets on restart and is not a container-wide total when multiple workers are configured. The
+  configured-worker field is an optional environment hint, not a discovered worker count.
+  Proxy handling time is receive-to-response, not full MinusPod round-trip time; Jev timing is
+  per upstream HTTP attempt, including retries. Estimated cost includes only successful uncached
+  calls with valid upstream input-token usage. Cache hits do not call Jev; failed cache
+  fetches are cache misses.
 - Logs go to stdout at `LOG_LEVEL` (`DEBUG` for verbose tracing). The TypeSafe key, MinusPod
   password, session cookies, and Authorization header are never logged.
 - The included status page uses `/api/health` and `/api/status` directly. It reports live
   reachability and performs no inference or MinusPod login.
+
+### Status page
+
+Served at the proxy root (`http://<proxy>:8080/`), with an Overview and a Runtime stats view
+and a manual Refresh.
+
+![Jev Proxy status page](assets/status-page.png)
+
+- **Connections** - three cards: Proxy (health, environment, version), TypeSafe Jev
+  (connection, host), and MinusPod (connection, host, session).
+- **Runtime stats** - process-scoped counters from `/api/stats`: proxy calls, average proxy
+  handling time, Jev HTTP attempts, average Jev round-trip, cache hit rate, estimated input
+  cost, process uptime, and configured workers. Counters reset when the process restarts and
+  are per worker, not a container-wide total.
 
 ### Docker Compose exposure
 
