@@ -4,18 +4,20 @@ Main FastAPI application module.
 
 import logging
 import sys
-from collections.abc import AsyncGenerator
+import time
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from app.api.health import router as health_router
 from app.api.openai import router as openai_router
 from app.api.status import router as status_router
 from app.api.v1.router import api_router as v1_router
 from app.config import settings
+from app.utils.metrics import metrics
 from app.utils.redact import redact
 
 _LOG_HANDLER_NAME = "jevproxy-stdout"
@@ -78,6 +80,24 @@ app.include_router(v1_router, prefix="/api/v1")
 # whether or not its base_url includes /v1.
 app.include_router(openai_router, tags=["openai"])
 app.include_router(openai_router, prefix="/v1", tags=["openai"])
+
+_INFERENCE_PATHS = {"/chat/completions", "/v1/chat/completions", "/api/v1/jev/ask"}
+
+
+@app.middleware("http")
+async def inference_metrics(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    if request.url.path not in _INFERENCE_PATHS:
+        return await call_next(request)
+    start = time.monotonic()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        metrics.record_proxy_request((time.monotonic() - start) * 1000, status_code < 400)
 
 
 @app.exception_handler(404)

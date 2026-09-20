@@ -19,6 +19,7 @@ from typing import Any
 import httpx
 
 from app.utils.cache import JsonCache
+from app.utils.metrics import metrics
 from app.utils.spans import spans_from_probabilities
 
 logger = logging.getLogger(__name__)
@@ -159,6 +160,7 @@ def call_payload(
             try:
                 resp = own.post(url, json=payload, headers=headers, timeout=min(timeout, remaining))
             except httpx.TransportError as exc:
+                metrics.record_jev_attempt((time.monotonic() - start) * 1000, False)
                 if attempt >= max_retries:
                     raise
                 delay = min(RETRY_BACKOFF_INITIAL * 2**attempt, RETRY_BACKOFF_MAX, retry_after_max)
@@ -181,6 +183,21 @@ def call_payload(
                 len(payload.get("questions", {})),
                 (time.monotonic() - start) * 1000,
             )
+            duration_ms = (time.monotonic() - start) * 1000
+            if 200 <= resp.status_code < 300:
+                try:
+                    result: dict[str, Any] = resp.json()
+                    input_tokens = _input_tokens(result)
+                    metrics.record_jev_attempt(
+                        duration_ms,
+                        True,
+                        estimate_cost_usd(input_tokens) if input_tokens is not None else None,
+                    )
+                except Exception:
+                    metrics.record_jev_attempt(duration_ms, True)
+                    raise
+            else:
+                metrics.record_jev_attempt(duration_ms, False)
             if time.monotonic() > end:
                 raise httpx.TimeoutException("Jev request deadline exceeded")
             if resp.status_code in RETRY_STATUSES and attempt < max_retries:
@@ -202,7 +219,6 @@ def call_payload(
                     time.sleep(delay)
                 continue
             resp.raise_for_status()
-            result: dict[str, Any] = resp.json()
             return result
         raise RuntimeError("unreachable")  # loop always returns or raises
     finally:
@@ -228,6 +244,16 @@ def _usage_tokens(usage: dict[str, Any], key: str) -> int:
     ):
         raise ValueError(f"upstream usage.{key} must be a non-negative integer")
     return int(value)
+
+
+def _input_tokens(body: dict[str, Any]) -> int | None:
+    usage = body.get("usage")
+    if not isinstance(usage, dict) or usage.get("input_tokens") is None:
+        return None
+    try:
+        return _usage_tokens(usage, "input_tokens")
+    except ValueError:
+        return None
 
 
 def _valid_answers(entry: dict[str, Any], expected_keys: set[str]) -> bool:
@@ -273,6 +299,7 @@ def jev_ask(
     expected_keys = set(payload["questions"])
 
     def _fetch() -> dict[str, Any]:
+        metrics.record_cache(False)
         kwargs: dict[str, Any] = {
             "url": url,
             "api_key": api_key,
@@ -287,6 +314,8 @@ def jev_ask(
     entry, hit = cache.get_or_fetch(
         payload, _fetch, valid=lambda entry: _valid_answers(entry, expected_keys)
     )
+    if hit:
+        metrics.record_cache(True)
     if time.monotonic() > end:
         raise httpx.TimeoutException("Jev request deadline exceeded")
     probabilities: dict[str, float] = entry["probabilities"]
@@ -414,6 +443,7 @@ def jev_category(
     expected_keys = set(payload["questions"])
 
     def _fetch() -> dict[str, Any]:
+        metrics.record_cache(False)
         kwargs: dict[str, Any] = {
             "url": url,
             "api_key": api_key,
@@ -428,6 +458,8 @@ def jev_category(
     entry, hit = cache.get_or_fetch(
         payload, _fetch, valid=lambda entry: _valid_answers(entry, expected_keys)
     )
+    if hit:
+        metrics.record_cache(True)
     if time.monotonic() > end:
         raise httpx.TimeoutException("Jev request deadline exceeded")
     probs: dict[str, float] = entry["probabilities"]

@@ -18,11 +18,18 @@ from fastapi import APIRouter
 
 from app.config import settings
 from app.services import sponsors
+from app.utils.metrics import metrics
 
 router = APIRouter()
 
 # Short so the endpoint can never hang on a dead upstream.
 _PROBE_TIMEOUT_SECONDS = 3.0
+
+
+@router.get("/stats")
+def stats() -> dict[str, Any]:
+    """Return ephemeral metrics for this process only."""
+    return metrics.snapshot()
 
 
 def _host_only(url: str | None) -> str:
