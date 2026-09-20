@@ -1,7 +1,6 @@
-"""Request authentication, limits, and capacity guards."""
+"""Request authentication and capacity guards."""
 
 import threading
-from typing import Any
 
 import pytest
 from app.api import openai
@@ -30,19 +29,6 @@ async def test_chat_fallback_is_explicit_opt_in(client, monkeypatch):
     response = await client.post("/v1/chat/completions", json={"messages": []})
     assert response.status_code == 200
     assert response.json()["api_key"] == "server-key"
-
-
-async def test_chat_counts_multipart_transcript_segments(client, monkeypatch):
-    content: list[dict[str, Any]] = [
-        {"type": "text", "text": f"[{i}] line"} for i in range(301)
-    ]
-    monkeypatch.setattr(settings, "JEV_MAX_SEGMENTS", 300)
-    response = await client.post(
-        "/v1/chat/completions",
-        headers={"Authorization": "Bearer caller-key"},
-        json={"messages": [{"role": "user", "content": content}]},
-    )
-    assert response.status_code == 413
 
 
 async def test_capacity_slot_released_after_error(client, monkeypatch):

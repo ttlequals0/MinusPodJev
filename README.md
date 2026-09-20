@@ -3,7 +3,8 @@
 Two things live here:
 
 1. **jevproxy** (`backend/`) - a FastAPI service that makes TypeSafe Jev look like an OpenAI
-   chat model, so MinusPod can detect ads with Jev instead of a chat LLM.
+   chat model, so [MinusPod](https://github.com/ttlequals0/MinusPod) can detect ads with Jev
+   instead of a chat LLM.
 2. **benchmark** (`benchmark/`) - the offline harness that measured Jev against 84 chat
    models on a 14-episode corpus, with the caches and reports. Runs standalone with `uv`.
 
@@ -85,8 +86,11 @@ For independent review, you can configure a separate chat model as the secondary
 review and chapter titles. This is a recommended POC configuration, not a change applied to
 MinusPod by this repository.
 
-The caller's system policy is forwarded to Jev's detection and category classification guidance.
-Policies over 12,000 characters are rejected with 422; they are never silently truncated.
+The caller's system policy is forwarded unchanged to Jev's detection and category classification
+guidance. This shim does not impose text, segment, or request-body caps and never truncates the
+prompt; Jev enforces its current model limits upstream. External network components may enforce
+their own limits outside this shim. See the [Jev model limits](https://docs.typesafe.ai/models)
+and [API documentation](https://docs.typesafe.ai/api) for the current upstream contract.
 
 | phase | provider slot | goes to |
 |---|---|---|
@@ -122,10 +126,9 @@ until Jev is mature.
 - A caller bearer token is required by default and is forwarded as the TypeSafe key. Set
   `JEV_ALLOW_UNAUTHENTICATED_FALLBACK=true` only for a protected internal deployment that must
   permit a configured `TYPESAFE_API_KEY` without a caller bearer token.
-- Requests are bounded by `JEV_MAX_CONCURRENT_REQUESTS=4` per worker, `JEV_MAX_SEGMENTS=300`,
-  and `JEV_MAX_TRANSCRIPT_CHARS=200000`. The Docker default of 2 workers therefore permits up
-  to 8 concurrent requests. Requests outside the configured size or segment limits are rejected
-  before an upstream inference call.
+- Requests are bounded by `JEV_MAX_CONCURRENT_REQUESTS=4` per worker. The Docker default of 2
+  workers therefore permits up to 8 concurrent requests. The shim does not apply text, segment,
+  or request-body limits; Jev enforces its current upstream model limits.
 - `JEV_REQUEST_DEADLINE_SECONDS=75` is a cooperative request budget covering retries and retry
   waits. Keep it below nginx's 90 second response-inactivity timeout when changing either value.
 - `JEV_CACHE_PATH` is retained as the legacy JSON import source. Active responses are stored in

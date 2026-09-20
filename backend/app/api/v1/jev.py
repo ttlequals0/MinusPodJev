@@ -41,12 +41,6 @@ def ask(
     api_key = _resolve_api_key(authorization)
 
     segments = [seg.model_dump(exclude_none=True) for seg in request.segments]
-    max_segments = settings.JEV_MAX_SEGMENTS
-    max_chars = settings.JEV_MAX_TRANSCRIPT_CHARS
-    if len(segments) > max_segments:
-        raise HTTPException(status_code=413, detail="Transcript exceeds configured segment limit")
-    if sum(len(str(seg.get("text", ""))) for seg in segments) > max_chars:
-        raise HTTPException(status_code=413, detail="Transcript exceeds configured size limit")
     if not _REQUEST_SLOTS.acquire(blocking=False):
         raise HTTPException(status_code=429, detail="Proxy is at capacity")
     try:

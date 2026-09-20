@@ -6,7 +6,6 @@ from typing import Any
 import pytest
 from app.config import settings
 from app.services.openai_adapter import (
-    CallerPolicyTooLongError,
     extract_user_text,
     parse_transcript,
     run_chat_completion,
@@ -181,19 +180,60 @@ async def test_chat_completions_empty_prompt(jev_env, client):
     assert data["usage"]["total_tokens"] == 0
 
 
-async def test_chat_completions_rejects_oversized_system_policy(jev_env, client):
+async def test_chat_completions_forwards_large_system_policy_unchanged(
+    jev_env, client, monkeypatch
+):
+    import app.services.jev as jev
+    from minuspod_compat import get_static_system_prompt
+
+    calls: list[dict[str, Any]] = []
+    suffix = "KEEP_THIS_ENDPOINT_TAIL_RULE"
+    policy = f"{get_static_system_prompt()}\n{'p' * 12_001}\n{suffix}"
+
+    def fetcher(payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        calls.append(payload)
+        return make_fake({0})(payload, **kwargs)
+
+    monkeypatch.setattr(jev, "call_payload", fetcher)
+    response = await client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [
+                {"role": "system", "content": policy},
+                {"role": "user", "content": "[0.0s - 1.0s] sponsored by BetterHelp"},
+            ]
+        },
+        headers={"Authorization": "Bearer test-key"},
+    )
+    assert response.status_code == 200
+    assert policy in calls[0]["state"]["guidance"]
+    assert suffix in calls[0]["state"]["guidance"]
+
+
+async def test_chat_completions_accepts_content_above_former_aggregate_cap(
+    jev_env, client, monkeypatch
+):
+    import app.services.jev as jev
+
+    calls: list[dict[str, Any]] = []
+
+    def fetcher(payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        calls.append(payload)
+        return make_fake({0})(payload, **kwargs)
+
+    monkeypatch.setattr(jev, "call_payload", fetcher)
     body = {
         "model": "jev-latest",
         "messages": [
-            {"role": "system", "content": "p" * 12_001},
-            {"role": "user", "content": "[0.0s - 1.0s] hi"},
+            {"role": "system", "content": [{"type": "text", "text": "p" * 200_000}]},
+            {"role": "user", "content": "[0.0s - 1.0s] sponsored by BetterHelp"},
         ],
     }
     resp = await client.post(
         "/v1/chat/completions", json=body, headers={"Authorization": "Bearer test-key"}
     )
-    assert resp.status_code == 422
-    assert resp.json()["detail"] == "System policy exceeds configured size limit"
+    assert resp.status_code == 200
+    assert calls
 
 
 async def test_chat_completions_segment_ids_round_trip(jev_env, client, monkeypatch):
@@ -318,22 +358,65 @@ def test_policy_is_forwarded_and_separates_cache_entries(jev_env, tmp_path):
     assert set(calls[0]["questions"]) == {f"s{i}" for i in range(len(TS_LINES))}
 
 
-def test_direct_adapter_rejects_oversized_system_policy(jev_env, tmp_path):
-    with pytest.raises(CallerPolicyTooLongError):
-        run_chat_completion(
-            messages=[{"role": "system", "content": "p" * 12_001}],
-            request_model="jev-latest",
-            url="u",
-            api_key="k",
-            timeout=1.0,
-            cache_path=str(tmp_path / "c.json"),
-            model="jev-latest",
-            enter=0.95,
-            stay=0.40,
-            category_pass=False,
-            category_context=2,
-            default_category="sponsor",
-        )
+def test_large_default_policy_is_forwarded_unchanged(jev_env, tmp_path):
+    from minuspod_compat import get_static_system_prompt
+
+    calls: list[dict[str, Any]] = []
+    suffix = "KEEP_THIS_TAIL_RULE"
+    policy = f"{get_static_system_prompt()}\n{'p' * 12_001}\n{suffix}"
+
+    def fetcher(payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        calls.append(payload)
+        return make_fake({0})(payload, **kwargs)
+
+    run_chat_completion(
+        messages=[
+            {"role": "system", "content": policy},
+            {"role": "user", "content": "[0.0s - 1.0s] sponsored by BetterHelp"},
+        ],
+        request_model="jev-latest",
+        url="u",
+        api_key="k",
+        timeout=1.0,
+        cache_path=str(tmp_path / "c.json"),
+        model="jev-latest",
+        enter=0.95,
+        stay=0.40,
+        category_pass=False,
+        category_context=2,
+        default_category="sponsor",
+        fetcher=fetcher,
+    )
+    assert policy in calls[0]["state"]["guidance"]
+    assert suffix in calls[0]["state"]["guidance"]
+
+
+def test_direct_adapter_accepts_content_above_former_cap(jev_env, tmp_path):
+    calls: list[dict[str, Any]] = []
+
+    def fetcher(payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        calls.append(payload)
+        return make_fake({0})(payload, **kwargs)
+
+    run_chat_completion(
+        messages=[
+            {"role": "system", "content": "p" * 200_001},
+            {"role": "user", "content": "[0.0s - 1.0s] sponsored by BetterHelp"},
+        ],
+        request_model="jev-latest",
+        url="u",
+        api_key="k",
+        timeout=1.0,
+        cache_path=str(tmp_path / "c.json"),
+        model="jev-latest",
+        enter=0.95,
+        stay=0.40,
+        category_pass=False,
+        category_context=2,
+        default_category="sponsor",
+        fetcher=fetcher,
+    )
+    assert calls
 
 
 def test_unknown_sponsor_uses_grounded_reason_without_minting_label(jev_env, tmp_path, monkeypatch):

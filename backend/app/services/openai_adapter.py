@@ -50,7 +50,6 @@ _REVIEW_SYSTEM_SIGNATURES = (
     "reviewing a candidate advertisement that has already been detected",
     "taking a second look at a segment that the validator already rejected",
 )
-_CALLER_POLICY_MAX_CHARS = 12_000
 _EVIDENCE_MAX_CHARS = 400
 _AD_EVIDENCE_RE = re.compile(
     r"\b(?:sponsored by|brought to you by|promo(?:tion)? code|discount code|use code|"
@@ -64,22 +63,9 @@ class ReviewUnavailableError(RuntimeError):
     """The proxy cannot produce a safe review verdict."""
 
 
-class CallerPolicyTooLongError(ValueError):
-    """The caller supplied more policy than the proxy can safely forward."""
-
-
-def _validated_policy(system_text: str) -> str:
-    policy = system_text.strip()
-    if len(policy) > _CALLER_POLICY_MAX_CHARS:
-        raise CallerPolicyTooLongError(
-            f"System policy exceeds {_CALLER_POLICY_MAX_CHARS} character limit"
-        )
-    return policy
-
-
 def _detection_guidance(system_text: str) -> str:
     """Add caller policy while retaining Jev's transcript and noul contract."""
-    policy = _validated_policy(system_text)
+    policy = system_text.strip()
     if not policy:
         return GUIDANCE
     return (
@@ -90,7 +76,7 @@ def _detection_guidance(system_text: str) -> str:
 
 
 def _category_guidance(system_text: str) -> str:
-    policy = _validated_policy(system_text)
+    policy = system_text.strip()
     if not policy:
         return CATEGORY_GUIDANCE
     return (

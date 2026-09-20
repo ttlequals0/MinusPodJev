@@ -333,3 +333,20 @@ def test_native_ask_uses_configured_thresholds_when_omitted(jev_env, monkeypatch
     assert seen["enter"] == 0.88
     assert seen["stay"] == 0.22
     assert seen["max_retries"] == 7
+
+
+def test_native_ask_accepts_more_than_the_former_segment_cap(jev_env, monkeypatch):
+    import app.api.v1.jev as api
+
+    seen: dict[str, Any] = {}
+
+    def fake_ask(segments, **_kwargs):
+        seen["segments"] = segments
+        return {"probabilities": {}, "spans": [], "usage": {}}
+
+    monkeypatch.setattr(api, "jev_ask", fake_ask)
+    api.ask(
+        api.AskRequest(segments=[{"sid": index, "text": "segment"} for index in range(301)]),
+        "Bearer test-key",
+    )
+    assert len(seen["segments"]) == 301

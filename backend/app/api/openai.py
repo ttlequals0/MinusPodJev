@@ -7,7 +7,6 @@ probes with the configured Jev model id.
 
 from __future__ import annotations
 
-import re
 import threading
 import time
 from typing import Any
@@ -17,10 +16,7 @@ from pydantic import BaseModel, ConfigDict
 
 from app.config import settings
 from app.services.openai_adapter import (
-    CallerPolicyTooLongError,
     ReviewUnavailableError,
-    extract_system_text,
-    extract_user_text,
     run_chat_completion,
 )
 
@@ -28,7 +24,6 @@ router = APIRouter()
 _REQUEST_SLOTS = threading.BoundedSemaphore(
     settings.JEV_MAX_CONCURRENT_REQUESTS
 )
-_SEGMENT_LINE = re.compile(r"^\s*\[\d+(?:\.\d+)?s\s*-|^\s*\[\d+\]")
 
 
 def _bearer(authorization: str | None) -> str | None:
@@ -59,19 +54,6 @@ def _resolve_api_key(authorization: str | None) -> str:
     return key
 
 
-def _guard_request(messages: list[ChatMessage]) -> None:
-    parsed_messages = [message.model_dump() for message in messages]
-    text = extract_user_text(parsed_messages)
-    max_chars = settings.JEV_MAX_TRANSCRIPT_CHARS
-    max_segments = settings.JEV_MAX_SEGMENTS
-    if len(text) > max_chars:
-        raise HTTPException(status_code=413, detail="Transcript exceeds configured size limit")
-    if sum(1 for line in text.splitlines() if _SEGMENT_LINE.search(line)) > max_segments:
-        raise HTTPException(status_code=413, detail="Transcript exceeds configured segment limit")
-    if len(extract_system_text(parsed_messages).strip()) > 12_000:
-        raise HTTPException(status_code=422, detail="System policy exceeds configured size limit")
-
-
 class ChatMessage(BaseModel):
     role: str
     content: Any = None
@@ -94,7 +76,6 @@ def chat_completions(
 ) -> dict[str, Any]:
     """Turn an OpenAI chat request into a Jev detection and shape the reply."""
     api_key = _resolve_api_key(authorization)
-    _guard_request(request.messages)
     if not _REQUEST_SLOTS.acquire(blocking=False):
         raise HTTPException(status_code=429, detail="Proxy is at capacity")
 
@@ -120,8 +101,6 @@ def chat_completions(
             )
         except ReviewUnavailableError as exc:
             raise HTTPException(status_code=503, detail="Review unavailable") from exc
-        except CallerPolicyTooLongError as exc:
-            raise HTTPException(status_code=422, detail="System policy exceeds configured size limit") from exc
     finally:
         _REQUEST_SLOTS.release()
 

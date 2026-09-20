@@ -69,10 +69,6 @@ class Settings(BaseSettings):
     JEV_ALLOW_UNAUTHENTICATED_FALLBACK: bool = Field(
         default=False, description="Allow using TYPESAFE_API_KEY when a caller omits bearer auth"
     )
-    JEV_MAX_SEGMENTS: int = Field(default=300, ge=1, description="Maximum segments per request")
-    JEV_MAX_TRANSCRIPT_CHARS: int = Field(
-        default=200_000, ge=1, description="Maximum transcript characters per request"
-    )
     JEV_MAX_CONCURRENT_REQUESTS: int = Field(
         default=4, ge=1, description="Maximum simultaneous upstream requests per worker"
     )
