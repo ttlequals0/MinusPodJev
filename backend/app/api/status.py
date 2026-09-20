@@ -87,4 +87,10 @@ def status_check() -> dict[str, Any]:
         "status": "degraded" if degraded else "ok",
         "jev": jev,
         "minuspod": minuspod,
+        "review": {
+            "refine_boundaries": settings.JEV_REVIEW_REFINE_BOUNDARIES,
+            "model": settings.JEV_MODEL,
+            "evidence_threshold": settings.JEV_ENTER,
+            "choice_threshold": settings.JEV_ENTER,
+        },
     }

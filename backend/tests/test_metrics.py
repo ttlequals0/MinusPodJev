@@ -94,6 +94,8 @@ def test_metrics_records_are_thread_safe():
         metrics.record_proxy_request(1.0, True)
         metrics.record_cache(True)
         metrics.record_review("adjusted", 2.0)
+        metrics.record_review_refinement("attempted")
+        metrics.record_review_refinement("completed", changed=True)
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(record, range(100)))
@@ -102,6 +104,9 @@ def test_metrics_records_are_thread_safe():
     assert snapshot["cache"]["hits"] == 100
     assert snapshot["review"]["count"] == 100
     assert snapshot["review"]["outcomes"]["adjusted"] == 100
+    assert snapshot["review"]["refinement"]["attempted"] == 100
+    assert snapshot["review"]["refinement"]["completed"] == 100
+    assert snapshot["review"]["refinement"]["changed"] == 100
 
 
 def test_review_metrics_use_fixed_safe_values_and_reset():
@@ -159,7 +164,7 @@ async def test_stats_schema_and_inference_path_scope(client):
     }
     assert set(snapshot["cache"]) == {"hits", "misses"}
     assert set(snapshot["cost"]) == {"estimated_input_usd"}
-    assert set(snapshot["review"]) == {"count", "outcomes", "reasons", "latency_ms"}
+    assert set(snapshot["review"]) == {"count", "outcomes", "reasons", "latency_ms", "refinement"}
     assert set(snapshot["review"]["outcomes"]) == {
         "confirmed",
         "adjusted",
@@ -180,6 +185,21 @@ async def test_stats_schema_and_inference_path_scope(client):
         "invalid_request",
         "internal_error",
         "unknown",
+    }
+    assert snapshot["review"]["refinement"] == {
+        "attempted": 0,
+        "completed": 0,
+        "changed": 0,
+        "unchanged": 0,
+        "inconclusive": 0,
+        "upstream_error": 0,
+        "skipped": {
+            "disabled": 0,
+            "missing_word_timings": 0,
+            "insufficient_evidence": 0,
+            "ambiguous_spans": 0,
+            "no_overlapping_span": 0,
+        },
     }
     assert set(snapshot["proxy_requests"]["latency_ms"]) == {
         "count",

@@ -29,6 +29,7 @@ from app.services.jev import (
     jev_review_questions,
 )
 from app.services.sponsors import matched_sponsor_for_span
+from app.utils.metrics import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -496,6 +497,7 @@ def _select_word(
     words: Sequence[dict[str, Any]],
     enter: float,
     request: Callable[[dict[str, dict[str, Any]], str], dict[str, Any]],
+    review_request_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Reduce Choice groups without dropping candidates; unknown is inconclusive."""
     current = list(words)
@@ -506,6 +508,15 @@ def _select_word(
         for key in questions:
             answer = result["answers"][key]
             choice = answer["choice"]
+            logger.info(
+                "review request_id=%s stage=choice_%s question=%s choice=%s confidence=%s threshold=%s",
+                review_request_id,
+                prefix,
+                key,
+                choice,
+                float(answer["confidence"]),
+                enter,
+            )
             if answer["confidence"] < enter:
                 return None
             if choice == "unknown":
@@ -555,6 +566,15 @@ def run_review(
         raise ReviewInvalidRequestError("candidate bounds or transcript could not be parsed")
     context_start = min(float(segment["start"]) for segment in segments)
     context_end = max(float(segment["end"]) for segment in segments)
+    logger.info(
+        "review request_id=%s stage=context refine_boundaries=%s start_word_count=%d end_word_count=%d evidence_threshold=%s choice_threshold=%s",
+        review_request_id,
+        refine_boundaries,
+        len(word_edges["start"]),
+        len(word_edges["end"]),
+        enter,
+        enter,
+    )
     if not any(
         min(float(segment["end"]), cand[1]) > max(float(segment["start"]), cand[0])
         for segment in segments
@@ -599,8 +619,22 @@ def run_review(
         if min(span_end, cand_end) > max(span_start, cand_start):
             overlapping.append((span_start, span_end, float(span["confidence"])))
     if not overlapping:
+        metrics.record_review_refinement("skipped", skip_reason="no_overlapping_span")
+        logger.info(
+            "review request_id=%s refinement=skipped reason=no_overlapping_span original_start=%.3f original_end=%.3f",
+            review_request_id,
+            cand_start,
+            cand_end,
+        )
         return _envelope(echo_model, {"ads": []}, detection["usage"])
     if len(overlapping) != 1:
+        metrics.record_review_refinement("skipped", skip_reason="ambiguous_spans")
+        logger.info(
+            "review request_id=%s refinement=skipped reason=ambiguous_spans original_start=%.3f original_end=%.3f",
+            review_request_id,
+            cand_start,
+            cand_end,
+        )
         _review_unavailable(pool, "Jev did not produce one unambiguous overlapping span")
 
     ad_start, ad_end, confidence = overlapping[0]
@@ -645,17 +679,79 @@ def run_review(
             }
         }, "evidence"
     )
-    if evidence["answers"]["evidence"] < enter:
+    evidence_score = float(evidence["answers"]["evidence"])
+    logger.info(
+        "review request_id=%s stage=evidence score=%s threshold=%s",
+        review_request_id,
+        evidence_score,
+        enter,
+    )
+    if evidence_score < enter:
+        metrics.record_review_refinement("skipped", skip_reason="insufficient_evidence")
+        logger.info(
+            "review request_id=%s refinement=skipped reason=insufficient_evidence original_start=%.3f original_end=%.3f",
+            review_request_id,
+            cand_start,
+            cand_end,
+        )
         _review_unavailable(pool, "Jev did not find sufficient advertising evidence")
 
-    if refine_boundaries and word_edges["start"] and word_edges["end"]:
-        start_word = _select_word(
-            prefix="start", words=word_edges["start"], enter=enter, request=review_questions
+    if not refine_boundaries:
+        metrics.record_review_refinement("skipped", skip_reason="disabled")
+        logger.info(
+            "review request_id=%s refinement=skipped reason=disabled original_start=%.3f original_end=%.3f",
+            review_request_id,
+            cand_start,
+            cand_end,
         )
-        end_word = _select_word(
-            prefix="end", words=word_edges["end"], enter=enter, request=review_questions
+    elif not word_edges["start"] or not word_edges["end"]:
+        metrics.record_review_refinement("skipped", skip_reason="missing_word_timings")
+        logger.info(
+            "review request_id=%s refinement=skipped reason=missing_word_timings original_start=%.3f original_end=%.3f",
+            review_request_id,
+            cand_start,
+            cand_end,
         )
+    else:
+        metrics.record_review_refinement("attempted")
+        logger.info(
+            "review request_id=%s refinement=attempted original_start=%.3f original_end=%.3f",
+            review_request_id,
+            cand_start,
+            cand_end,
+        )
+        try:
+            start_word = _select_word(
+                prefix="start",
+                words=word_edges["start"],
+                enter=enter,
+                request=review_questions,
+                review_request_id=review_request_id,
+            )
+            end_word = _select_word(
+                prefix="end",
+                words=word_edges["end"],
+                enter=enter,
+                request=review_questions,
+                review_request_id=review_request_id,
+            )
+        except ReviewUnavailableError:
+            metrics.record_review_refinement("upstream_error")
+            logger.info(
+                "review request_id=%s refinement=failed reason=upstream_error original_start=%.3f original_end=%.3f",
+                review_request_id,
+                cand_start,
+                cand_end,
+            )
+            raise
         if start_word is None or end_word is None:
+            metrics.record_review_refinement("inconclusive")
+            logger.info(
+                "review request_id=%s refinement=failed reason=choice_inconclusive original_start=%.3f original_end=%.3f",
+                review_request_id,
+                cand_start,
+                cand_end,
+            )
             _review_unavailable(pool, "Jev boundary Choice was inconclusive")
         refined_start, refined_end = float(start_word["start"]), float(end_word["end"])
         if (
@@ -665,7 +761,27 @@ def run_review(
             or min(refined_end, cand_end) <= max(refined_start, cand_start)
             or min(refined_end, ad_end) <= max(refined_start, ad_start)
         ):
+            metrics.record_review_refinement("inconclusive")
+            logger.info(
+                "review request_id=%s refinement=failed reason=invalid_pair original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f",
+                review_request_id,
+                cand_start,
+                cand_end,
+                refined_start,
+                refined_end,
+            )
             _review_unavailable(pool, "Jev boundary Choice returned an invalid pair")
+        changed = abs(refined_start - cand_start) > 0.1 or abs(refined_end - cand_end) > 0.1
+        metrics.record_review_refinement("completed", changed=changed)
+        logger.info(
+            "review request_id=%s refinement=completed reason=%s original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f",
+            review_request_id,
+            "changed" if changed else "unchanged",
+            cand_start,
+            cand_end,
+            refined_start,
+            refined_end,
+        )
         ad_start, ad_end = refined_start, refined_end
     verdict = {
         "is_ad": True,

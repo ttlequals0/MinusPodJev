@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from app.config import settings
 from app.services.openai_adapter import (
+    ReviewInconclusiveError,
     ReviewUnavailableError,
     is_review_request,
     parse_candidate_bounds,
@@ -19,6 +20,7 @@ from app.services.openai_adapter import (
     parse_review_segments,
     run_review,
 )
+from app.utils.metrics import metrics
 from minuspod_compat import extract_json_ads_array, format_window_prompt
 
 _AD_KW = ("sponsor", "betterhelp", "promo code", "brought to you by", "acast")
@@ -28,6 +30,12 @@ _AD_KW = ("sponsor", "betterhelp", "promo code", "brought to you by", "acast")
 def jev_env(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "TYPESAFE_API_KEY", "test-key")
     monkeypatch.setattr(settings, "JEV_CACHE_PATH", str(tmp_path / "cache.json"))
+
+
+@pytest.fixture(autouse=True)
+def reset_review_refinement_metrics():
+    metrics.reset()
+    yield
 
 
 def make_text_fake(*, keywords=_AD_KW, input_tokens=1200, output_tokens=6, raises=False):
@@ -126,7 +134,7 @@ def minuspod_review_verdict(content, original_start, original_end, *, pool="acce
     return ("confirmed" if unchanged else "adjust"), new_start, new_end, method
 
 
-def _run(prompt, fake, tmp_path, *, refine_boundaries=False):
+def _run(prompt, fake, tmp_path, *, refine_boundaries=False, review_request_id=None, enter=0.95):
     return run_review(
         messages=[
             {"role": "system", "content": "review ads"},
@@ -138,10 +146,21 @@ def _run(prompt, fake, tmp_path, *, refine_boundaries=False):
         timeout=1.0,
         cache_path=str(tmp_path / "c.json"),
         model="jev-latest",
-        enter=0.95,
+        enter=enter,
         stay=0.40,
         refine_boundaries=refine_boundaries,
+        review_request_id=review_request_id,
         fetcher=fake,
+    )
+
+
+def _with_word_edges(prompt, start=(99.5, 100.0, "This"), end=(119.5, 120.5, "BetterHelp")):
+    return prompt + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n"
+        f"[{start[0]:.1f}s-{start[1]:.1f}s] {start[2]}\n"
+        "End edge:\n"
+        f"[{end[0]:.1f}s-{end[1]:.1f}s] {end[2]}\n"
     )
 
 
@@ -468,6 +487,171 @@ def test_opt_in_refinement_uses_word_edges(jev_env, tmp_path):
     response = _run(prompt, make_text_fake(), tmp_path, refine_boundaries=True)
     ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
     assert (ad["start"], ad["end"]) == (99.5, 120.5)
+
+
+def test_refinement_metrics_changed_and_unchanged(jev_env, tmp_path):
+    base = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 120.0, "This episode is sponsored by BetterHelp")],
+        [(120.0, 126.0, "context after")],
+    )
+    _run(_with_word_edges(base), make_text_fake(), tmp_path, refine_boundaries=True)
+    _run(
+        _with_word_edges(base, start=(100.0, 100.0, "This"), end=(120.0, 120.0, "BetterHelp")),
+        make_text_fake(),
+        tmp_path,
+        refine_boundaries=True,
+    )
+
+    refinement = metrics.snapshot()["review"]["refinement"]
+    assert refinement["attempted"] == 2
+    assert refinement["completed"] == 2
+    assert refinement["changed"] == 1
+    assert refinement["unchanged"] == 1
+
+
+def test_refinement_gates_never_enter_choice(jev_env, tmp_path):
+    base = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 120.0, "This episode is sponsored by BetterHelp")],
+        [(120.0, 126.0, "context after")],
+    )
+    _run(base, make_text_fake(), tmp_path, refine_boundaries=False)
+    _run(base, make_text_fake(), tmp_path, refine_boundaries=True)
+
+    low_evidence = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 120.0, "This unrelated editorial sentence")],
+        [(120.0, 126.0, "context after")],
+    )
+    with pytest.raises(ReviewInconclusiveError):
+        _run(_with_word_edges(low_evidence), make_text_fake(keywords=("unrelated",)), tmp_path, refine_boundaries=True)
+
+    outside = build_review_prompt(
+        100.0,
+        120.0,
+        [(88.0, 94.0, "context before")],
+        [(100.0, 120.0, "editorial content")],
+        [(126.0, 132.0, "context after")],
+    )
+    outside_cache = tmp_path / "outside"
+    outside_cache.mkdir()
+    _run(outside, make_text_fake(keywords=("context",)), outside_cache, refine_boundaries=True)
+
+    ambiguous = build_review_prompt(
+        100.0,
+        200.0,
+        [(94.0, 100.0, "context before")],
+        [
+            (100.0, 105.0, "This is sponsored by BetterHelp"),
+            (105.0, 155.0, "The hosts return to their discussion"),
+            (155.0, 200.0, "Use promo code SHOW at betterhelp.com"),
+        ],
+        [(200.0, 206.0, "context after")],
+    )
+    ambiguous_cache = tmp_path / "ambiguous"
+    ambiguous_cache.mkdir()
+    with pytest.raises(ReviewInconclusiveError):
+        _run(ambiguous, make_text_fake(), ambiguous_cache, refine_boundaries=True)
+
+    refinement = metrics.snapshot()["review"]["refinement"]
+    assert refinement["attempted"] == 0
+    assert refinement["skipped"] == {
+        "disabled": 1,
+        "missing_word_timings": 1,
+        "insufficient_evidence": 1,
+        "ambiguous_spans": 1,
+        "no_overlapping_span": 1,
+    }
+
+
+def test_refinement_choice_failures_are_counted(jev_env, tmp_path):
+    base = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 120.0, "This episode is sponsored by BetterHelp")],
+        [(120.0, 126.0, "context after")],
+    )
+    prompt = _with_word_edges(base)
+    normal = make_text_fake()
+
+    def uncertain(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if any(question.get("type") == "choice" for question in payload["questions"].values()):
+            for answer in result["answers"].values():
+                answer["confidence"] = 0.5
+        return result
+
+    with pytest.raises(ReviewInconclusiveError):
+        uncertain_cache = tmp_path / "uncertain"
+        uncertain_cache.mkdir()
+        _run(prompt, uncertain, uncertain_cache, refine_boundaries=True)
+
+    def upstream_choice(payload, **kwargs):
+        if any(question.get("type") == "choice" for question in payload["questions"].values()):
+            raise RuntimeError("choice upstream failure")
+        return normal(payload, **kwargs)
+
+    with pytest.raises(ReviewUnavailableError):
+        upstream_cache = tmp_path / "upstream"
+        upstream_cache.mkdir()
+        _run(prompt, upstream_choice, upstream_cache, refine_boundaries=True)
+
+    def malformed_choice(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if any(question.get("type") == "choice" for question in payload["questions"].values()):
+            result["answers"][next(iter(result["answers"]))]["probabilities"] = {"bad": 1.0}
+        return result
+
+    with pytest.raises(ReviewUnavailableError):
+        malformed_cache = tmp_path / "malformed"
+        malformed_cache.mkdir()
+        _run(prompt, malformed_choice, malformed_cache, refine_boundaries=True)
+
+    invalid = _with_word_edges(base, end=(90.0, 95.0, "wrong"))
+    with pytest.raises(ReviewInconclusiveError):
+        invalid_cache = tmp_path / "invalid"
+        invalid_cache.mkdir()
+        _run(invalid, normal, invalid_cache, refine_boundaries=True)
+
+    refinement = metrics.snapshot()["review"]["refinement"]
+    assert refinement["attempted"] == 4
+    assert refinement["inconclusive"] == 2
+    assert refinement["upstream_error"] == 2
+
+
+def test_refinement_logs_effective_context_and_precise_thresholds(jev_env, tmp_path, caplog):
+    import logging
+
+    prompt = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 120.0, "This episode is sponsored by BetterHelp")],
+        [(120.0, 126.0, "context after")],
+    )
+    with caplog.at_level(logging.INFO, logger="app.services.openai_adapter"):
+        _run(
+            _with_word_edges(prompt),
+            make_text_fake(),
+            tmp_path,
+            refine_boundaries=True,
+            review_request_id="request-123",
+            enter=0.9496,
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("request_id=request-123 stage=context" in message and "start_word_count=1" in message for message in messages)
+    assert any("stage=evidence score=0.98 threshold=0.9496" in message for message in messages)
+    assert any("stage=choice_start" in message and "confidence=0.98" in message for message in messages)
+    assert all("BetterHelp" not in message for message in messages)
 
 
 def test_review_upstream_failure_is_unavailable(jev_env, tmp_path):

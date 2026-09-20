@@ -143,9 +143,14 @@ and is not an independent judgment. It uses coarse segment context and parses wo
 separately. The focused evidence NouL question adds an upstream call unless cached.
 `JEV_REVIEW_REFINE_BOUNDARIES=false` disables optional word-boundary refinement by default. Set it
 to `true` when provided word times should refine boundaries; the proxy handles Jev's 255-option
-Choice limit without truncating the supplied options. An inconclusive review returns 422 with
+Choice limit without truncating the supplied options. `GET /api/status` reports effective review
+settings: enabled state, model, evidence threshold, and Choice threshold. Enabled does not
+guarantee refinement: both word-timing edges, sufficient evidence, and confident Choice answers
+are required. Review logs include request ID, stage, evidence score and threshold, word counts,
+Choice confidence, and skip or failure reason. An inconclusive review returns 422 with
 `x-should-retry: false` and does not confirm or move the candidate. An upstream or invalid-upstream
-review error returns 503. MinusPod's local breaker still counts non-rate errors. Sponsor naming: set `MINUSPOD_BASE_URL` +
+review error returns 503.
+MinusPod's local breaker still counts non-rate errors. Sponsor naming: set `MINUSPOD_BASE_URL` +
 `MINUSPOD_PASSWORD` and the proxy logs into MinusPod (cached session) to read
 `GET /api/v1/sponsors`. It emits `sponsor_name` only for one known sponsor with local ad
 evidence, using the `jev-` namespace, for example `jev-ButcherBox`. The prefix identifies a
@@ -190,6 +195,11 @@ parseable `WORKERS` environment hint, or `null` when unavailable. Metrics reset 
 - `review` counts fixed outcomes and safe reason codes with review latency. It stores no request
   IDs, transcripts, boundaries, or secrets. Request IDs and numeric bounds are logged for
   diagnosis.
+- `review.refinement` reports attempts, completed selections, changed and unchanged results,
+  inconclusive and upstream-error counts, plus skip counts for disabled refinement, missing word
+  timings, insufficient evidence, ambiguous spans, and no overlap. Counters live in process memory
+  and reset on restart. Changed and unchanged compare the final word pair with the candidate at
+  the 0.1 s tolerance; they are separate from coarse span adjustments in review outcomes.
 - `cache` separates cache hits and misses. `cost.estimated_input_usd` charges only successful,
   uncached upstream responses with valid reported input tokens, at Jev's published $0.042 per
   million input tokens. It is an estimate and excludes output token charges, fees, and taxes.

@@ -2,8 +2,23 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 type Health = { status: string; environment: string; version: string }
 type Upstream = { configured: boolean; reachable: boolean; authenticated?: boolean; url: string; reason?: string }
-type Status = { status: string; jev: Upstream; minuspod: Upstream }
+type ReviewSettings = {
+  refine_boundaries?: boolean
+  model?: string
+  evidence_threshold?: number
+  choice_threshold?: number
+}
+type Status = { status: string; jev: Upstream; minuspod: Upstream; review?: ReviewSettings }
 type Latency = { count: number; sum: number; min: number; max: number; average: number }
+type RefinementStats = {
+  attempted?: number
+  completed?: number
+  changed?: number
+  unchanged?: number
+  inconclusive?: number
+  upstream_error?: number
+  skipped?: Partial<Record<'disabled' | 'missing_word_timings' | 'insufficient_evidence' | 'ambiguous_spans' | 'no_overlapping_span', number>>
+}
 type Review = {
   count: number
   outcomes: {
@@ -17,6 +32,7 @@ type Review = {
   }
   reasons: Record<string, number>
   latency_ms: Latency
+  refinement?: RefinementStats
 }
 type Stats = {
   scope: { kind: 'process'; pid: number; configured_workers: number | null }
@@ -151,6 +167,7 @@ function App() {
             <article className="card"><h3>Proxy</h3><dl><Definition label="Health" value={state.health?.status ?? 'Unknown'} tone={serviceHealthy ? 'success' : 'warning'} /><Definition label="Environment" value={state.health?.environment ?? 'Unknown'} /><Definition label="Version" value={state.health?.version ?? 'Unknown'} /></dl></article>
             <UpstreamCard name="TypeSafe Jev" upstream={state.status?.jev} />
             <UpstreamCard name="MinusPod" upstream={state.status?.minuspod} />
+            <ReviewCard settings={state.status?.review} />
           </div>
         </section>
 
@@ -179,6 +196,20 @@ function UpstreamCard({ name, upstream }: { name: string; upstream: Upstream | u
   </dl></article>
 }
 
+function ReviewCard({ settings }: { settings: ReviewSettings | undefined }) {
+  return <article className="card"><h3>Jev review</h3>
+    {settings ? <>
+      <dl>
+        <Definition label="Boundary refinement" value={settings.refine_boundaries == null ? 'Not reported' : settings.refine_boundaries ? 'Enabled' : 'Disabled'} tone={settings.refine_boundaries ? 'success' : undefined} />
+        <Definition label="Model" value={settings.model ?? 'Not reported'} />
+        <Definition label="Evidence threshold" value={settings.evidence_threshold == null ? 'Not reported' : String(settings.evidence_threshold)} />
+        <Definition label="Choice threshold" value={settings.choice_threshold == null ? 'Not reported' : String(settings.choice_threshold)} />
+      </dl>
+      <p className="card-note">Enabled does not mean every review runs refinement. Both word-timing edges and sufficient evidence are required.</p>
+    </> : <p className="card-note">Review settings are not reported by this backend.</p>}
+  </article>
+}
+
 function RuntimeStats({ stats, statsError }: { stats: Stats | null; statsError: string | null }) {
   if (!stats) return <div className="notice" role="status">{statsError ? 'Runtime statistics unavailable.' : 'Loading runtime statistics...'}</div>
   const cacheTotal = stats.cache.hits + stats.cache.misses
@@ -198,12 +229,46 @@ function RuntimeStats({ stats, statsError }: { stats: Stats | null; statsError: 
         <Metric label="Average review latency" value={formatLatency(stats.review.latency_ms.average, stats.review.latency_ms.count)} detail="Completed review attempts in this process" />
       </>}
     </div>
+    {stats.review && <>
+      <RefinementStats refinement={stats.review.refinement} />
+      <ReviewReasons reasons={stats.review.reasons} />
+    </>}
     <div className="runtime-details">
       <div><span>Process uptime</span><strong>{formatDuration(stats.uptime_seconds)}</strong></div>
       <div><span>Configured workers</span><strong>{stats.scope.configured_workers ?? 'Unknown'}</strong></div>
       <p>Stats are local to process {stats.scope.pid}. Configured workers is an optional environment hint, not a discovered worker count. With multiple workers, requests may alternate between per-worker counters rather than forming a container-wide total. Full MinusPod round-trip timing requires client timing. Cache hits do not call Jev; failed cache fetches count as misses. Failed or usage-unknown attempts do not add to the cost estimate.</p>
     </div>
   </>
+}
+
+function RefinementStats({ refinement }: { refinement: RefinementStats | undefined }) {
+  if (!refinement) return <div className="notice refinement-summary" role="status">Boundary refinement counters are not reported by this backend.</div>
+  const skipped = refinement.skipped
+  const count = (value: number | undefined) => value == null ? 'Not reported' : value.toLocaleString()
+  return <section className="refinement-summary" aria-labelledby="refinement-title">
+    <div className="section-heading"><div><h3 id="refinement-title">Boundary refinement</h3><p>Word-level refinement counters are separate from coarse review outcomes.</p></div></div>
+    <div className="metric-grid">
+      <Metric label="Refinement attempts" value={count(refinement.attempted)} detail="Reviews that started word selection" />
+      <Metric label="Refinement completed" value={count(refinement.completed)} detail={`${count(refinement.changed)} changed, ${count(refinement.unchanged)} unchanged`} />
+      <Metric label="Refinement inconclusive" value={count(refinement.inconclusive)} detail="Uncertain selection or invalid boundary pair" />
+      <Metric label="Refinement upstream failures" value={count(refinement.upstream_error)} detail="Choice request failed or returned an invalid response" />
+    </div>
+    <article className="card refinement-skips"><h4>Refinement skipped</h4><dl>
+      <Definition label="Disabled" value={count(skipped?.disabled)} />
+      <Definition label="Missing word timings" value={count(skipped?.missing_word_timings)} />
+      <Definition label="Insufficient evidence" value={count(skipped?.insufficient_evidence)} />
+      <Definition label="Ambiguous spans" value={count(skipped?.ambiguous_spans)} />
+      <Definition label="No overlapping span" value={count(skipped?.no_overlapping_span)} />
+    </dl></article>
+    <p className="refinement-note">Changed and unchanged compare the selected final word pair with the original candidate at the 0.1 s tolerance. They do not include coarse span adjustments counted under review outcomes.</p>
+  </section>
+}
+
+function ReviewReasons({ reasons }: { reasons: Record<string, number> }) {
+  const entries = Object.entries(reasons).filter(([, value]) => value > 0)
+  return <article className="card refinement-skips"><h4>Review reasons</h4>
+    {entries.length ? <dl>{entries.map(([reason, value]) => <Definition key={reason} label={reason.replaceAll('_', ' ')} value={value.toLocaleString()} />)}</dl> : <p className="card-note">No review reasons recorded.</p>}
+  </article>
 }
 
 function Metric({ label, value, detail }: { label: string; value: string; detail: string }) {
