@@ -17,38 +17,70 @@ cross-validating its tuned thresholds.
 
 ```mermaid
 flowchart TD
-  op["Episode ingest"] --> mp
-
-  subgraph mp["MinusPod pipeline (per-phase provider routing)"]
-    det["detection"]
-    ver["verification"]
-    rev["review"]
-    chap["chapters"]
+  subgraph ops["Operations UI"]
+    statuspage["Status Page<br/>[App.tsx]"]
   end
 
-  det -->|primary| proxy
-  ver -->|primary| proxy
-  rev -->|secondary| real["Real chat model"]
-  rev -.->|optional primary| proxy
-  chap -->|secondary| real
-
-  subgraph proxy["jevproxy  POST /v1/chat/completions"]
-    disc{"candidate markers or review prompt?"}
-    parse["parse Xs-Ys lines to segments"]
-    detf["detection: assemble spans + category"]
-    revf["review: verdict"]
-    spon["sponsor_name: confirmed match -> jev-<brand>, else omitted"]
-    disc -->|no| parse --> detf --> spon
-    disc -->|yes| revf
+  subgraph proxyapi["Proxy API"]
+    health["Health API<br/>[health.py]"]
+    status["Status API<br/>[status.py]"]
+    nativejev["Native Jev API<br/>[jev.py]"]
+    openai["OpenAI API<br/>[openai.py]"]
   end
 
-  proxy -->|"noul per segment, model = jev-latest, bearer = TypeSafe key"| jev[("TypeSafe Jev System One")]
-  jev -->|per-segment probabilities| proxy
-  spon -.->|"login + GET /api/v1/sponsors"| mpapi[("MinusPod API")]
+  subgraph pipeline["Detection Pipeline"]
+    adapter["Chat Adapter<br/>[openai_adapter.py]"]
+    category["Category Pass<br/>[jev.py]"]
+    spans["Span Assembly<br/>[spans.py]"]
+    jevclient["Jev Client<br/>[jev.py]"]
+  end
 
-  proxy -->|"ads / verdict JSON in chat.completion"| mp
-  mp --> cut["cut or replace audio"]
-  mp --> learn["pattern learning"]
+  subgraph enrich["Enrichment State"]
+    cache[("Response Cache<br/>[cache.py]")]
+    sponsors["Sponsor Matching<br/>[sponsors.py]"]
+    gazetteer["Sponsor Gazetteer<br/>[sponsors.py]"]
+  end
+
+  typesafe["TypeSafe Jev"]
+  minuspod((MinusPod))
+  chatmodel["Chat Model"]
+  mpapi["MinusPod API"]
+
+  statuspage -->|polls health| health
+  statuspage -->|polls status| status
+  status -->|probes Jev| typesafe
+  status -->|probes MinusPod| mpapi
+
+  minuspod -->|sends prompts| openai
+  openai -->|returns envelope| minuspod
+  openai -->|dispatches request| adapter
+  adapter -->|returns ad JSON| openai
+  nativejev -->|asks segments| jevclient
+
+  adapter -->|classifies spans| category
+  adapter -->|assembles spans| spans
+  adapter -->|queries Jev| jevclient
+  category -->|queries categories| jevclient
+  adapter -->|matches sponsors| sponsors
+
+  jevclient -->|sends nouls| typesafe
+  typesafe -->|returns probabilities| jevclient
+  jevclient -->|caches answers| cache
+
+  sponsors -->|uses gazetteer| gazetteer
+  sponsors -->|reads sponsors| mpapi
+
+  minuspod -.->|routes review| chatmodel
+  minuspod -.->|routes chapters| chatmodel
+
+  classDef proxyc fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a
+  classDef pipec fill:#fde9c8,stroke:#d97706,color:#7c2d12
+  classDef enrichc fill:#d1fae5,stroke:#10b981,color:#065f46
+  classDef statusc fill:#fee2e2,stroke:#ef4444,color:#991b1b
+  class health,status,nativejev,openai proxyc
+  class adapter,category,spans,jevclient pipec
+  class cache,sponsors,gazetteer enrichc
+  class statuspage statusc
 ```
 
 ## jevproxy
