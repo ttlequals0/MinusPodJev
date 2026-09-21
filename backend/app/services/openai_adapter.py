@@ -97,7 +97,7 @@ def _category_guidance(system_text: str) -> str:
         return CATEGORY_GUIDANCE
     return (
         f"{CATEGORY_GUIDANCE}\n\nCaller policy for category selection:\n"
-        f"{policy}\n\nAnswer only the supplied noul questions."
+        f"{policy}\n\nAnswer only the supplied Choice question."
     )
 
 
@@ -344,6 +344,12 @@ def run_chat_completion(
             category = cat_result["category"]
             input_tokens += int(cat_result["usage"]["input_tokens"])
             output_tokens += int(cat_result["usage"]["output_tokens"])
+            logger.info(
+                "category category=%s confidence=%s cache_hit=%s",
+                category,
+                cat_result["confidence"],
+                cat_result["cache_hit"],
+            )
         else:
             category = default_category
 

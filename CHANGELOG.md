@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.6 - 2026-09-21
+
+- Classify each detected span with one validated Jev Choice across MinusPod's category labels.
+
 ## 0.1.5 - 2026-09-21
 
 - Made all four runtime thresholds persistent and editable, including detection stay.

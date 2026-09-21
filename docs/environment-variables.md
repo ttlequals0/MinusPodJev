@@ -97,7 +97,7 @@ and review Choice values.
 | `DEBUG` | `true` | Debug-mode setting. |
 | `LOG_LEVEL` | `INFO` | Logging level. |
 | `LOG_FORMAT` | `%(asctime)s - %(name)s - %(levelname)s - %(message)s` | Python logging format. |
-| `JEV_CATEGORY_PASS` | `true` | Run the per-span category pass. |
+| `JEV_CATEGORY_PASS` | `true` | Run one Jev Choice per detected span for category classification. |
 | `JEV_CATEGORY_CONTEXT` | `2` | Number of before/after context segments used by that pass. |
 | `JEV_DEFAULT_CATEGORY` | `sponsor` | Category when the category pass is disabled. |
 | `TESTING` | `false` | Testing-mode setting. |

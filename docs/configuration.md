@@ -7,6 +7,7 @@
 - [MinusPod routing](#minuspod-routing)
 - [Provider fields](#provider-fields)
 - [Runtime threshold settings](#runtime-threshold-settings)
+- [Category classification](#category-classification)
 - [Review behavior](#review-behavior)
 - [Sponsor naming](#sponsor-naming)
 - [Runtime ownership](#runtime-ownership)
@@ -76,6 +77,14 @@ These are `0` to `1` probability scores, not measured accuracy. Detection enter 
 - The message omits paths and file contents.
 - The `/app/data` mount must be writable by UID/GID 1000.
 - Existing volume ownership overrides image defaults, so verify the mounted directory before applying a nonrecursive `chown` to UID/GID 1000.
+
+## Category classification
+
+The category pass uses one Jev Choice for each detected span. Its values are `sponsor`, `cross_promo`, `self_promo`, `interaction`, `intro`, `outro`, and `recap`.
+
+- `JEV_CATEGORY_PASS=true` enables the pass. With `false`, the proxy uses `JEV_DEFAULT_CATEGORY`.
+- Category Choice has no threshold. It does not use the detection or boundary-review thresholds.
+- A category result does not change the detected span confidence.
 
 ## Review behavior
 

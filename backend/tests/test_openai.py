@@ -12,6 +12,7 @@ from app.services.openai_adapter import (
 )
 from minuspod_compat import (
     AD_DETECTION_JSON_SCHEMA,
+    SEGMENT_CATEGORIES,
     format_window_prompt,
     parse_ads_from_response,
     parse_id_ads_from_response,
@@ -31,7 +32,7 @@ def jev_env(tmp_path, monkeypatch):
 
 
 def make_fake(ad_sids, *, cat_index=0, input_tokens=1000, output_tokens=5):
-    """Fetcher that scores s<sid> detection and c<index> category questions."""
+    """Fetcher that scores detection NouLs and category Choices."""
     ad_sids = set(ad_sids)
 
     def fake(payload: dict[str, Any], *, url: str, api_key: str, timeout: float, max_retries: int = 2, **_kwargs: Any) -> dict[str, Any]:
@@ -39,8 +40,17 @@ def make_fake(ad_sids, *, cat_index=0, input_tokens=1000, output_tokens=5):
         for key in payload["questions"]:
             if key.startswith("s"):
                 answers[key] = {"noul": 0.98 if int(key[1:]) in ad_sids else 0.02}
-            elif key.startswith("c"):
-                answers[key] = {"noul": 0.97 if int(key[1:]) == cat_index else 0.05}
+            elif question := payload["questions"][key]:
+                criteria = question.get("criteria", {})
+                category = list(criteria)[cat_index]
+                answers[key] = {
+                    "choice": category,
+                    "confidence": 0.97,
+                    "probabilities": {
+                        option: 0.97 if option == category else 0.005
+                        for option in criteria
+                    },
+                }
         return {
             "answers": answers,
             "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
@@ -146,9 +156,118 @@ async def test_chat_completions_timestamps_round_trip(jev_env, client, monkeypat
     assert ad["start"] == 18.0
     assert ad["end"] == 36.0
     assert ad["category"] == "sponsor"
+    assert ad["confidence"] == 0.98
     assert ad["sponsor"] == "jev-BetterHelp"
     assert ad["end_text"].startswith("Use code SHOW")
     assert ad["reason"].startswith("Based on transcript: This episode is sponsored by BetterHelp.")
+
+
+@pytest.mark.parametrize("category", SEGMENT_CATEGORIES)
+@pytest.mark.parametrize("addressing_mode", ["timestamps", "segment_ids"])
+def test_category_choice_propagates_for_timestamp_and_segment_id_prompts(
+    jev_env, tmp_path, category, addressing_mode
+):
+    category_index = list(SEGMENT_CATEGORIES).index(category)
+    if addressing_mode == "timestamps":
+        prompt = format_window_prompt("Pod", "Ep", "", TS_LINES, 0, 1, 0.0, 600.0)
+    else:
+        lines = [f"[{index + 10}] {line.split('] ', 1)[1]}" for index, line in enumerate(TS_LINES)]
+        prompt = format_window_prompt(
+            "Pod", "Ep", "", lines, 0, 1, 0.0, 600.0, addressing_mode="segment_ids"
+        )
+    ad_sids = {3, 4, 5} if addressing_mode == "timestamps" else {13, 14, 15}
+    response = run_chat_completion(
+        messages=[{"role": "system", "content": "Keep policy context."}, {"role": "user", "content": prompt}],
+        request_model="jev-latest",
+        url="u",
+        api_key="k",
+        timeout=1.0,
+        cache_path=str(tmp_path / f"{addressing_mode}-{category}.json"),
+        model="jev-latest",
+        enter=0.95,
+        stay=0.40,
+        category_pass=True,
+        category_context=2,
+        default_category="sponsor",
+        fetcher=make_fake(ad_sids, cat_index=category_index),
+    )
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+    assert ad["category"] == category
+    assert ad["confidence"] == 0.98
+
+
+def test_category_choice_preserves_verification_policy_and_context(jev_env, tmp_path):
+    prompt = format_window_prompt("Pod", "Ep", "", TS_LINES, 0, 1, 0.0, 600.0)
+    calls: list[dict[str, Any]] = []
+
+    def fetcher(payload, **kwargs):
+        calls.append(payload)
+        return make_fake({3, 4, 5})(payload, **kwargs)
+
+    response = run_chat_completion(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are reviewing a podcast episode that has ALREADY had advertisements removed. "
+                    "Verify the remaining transcript and keep host banter."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        request_model="jev-latest",
+        url="u",
+        api_key="k",
+        timeout=1.0,
+        cache_path=str(tmp_path / "verification.json"),
+        model="jev-latest",
+        enter=0.95,
+        stay=0.40,
+        category_pass=True,
+        category_context=2,
+        default_category="sponsor",
+        fetcher=fetcher,
+    )
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+    category_payload = next(
+        payload for payload in calls if payload["questions"].get("category", {}).get("type") == "choice"
+    )
+    assert ad["category"] == "sponsor"
+    assert (
+        "You are reviewing a podcast episode that has ALREADY had advertisements removed."
+        in category_payload["state"]["guidance"]
+    )
+    assert category_payload["state"]["focus"] == "L0003-L0005"
+    assert "L0001| Today we talk about hiking trips." in category_payload["state"]["transcript"]
+    assert "L0006| Anyway, back to the trip we were on." in category_payload["state"]["transcript"]
+
+
+async def test_malformed_category_choice_returns_safe_503(jev_env, client, monkeypatch, tmp_path, caplog):
+    import app.services.jev as jev
+
+    monkeypatch.setattr(settings, "JEV_CACHE_PATH", str(tmp_path / "cache.json"))
+
+    def malformed_choice(payload, **kwargs):
+        answers = {}
+        for key, question in payload["questions"].items():
+            if key.startswith("s"):
+                answers[key] = {"noul": 0.98 if int(key[1:]) in {3, 4, 5} else 0.02}
+            elif question["type"] == "choice":
+                answers[key] = {"choice": "sponsor", "confidence": 0.6, "probabilities": {}}
+        return {"answers": answers, "usage": {"input_tokens": 7, "output_tokens": 3}}
+
+    monkeypatch.setattr(jev, "call_payload", malformed_choice)
+    prompt = format_window_prompt("Pod", "Ep", "", TS_LINES, 0, 1, 0.0, 600.0)
+    with caplog.at_level("WARNING"):
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": prompt}]},
+            headers={"Authorization": "Bearer test-key"},
+        )
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "jev_category_upstream_invalid_response"
+    assert "choice_probability_keys" in caplog.text
+    assert "This episode is sponsored" not in caplog.text
 
 
 async def test_chat_completions_no_ads(jev_env, client, monkeypatch):

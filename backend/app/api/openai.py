@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from app.config import settings
-from app.services.jev import _retry_after_seconds
+from app.services.jev import JevCategoryValidationError, _retry_after_seconds
 from app.services.openai_adapter import (
     ReviewInconclusiveError,
     ReviewInvalidRequestError,
@@ -146,6 +146,18 @@ def chat_completions(
         except ReviewUnavailableError:
             outcome, reason_code = "upstream_error", "upstream_failure"
             return _review_error(503, "jev_review_upstream_failure", "Review unavailable", request_id)
+        except JevCategoryValidationError as exc:
+            logger.warning(
+                "category validation_failed rule=%s details=%s",
+                exc.rule,
+                exc.numeric_details,
+            )
+            return _review_error(
+                503,
+                "jev_category_upstream_invalid_response",
+                "Category classification unavailable",
+                None,
+            )
         except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.TransportError) as exc:
             outcome, reason_code = "upstream_error", "upstream_failure"
             return _upstream_error_response(exc, request_id)

@@ -37,8 +37,17 @@ def _fake_fetcher(ad_sids):
         for key in payload["questions"]:
             if key.startswith("s"):
                 answers[key] = {"noul": 0.98 if int(key[1:]) in ad_sids else 0.02}
-            elif key.startswith("c"):
-                answers[key] = {"noul": 0.97 if key == "c0" else 0.05}
+            elif question := payload["questions"][key]:
+                criteria = question.get("criteria", {})
+                category = next(iter(criteria))
+                answers[key] = {
+                    "choice": category,
+                    "confidence": 0.97,
+                    "probabilities": {
+                        option: 0.97 if option == category else 0.005
+                        for option in criteria
+                    },
+                }
         return {"answers": answers, "usage": {"input_tokens": 1000, "output_tokens": 5}}
 
     return fake

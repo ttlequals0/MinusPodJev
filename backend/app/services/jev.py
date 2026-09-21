@@ -87,6 +87,10 @@ class JevReviewValidationError(ValueError):
         return safe
 
 
+class JevCategoryValidationError(JevReviewValidationError):
+    """Safe validation failure for a category Choice response."""
+
+
 def _finite_float(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -573,9 +577,9 @@ def jev_review_questions(
 
 
 # --- Category second pass -------------------------------------------------
-# One call per span: the span's segments plus a little context, one noul per
-# category, argmax = the category. Keyed c<index> so it never collides with the
-# detection s<sid> questions; cached through the same JsonCache.
+# One call per span: the span's segments plus a little context and one Choice
+# over MinusPod's category labels. Validation, caching, retries, and deadline
+# handling are shared with focused review questions.
 
 CATEGORY_GUIDANCE = (
     "Each line of `transcript` is one segment around a single advertising "
@@ -585,8 +589,8 @@ CATEGORY_GUIDANCE = (
 )
 
 CATEGORY_DESCRIPTIONS: dict[str, str] = {
-    "sponsor": "a paid sponsor read or product advertisement for an outside advertiser",
-    "cross_promo": "a cross-promotion for another podcast or show",
+    "sponsor": "a paid sponsor read, product advertisement, or paid ad for another podcast or show",
+    "cross_promo": "an unpaid promotion for another podcast or show in the same network or by the same host",
     "self_promo": "the host promoting their own show, Patreon, merch, membership, or back catalog",
     "interaction": "a call to action to like, subscribe, rate, review, follow, or comment",
     "intro": "an intro segment opening the episode",
@@ -594,7 +598,11 @@ CATEGORY_DESCRIPTIONS: dict[str, str] = {
     "recap": "a recap or summary of earlier content",
 }
 
-CATEGORY_NOUL = "The advertising break at lines {ids} is {desc}."
+CATEGORY_CHOICE_KEY = "category"
+CATEGORY_CHOICE_INSTRUCTIONS = (
+    "Choose the one category that best describes the advertising break at lines {ids}. "
+    "Use the supplied transcript context."
+)
 
 
 def _focus_ids(focus: Sequence[dict[str, Any]]) -> str:
@@ -612,7 +620,7 @@ def build_category_payload(
     uid: str | None = None,
     guidance: str = CATEGORY_GUIDANCE,
 ) -> dict[str, Any]:
-    """One request: span + context state, one noul per category keyed c<index>."""
+    """One request: span plus context state and one category Choice."""
     merged = {int(s["sid"]): s for s in [*context, *focus]}
     ordered = [merged[k] for k in sorted(merged)]
     ids = _focus_ids(focus)
@@ -624,33 +632,15 @@ def build_category_payload(
     if uid is not None:
         state["uid"] = uid
     questions = {
-        f"c{i}": {
-            "type": "noul",
-            "instructions": CATEGORY_NOUL.format(
-                ids=ids, desc=CATEGORY_DESCRIPTIONS.get(cat, cat)
-            ),
+        CATEGORY_CHOICE_KEY: {
+            "type": "choice",
+            "instructions": CATEGORY_CHOICE_INSTRUCTIONS.format(ids=ids),
+            "criteria": {
+                category: CATEGORY_DESCRIPTIONS.get(category, category) for category in categories
+            },
         }
-        for i, cat in enumerate(categories)
     }
     return {"state": state, "model": model, "questions": questions}
-
-
-def parse_category_response(body: dict[str, Any]) -> dict[str, Any]:
-    """Keep the c<index> noul answers and usage from an upstream reply."""
-    answers = body.get("answers") or {}
-    probs: dict[str, float] = {}
-    for key, ans in answers.items():
-        if not key.startswith("c") or not isinstance(ans, dict):
-            continue
-        value = ans.get("noul")
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
-            probs[key] = float(value)
-    usage = body.get("usage") or {}
-    return {
-        "probabilities": probs,
-        "input_tokens": _usage_tokens(usage, "input_tokens"),
-        "output_tokens": _usage_tokens(usage, "output_tokens"),
-    }
 
 
 def jev_category(
@@ -672,49 +662,33 @@ def jev_category(
     guidance: str = CATEGORY_GUIDANCE,
     fetcher: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Argmax category for one span, cached and shaped like jev_ask."""
-    end = deadline_at if deadline_at is not None else time.monotonic() + request_deadline
+    """Classify one span with a validated category Choice."""
     payload = build_category_payload(
         focus, context, categories, model=model, uid=uid, guidance=guidance
     )
-    cache = JsonCache(cache_path, max_entries=cache_max_entries)
-    send = fetcher or call_payload
-    expected_keys = set(payload["questions"])
-
-    def _fetch() -> dict[str, Any]:
-        metrics.record_cache(False)
-        kwargs: dict[str, Any] = {
-            "url": url,
-            "api_key": api_key,
-            "timeout": timeout,
-            "max_retries": max_retries,
-        }
-        if fetcher is None:
-            kwargs.update(retry_after_max=retry_after_max, deadline_at=end)
-        body = send(payload, **kwargs)
-        return parse_category_response(body)
-
-    entry, hit = cache.get_or_fetch(
-        payload, _fetch, valid=lambda entry: _valid_answers(entry, expected_keys)
-    )
-    if hit:
-        metrics.record_cache(True)
-    if time.monotonic() > end:
-        raise httpx.TimeoutException("Jev request deadline exceeded")
-    probs: dict[str, float] = entry["probabilities"]
-    best_cat = categories[0] if categories else ""
-    best_p = -1.0
-    for i, cat in enumerate(categories):
-        p = probs.get(f"c{i}", 0.0)
-        if p > best_p:
-            best_p, best_cat = p, cat
+    try:
+        result = jev_review_questions(
+            state=payload["state"],
+            questions=payload["questions"],
+            url=url,
+            api_key=api_key,
+            timeout=timeout,
+            cache_path=cache_path,
+            model=model,
+            max_retries=max_retries,
+            retry_after_max=retry_after_max,
+            request_deadline=request_deadline,
+            deadline_at=deadline_at,
+            cache_max_entries=cache_max_entries,
+            fetcher=fetcher,
+        )
+    except JevReviewValidationError as exc:
+        raise JevCategoryValidationError(exc.rule, exc.numeric_details) from exc
+    answer = result["answers"][CATEGORY_CHOICE_KEY]
     return {
-        "category": best_cat,
-        "confidence": max(best_p, 0.0),
-        "cache_hit": hit,
-        "probabilities": probs,
-        "usage": {
-            "input_tokens": int(entry["input_tokens"]),
-            "output_tokens": int(entry["output_tokens"]),
-        },
+        "category": answer["choice"],
+        "confidence": answer["confidence"],
+        "cache_hit": result["cache_hit"],
+        "probabilities": answer["probabilities"],
+        "usage": result["usage"],
     }
