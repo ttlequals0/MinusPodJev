@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.5 - 2026-09-21
+
+- Made all four runtime thresholds persistent and editable, including detection stay.
+- Replaced independent boundary-word choices with one constrained boundary-pair choice.
+- Accept complete Choice probability maps totaling 0.99 to 1.01 without changing supplied confidence.
+- Return sanitized upstream errors for detection and native requests instead of generic 500 responses.
+
 ## 0.1.4 - 2026-09-20
 
 - Skip end-boundary selection after an inconclusive start.

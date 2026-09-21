@@ -7,10 +7,12 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from app.api.openai import _REQUEST_SLOTS, _resolve_api_key
+from app.api.openai import _REQUEST_SLOTS, _resolve_api_key, _upstream_error_response
 from app.config import settings
 from app.services.jev import jev_ask
 from app.services.runtime_settings import RuntimeSettingsError, effective_from_settings
@@ -35,10 +37,10 @@ class AskRequest(BaseModel):
     stay: float | None = None
 
 
-@router.post("/jev/ask")
+@router.post("/jev/ask", response_model=None)
 def ask(
     request: AskRequest, authorization: str | None = Header(default=None)
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """Answer one noul question per segment against the shared transcript."""
     api_key = _resolve_api_key(authorization)
 
@@ -76,5 +78,7 @@ def ask(
             request_deadline=settings.JEV_REQUEST_DEADLINE_SECONDS,
             retry_after_max=settings.JEV_RETRY_AFTER_MAX_SECONDS,
         )
+    except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.TransportError) as exc:
+        return _upstream_error_response(exc)
     finally:
         _REQUEST_SLOTS.release()

@@ -56,17 +56,25 @@ def _validate_number(value: object, name: str) -> float:
     return number
 
 
-def validate_editable(values: dict[str, object], defaults: Thresholds) -> Thresholds:
-    """Validate the three fields accepted by the settings write API."""
-    expected = {"detection_enter", "review_evidence", "review_choice"}
+def validate_editable(values: dict[str, object]) -> Thresholds:
+    """Validate the complete set of runtime-editable thresholds."""
+    expected = {"detection_enter", "detection_stay", "review_evidence", "review_choice"}
     if set(values) != expected:
-        raise RuntimeSettingsValidationError("thresholds must contain exactly three numeric fields")
+        raise RuntimeSettingsValidationError("thresholds must contain exactly four numeric fields")
     detection_enter = _validate_number(values["detection_enter"], "detection_enter")
+    detection_stay = _validate_number(values["detection_stay"], "detection_stay")
     review_evidence = _validate_number(values["review_evidence"], "review_evidence")
     review_choice = _validate_number(values["review_choice"], "review_choice")
-    if detection_enter < defaults.detection_stay:
+    if detection_enter < detection_stay:
         raise RuntimeSettingsValidationError("detection_enter must be at least detection_stay")
-    return Thresholds(detection_enter, defaults.detection_stay, review_evidence, review_choice)
+    return Thresholds(detection_enter, detection_stay, review_evidence, review_choice)
+
+
+def _validate_persisted(values: dict[str, object], defaults: Thresholds) -> Thresholds:
+    """Accept the former three-field file format with the startup stay default."""
+    if set(values) == {"detection_enter", "review_evidence", "review_choice"}:
+        values = {**values, "detection_stay": defaults.detection_stay}
+    return validate_editable(values)
 
 
 def read(path: str, defaults: Thresholds) -> tuple[Thresholds, bool]:
@@ -91,7 +99,7 @@ def read(path: str, defaults: Thresholds) -> tuple[Thresholds, bool]:
         document = json.loads(raw)
         if not isinstance(document, dict):
             raise ValueError("settings document is not an object")
-        return validate_editable(document, defaults), True
+        return _validate_persisted(document, defaults), True
     except (RuntimeSettingsError, ValueError, TypeError, OverflowError) as exc:
         logger.warning("runtime settings file is invalid")
         raise RuntimeSettingsError("runtime settings are invalid") from exc
@@ -104,9 +112,9 @@ def effective_from_settings(config: Any) -> Thresholds:
     return effective
 
 
-def write(path: str, values: dict[str, object], defaults: Thresholds) -> Thresholds:
+def write(path: str, values: dict[str, object]) -> Thresholds:
     """Atomically replace the settings file after validating a full update."""
-    thresholds = validate_editable(values, defaults)
+    thresholds = validate_editable(values)
     settings_path = Path(path)
     parent = settings_path.parent
     try:
@@ -117,6 +125,7 @@ def write(path: str, values: dict[str, object], defaults: Thresholds) -> Thresho
                 json.dump(
                     {
                         "detection_enter": thresholds.detection_enter,
+                        "detection_stay": thresholds.detection_stay,
                         "review_evidence": thresholds.review_evidence,
                         "review_choice": thresholds.review_choice,
                     },

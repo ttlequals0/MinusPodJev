@@ -50,22 +50,24 @@ This is a recommended POC configuration, not a change applied to MinusPod by thi
 | setting | runtime field | default | purpose |
 |---|---|---|---|
 | `JEV_ENTER` | `detection_enter` | `0.95` | opens an ad span; editable at runtime |
-| `JEV_STAY` | `detection_stay` (read-only) | `0.40` | extends an open span; environment setting only |
+| `JEV_STAY` | `detection_stay` | `0.40` | extends an open span; editable at runtime |
 | `JEV_REVIEW_EVIDENCE_THRESHOLD` | `review_evidence` | `JEV_ENTER` when unset | gates advertising evidence before refinement |
-| `JEV_REVIEW_CHOICE_THRESHOLD` | `review_choice` | `JEV_ENTER` when unset | gates selected boundary words |
+| `JEV_REVIEW_CHOICE_THRESHOLD` | `review_choice` | `JEV_ENTER` when unset | gates the selected boundary pair |
 
 These are `0` to `1` probability scores, not measured accuracy. Detection enter must be at least `JEV_STAY`; review evidence and Choice thresholds are independent of detection enter.
 
 ### Save and authentication
 
-- The status page reads `GET /api/settings` and saves all three editable thresholds atomically with `PUT /api/settings`.
+- The status page reads `GET /api/settings` and saves all four editable thresholds atomically with `PUT /api/settings`.
 - Saving requires `Authorization: Bearer <MinusPod password>`. The proxy checks that password locally and does not log in to MinusPod. The password is not saved in browser storage.
 - Without `MINUSPOD_PASSWORD`, settings are visible but not editable.
 
 ### Persistence and request scope
 
 - Changes apply to new requests. In-flight requests keep their existing snapshot, so avoid changing thresholds during an episode if its windows must use one policy.
-- Saved overrides use `JEV_SETTINGS_PATH` (default `./data/runtime-settings.json`) and survive restarts when that directory is persistent. A saved file overrides environment defaults until it is changed or removed.
+- Saved overrides use `JEV_SETTINGS_PATH` (default `./data/runtime-settings.json`) and survive restarts when that directory is persistent.
+- A saved four-field file overrides environment defaults until it is changed or removed.
+- A legacy three-field file uses the startup `JEV_STAY` value until its next save writes all four fields.
 - Corrupt or unreadable state returns 503 rather than silently resetting to defaults. The Compose file mounts `/app/data` to a named volume. Existing deployments must add an equivalent persistent mount; replacing only the image does not preserve the settings file.
 
 ### Troubleshooting
@@ -79,10 +81,13 @@ These are `0` to `1` probability scores, not measured accuracy. Detection enter 
 
 - Jev review is correlated with Jev detection, not an independent judgment. It uses coarse context and separate word timing.
 - The evidence NouL adds an upstream call unless cached.
-- `JEV_REVIEW_REFINE_BOUNDARIES=false` disables word-boundary refinement by default. Set it to `true` to use supplied word times; the proxy handles Jev's 255-option Choice limit without truncating options.
-- `GET /api/status` reports effective enabled state, model, evidence threshold, and Choice threshold. Enabled does not guarantee refinement: both word-timing edges, sufficient evidence, and confident Choice answers are required.
+- `JEV_REVIEW_REFINE_BOUNDARIES=false` disables boundary-pair refinement by default. Set it to `true` to select one complete range from supplied word timings.
+- A pair can retain the original boundary or use the closest meaningful timed boundary: a sentence break or a coarse segment edge with an exact word timestamp. It must overlap both the candidate and Jev's corroborated span.
+- The Choice contains up to 9 valid combinations of keep, trim, or extend boundaries, plus unknown.
+- `GET /api/status` reports effective enabled state, model, evidence threshold, and Choice threshold. Enabled does not guarantee refinement: word timings, sufficient evidence, and a confident pair selection are required.
+- This local candidate set can miss further or intrasentence corrections. It does not claim an efficacy improvement.
 - Review logs include request ID, stage, evidence score and threshold, word counts, Choice confidence, and skip or failure reason.
-- An inconclusive start selection stops before end selection. An inconclusive review returns 422 with `x-should-retry: false` and does not confirm or move the candidate.
+- An unknown or low-confidence pair selection returns 422 with `x-should-retry: false` and does not confirm or move the candidate.
 - MinusPod's local breaker still counts non-rate errors. An upstream or invalid-upstream review error returns 503. Diagnostics identify invalid-upstream validation failures but do not repair the response.
 
 ## Sponsor naming

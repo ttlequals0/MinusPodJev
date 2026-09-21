@@ -11,9 +11,9 @@ type ReviewSettings = {
 type Status = { status: string; jev: Upstream; minuspod: Upstream; review?: ReviewSettings }
 type Thresholds = {
   detection_enter: number
+  detection_stay: number
   review_evidence: number
   review_choice: number
-  detection_stay?: number
 }
 type RuntimeSettings = {
   thresholds: Thresholds
@@ -23,6 +23,7 @@ type RuntimeSettings = {
 }
 type SettingsDraft = {
   detection_enter: string
+  detection_stay: string
   review_evidence: string
   review_choice: string
 }
@@ -68,6 +69,7 @@ const initialState: ApiState = { health: null, status: null, stats: null, settin
 function settingsToDraft(settings: RuntimeSettings): SettingsDraft {
   return {
     detection_enter: String(settings.thresholds.detection_enter),
+    detection_stay: String(settings.thresholds.detection_stay),
     review_evidence: String(settings.thresholds.review_evidence),
     review_choice: String(settings.thresholds.review_choice),
   }
@@ -209,20 +211,20 @@ function App() {
     }
     const values = {
       detection_enter: Number(draft.detection_enter),
+      detection_stay: Number(draft.detection_stay),
       review_evidence: Number(draft.review_evidence),
       review_choice: Number(draft.review_choice),
     }
-    const detectionStay = runtimeSettings.thresholds.detection_stay
     if (Object.values(draft).some((value) => !value.trim())) {
-      setSettingsError('Enter all three thresholds before saving.')
+      setSettingsError('Enter all four thresholds before saving.')
       return
     }
     if (Object.values(values).some((value) => !Number.isFinite(value) || value < 0 || value > 1)) {
       setSettingsError('Thresholds must be finite probabilities from 0 to 1.')
       return
     }
-    if (detectionStay != null && values.detection_enter < detectionStay) {
-      setSettingsError(`Detection threshold must be at least ${String(detectionStay)}.`)
+    if (values.detection_enter < values.detection_stay) {
+      setSettingsError('Detection enter must be at least detection stay.')
       return
     }
     const operation = ++settingsOperation.current
@@ -374,11 +376,12 @@ function ReviewCard({
       <p className="card-note">Enabled does not mean every review runs refinement. Both word-timing edges and sufficient evidence are required.</p>
       {runtimeSettings && draft && <form className="settings-form" onSubmit={onSave}>
         <h4>Runtime thresholds</h4>
-        <p className="card-note">Thresholds are probabilities from 0 to 1. Detection enter must be at least JEV_STAY; review evidence and Choice are independent. Values apply to new requests; in-flight requests keep existing settings.</p>
-        <dl className="settings-saved"><Definition label="Saved detection enter" value={String(runtimeSettings.thresholds.detection_enter)} /><Definition label="Saved review evidence" value={String(runtimeSettings.thresholds.review_evidence)} /><Definition label="Saved review Choice" value={String(runtimeSettings.thresholds.review_choice)} /><Definition label="Detection floor (JEV_STAY)" value={thresholds?.detection_stay == null ? 'Not reported' : String(thresholds.detection_stay)} /><Definition label="Persistence" value={runtimeSettings.persisted ? 'Saved override' : 'Environment defaults'} /></dl>
-        <p className="card-note">Environment defaults: detection {String(runtimeSettings.defaults.detection_enter)}, review evidence {String(runtimeSettings.defaults.review_evidence)}, review Choice {String(runtimeSettings.defaults.review_choice)}.</p>
+        <p className="card-note">Thresholds are probabilities from 0 to 1. Detection enter must be at least detection stay. Review evidence and Choice are independent. Values apply to new requests; in-flight requests keep existing settings.</p>
+        <dl className="settings-saved"><Definition label="Saved detection enter" value={String(runtimeSettings.thresholds.detection_enter)} /><Definition label="Saved detection stay" value={String(runtimeSettings.thresholds.detection_stay)} /><Definition label="Saved review evidence" value={String(runtimeSettings.thresholds.review_evidence)} /><Definition label="Saved review Choice" value={String(runtimeSettings.thresholds.review_choice)} /><Definition label="Persistence" value={runtimeSettings.persisted ? 'Saved override' : 'Environment defaults'} /></dl>
+        <p className="card-note">Environment defaults: detection enter {String(runtimeSettings.defaults.detection_enter)}, detection stay {String(runtimeSettings.defaults.detection_stay)}, review evidence {String(runtimeSettings.defaults.review_evidence)}, review Choice {String(runtimeSettings.defaults.review_choice)}.</p>
         <div className="settings-fields">
-          <SettingsField id="detection-enter" label="Draft detection enter (JEV_ENTER)" value={draft.detection_enter} min={thresholds?.detection_stay ?? 0} onChange={(value) => onDraftChange('detection_enter', value)} disabled={!runtimeSettings.editable || saving} />
+          <SettingsField id="detection-enter" label="Draft detection enter (JEV_ENTER)" value={draft.detection_enter} min={0} onChange={(value) => onDraftChange('detection_enter', value)} disabled={!runtimeSettings.editable || saving} />
+          <SettingsField id="detection-stay" label="Draft detection stay (JEV_STAY)" value={draft.detection_stay} min={0} onChange={(value) => onDraftChange('detection_stay', value)} disabled={!runtimeSettings.editable || saving} />
           <SettingsField id="review-evidence" label="Draft review evidence" value={draft.review_evidence} min={0} onChange={(value) => onDraftChange('review_evidence', value)} disabled={!runtimeSettings.editable || saving} />
           <SettingsField id="review-choice" label="Draft review Choice" value={draft.review_choice} min={0} onChange={(value) => onDraftChange('review_choice', value)} disabled={!runtimeSettings.editable || saving} />
         </div>
@@ -435,9 +438,9 @@ function RefinementStats({ refinement }: { refinement: RefinementStats | undefin
   const skipped = refinement.skipped
   const count = (value: number | undefined) => value == null ? 'Not reported' : value.toLocaleString()
   return <section className="refinement-summary" aria-labelledby="refinement-title">
-    <div className="section-heading"><div><h3 id="refinement-title">Boundary refinement</h3><p>Word-level refinement counters are separate from coarse review outcomes.</p></div></div>
+    <div className="section-heading"><div><h3 id="refinement-title">Boundary refinement</h3><p>Candidate-pair refinement counters are separate from coarse review outcomes.</p></div></div>
     <div className="metric-grid">
-      <Metric label="Refinement attempts" value={count(refinement.attempted)} detail="Reviews that started word selection" />
+      <Metric label="Refinement attempts" value={count(refinement.attempted)} detail="Reviews that started boundary selection" />
       <Metric label="Refinement completed" value={count(refinement.completed)} detail={`${count(refinement.changed)} changed, ${count(refinement.unchanged)} unchanged`} />
       <Metric label="Refinement inconclusive" value={count(refinement.inconclusive)} detail="Uncertain selection or invalid boundary pair" />
       <Metric label="Refinement upstream failures" value={count(refinement.upstream_error)} detail="Choice request failed or returned an invalid response" />
@@ -449,7 +452,7 @@ function RefinementStats({ refinement }: { refinement: RefinementStats | undefin
       <Definition label="Ambiguous spans" value={count(skipped?.ambiguous_spans)} />
       <Definition label="No overlapping span" value={count(skipped?.no_overlapping_span)} />
     </dl></article>
-    <p className="refinement-note">Changed and unchanged compare the selected final word pair with the original candidate at the 0.1 s tolerance. They do not include coarse span adjustments counted under review outcomes.</p>
+    <p className="refinement-note">Changed and unchanged compare the selected boundary pair with the original candidate at the 0.1 s tolerance. They do not include coarse span adjustments counted under review outcomes.</p>
   </section>
 }
 

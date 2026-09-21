@@ -17,14 +17,14 @@ The status page is served at the proxy root, `http://<proxy>:8080/`. It has an O
 *Local test instance showing a saved example override; thresholds and runtime statistics are not defaults or live production data.*
 
 - **Connections**: four cards for Proxy (health, environment, version), TypeSafe Jev (connection, host), MinusPod (connection, host, session), and Jev review settings.
-- **Review settings**: shows effective thresholds and lets an authenticated operator edit them. Draft values survive status refreshes. The password is cleared after each save attempt and is not saved in browser storage.
+- **Review settings**: shows effective thresholds and lets an authenticated operator edit them. Boundary refinement selects one candidate range from supplied timings. Draft values survive status refreshes. The password is cleared after each save attempt and is not saved in browser storage.
 - **Runtime stats**: process-scoped counters from `/api/stats`: proxy calls, average proxy handling time, Jev HTTP attempts, average Jev round-trip, cache hit rate, estimated input cost, process uptime, and configured workers. Counters reset when the process restarts and are per process, not a container-wide total.
 
 The page calls `/api/health`, `/api/status`, `/api/settings`, and `/api/stats` directly. It reports live reachability and performs no inference or MinusPod login.
 
 ## Review settings
 
-- The page reads `GET /api/settings` and saves all three editable thresholds atomically with `PUT /api/settings`.
+- The page reads `GET /api/settings` and saves all four editable thresholds atomically with `PUT /api/settings`.
 - Saving requires `Authorization: Bearer <MinusPod password>`. The proxy checks that password locally and does not log in to MinusPod.
 - Without `MINUSPOD_PASSWORD`, settings are visible but not editable.
 

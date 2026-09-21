@@ -18,9 +18,9 @@
 The proxy reads these settings from the process environment. A direct source run also reads a
 `.env` file in its working directory. Docker Compose uses `.env` for interpolation, but only
 variables listed under `environment:` are passed into the container. The Compose file currently
-passes the MinusPod settings, `JEV_ENTER`, review threshold settings, review flags, fallback flag,
-and settings path. It does not pass every variable in this reference; for example, `JEV_STAY` and
-`TYPESAFE_API_KEY` are not passed by the provided Compose file.
+passes the MinusPod settings, all four threshold settings, review flags, fallback flag, and settings
+path. It does not pass every variable in this reference; for example, `TYPESAFE_API_KEY` is not
+passed by the provided Compose file.
 
 The image serves nginx on container port `8080` and supervises `WORKERS` Uvicorn workers on
 `0.0.0.0:8000` (one by default). Compose publishes nginx on `127.0.0.1` by default. Set
@@ -58,19 +58,23 @@ Values are probabilities from `0` to `1`. `JEV_ENTER` must be at least `JEV_STAY
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JEV_ENTER` | `0.95` | Opens a detected span. Compose passes this variable. |
-| `JEV_STAY` | `0.40` | Extends an open span. This is an environment setting only; it is not editable through the runtime settings API. |
+| `JEV_ENTER` | `0.95` | Opens a detected span. Compose passes this startup default. |
+| `JEV_STAY` | `0.40` | Extends an open span. Compose passes this startup default. |
 | `JEV_REVIEW_EVIDENCE_THRESHOLD` | _(unset, inherits `JEV_ENTER`)_ | Evidence threshold for review. Blank values inherit `JEV_ENTER`. |
 | `JEV_REVIEW_CHOICE_THRESHOLD` | _(unset, inherits `JEV_ENTER`)_ | Choice threshold for review. Blank values inherit `JEV_ENTER`. |
 | `JEV_REVIEW_REFINE_BOUNDARIES` | `false` | Use Jev Choice questions and supplied word timings to refine review boundaries. |
 | `JEV_SETTINGS_PATH` | `./data/runtime-settings.json` | Runtime threshold file. Compose passes this variable and separately mounts the default `/app/data` directory to the `jevproxy-data` volume. |
 
-`GET /api/settings` and `PUT /api/settings` expose the editable `JEV_ENTER`, review evidence,
-and review Choice values. A saved file overrides those environment defaults until it is changed or
-removed. The saved file survives container replacement only when its containing directory remains
-persistent. The default path is under `/app/data`, which Compose mounts to a named volume. A custom
-path must also be covered by a persistent mount. The Compose volume must be writable by the app user (UID/GID
-`1000`). Runtime changes apply to new requests; an in-flight request keeps its threshold snapshot.
+`GET /api/settings` and `PUT /api/settings` expose detection enter, detection stay, review evidence,
+and review Choice values.
+
+- A saved four-field file overrides environment defaults until it is changed or removed.
+- A legacy three-field file uses the startup `JEV_STAY` value until its next save writes all four fields.
+- The saved file survives container replacement only when its containing directory remains persistent.
+- The default path is under `/app/data`, which Compose mounts to a named volume. A custom path must
+  also be covered by a persistent mount.
+- The Compose volume must be writable by the app user (UID/GID `1000`).
+- Runtime changes apply to new requests; an in-flight request keeps its threshold snapshot.
 
 ## Sponsor lookup
 

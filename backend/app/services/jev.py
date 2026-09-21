@@ -98,6 +98,9 @@ def _finite_float(value: Any) -> float | None:
 
 # $ per million input tokens (docs.typesafe.ai/models). Output is not billed.
 INPUT_COST_PER_MTOK = 0.042
+# Accept observed serialized Choice totals down to 0.99.
+CHOICE_PROBABILITY_SUM_TOLERANCE = 0.01
+CHOICE_PROBABILITY_SUM_EPSILON = 1e-12
 
 # Defining "advertising" once in the shared state keeps a 300-segment window
 # affordable: each per-question instruction is then a single short sentence.
@@ -465,10 +468,19 @@ def _review_answers(body: dict[str, Any], questions: dict[str, dict[str, Any]]) 
                 {"expected_count": len(criteria), "actual_count": len(parsed_probs)},
             )
         total = math.fsum(parsed_probs.values())
-        if abs(total - 1.0) > 1e-6:
+        if not math.isclose(
+            total,
+            1.0,
+            rel_tol=0.0,
+            abs_tol=CHOICE_PROBABILITY_SUM_TOLERANCE + CHOICE_PROBABILITY_SUM_EPSILON,
+        ):
             raise JevReviewValidationError(
                 "choice_probability_sum",
-                {"expected_total": 1.0, "actual_total": total, "tolerance": 1e-6},
+                {
+                    "expected_total": 1.0,
+                    "actual_total": total,
+                    "tolerance": CHOICE_PROBABILITY_SUM_TOLERANCE,
+                },
             )
         winner = max(parsed_probs.values())
         if parsed_probs[choice] != winner:

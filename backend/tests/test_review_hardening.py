@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from app.config import settings
 from app.services.jev import jev_review_questions
-from app.services.openai_adapter import _select_word
+from app.services.openai_adapter import _pair_questions, _review_state
 from app.utils.cache import hash_payload
 from app.utils.metrics import metrics
 
@@ -143,7 +143,7 @@ def test_review_helper_rejects_invalid_upstream_probability(tmp_path, bad):
         _review_call(tmp_path, fetcher)
 
 
-def test_choice_hierarchy_retains_all_real_corpus_word_candidates():
+def test_pair_choice_keeps_all_supplied_words_in_shared_state():
     rows = _segments("ep-daily-tech-news-show-c1904b8605f7")
     words = [
         {"start": word["start"], "end": word["end"], "text": word["word"].strip()}
@@ -152,41 +152,33 @@ def test_choice_hierarchy_retains_all_real_corpus_word_candidates():
     ][:255]
     assert len(words) == 255
 
-    seen: list[dict[str, Any]] = []
-
-    def request(questions, _stage):
-        seen.append(questions)
-        answers = {}
-        for key, question in questions.items():
-            choice = next(option for option in question["criteria"] if option != "unknown")
-            probabilities = {option: (1.0 if option == choice else 0.0) for option in question["criteria"]}
-            answers[key] = {"choice": choice, "confidence": 0.99, "probabilities": probabilities}
-        return {"answers": answers}
-
-    selected = _select_word(prefix="start", words=words, enter=0.95, request=request)
-    assert selected == words[0]
-    assert len(seen[0]) == 2
-    assert max(len(question["criteria"]) for question in seen[0].values()) == 255
-    assert sum(len(question["criteria"]) - 1 for question in seen[0].values()) == 255
+    segments = [{"sid": 0, "start": words[0]["start"], "end": words[-1]["end"], "text": "context"}]
+    state = _review_state(
+        segments,
+        {"start": words, "end": words},
+        (words[0]["start"], words[-1]["end"]),
+        "guidance",
+    )
+    assert len(words) == 255
+    assert state["boundary_words"]["start"] == words
+    assert state["boundary_words"]["end"] == words
 
 
-@pytest.mark.parametrize("answer", [
-    {"choice": "unknown", "confidence": 0.99},
-    {"choice": "w0000", "confidence": 0.94},
-])
-def test_choice_unknown_or_low_confidence_is_inconclusive(answer):
+def test_pair_choice_has_unknown_and_a_concrete_keep_candidate():
     words = [
         {"start": word["start"], "end": word["end"], "text": word["word"].strip()}
         for word in _segments("ep-daily-tech-news-show-c1904b8605f7")[0]["words"][:1]
     ]
 
-    def request(questions, _stage):
-        key, question = next(iter(questions.items()))
-        choice = answer["choice"] if answer["choice"] in question["criteria"] else next(option for option in question["criteria"] if option != "unknown")
-        probabilities = {option: (1.0 if option == choice else 0.0) for option in question["criteria"]}
-        return {"answers": {key: {"choice": choice, "confidence": answer["confidence"], "probabilities": probabilities}}}
-
-    assert _select_word(prefix="start", words=words, enter=0.95, request=request) is None
+    segments = [{"start": words[0]["start"], "end": words[0]["end"], "text": "context"}]
+    questions, pairs = _pair_questions(
+        segments,
+        {"start": words, "end": words},
+        (words[0]["start"], words[0]["end"]),
+        (words[0]["start"], words[0]["end"]),
+    )
+    assert "unknown" in questions["boundary_pair"]["criteria"]
+    assert pairs
 
 
 def _corpus_prompt(start: float, end: float, before: list[dict], candidate: list[dict], after: list[dict]) -> str:

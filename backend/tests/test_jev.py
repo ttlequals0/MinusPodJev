@@ -17,6 +17,7 @@ from app.services.jev import (
     estimate_cost_usd,
     jev_ask,
     jev_category,
+    jev_review_questions,
     parse_response,
 )
 from app.utils.cache import JsonCache, hash_payload
@@ -82,8 +83,128 @@ def test_review_validation_error_exposes_only_fixed_rule_and_numeric_details():
     error = raised.value
     assert error.code == "jev_upstream_invalid_response"
     assert error.rule == "choice_probability_sum"
-    assert error.numeric_details == {"expected_total": 1.0, "actual_total": 0.4, "tolerance": 1e-6}
+    assert error.numeric_details == {
+        "expected_total": 1.0,
+        "actual_total": 0.4,
+        "tolerance": 0.01,
+    }
     assert "unknown" not in str(error)
+
+
+@pytest.mark.parametrize("total", [0.99, 1.01, 0.9900000000000001, 1.0099999999999998])
+def test_review_validation_accepts_rounded_choice_probability_totals(total):
+    body = _valid_review_body()
+    body["answers"]["start_0"]["probabilities"] = {
+        "unknown": max(0.0, total - 1.0),
+        "w0": min(1.0, total),
+    }
+    parsed = _review_answers(body, REVIEW_QUESTIONS)
+    assert parsed["answers"]["start_0"]["probabilities"] == {
+        "unknown": max(0.0, total - 1.0),
+        "w0": min(1.0, total),
+    }
+
+
+@pytest.mark.parametrize("total", [0.989, 1.011, 0.0, 0.4])
+def test_review_validation_rejects_materially_drifted_choice_probability_totals(total):
+    body = _valid_review_body()
+    body["answers"]["start_0"]["probabilities"] = {
+        "unknown": max(0.0, total - 1.0),
+        "w0": min(1.0, total),
+    }
+    with pytest.raises(JevReviewValidationError) as raised:
+        _review_answers(body, REVIEW_QUESTIONS)
+    assert raised.value.rule == "choice_probability_sum"
+
+
+def test_review_choice_cache_preserves_rounded_distribution(tmp_path):
+    questions = {
+        "evidence": {"type": "noul"},
+        "start_0": {
+            "type": "choice",
+            "criteria": {"unknown": "none", "w0": "word"},
+        },
+    }
+    calls = 0
+
+    def fetcher(_payload, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "answers": {
+                "evidence": {"noul": 0.96},
+                "start_0": {
+                    "choice": "w0",
+                    "confidence": 0.94,
+                    "probabilities": {"unknown": 0.0, "w0": 0.99},
+                },
+            },
+            "usage": {"input_tokens": 3, "output_tokens": 2},
+        }
+
+    kwargs = {
+        "state": {"transcript": "transcript"},
+        "questions": questions,
+        "url": "u",
+        "api_key": "k",
+        "timeout": 1.0,
+        "cache_path": str(tmp_path / "review-cache.json"),
+        "model": "jev-latest",
+        "fetcher": fetcher,
+    }
+    first = jev_review_questions(**kwargs)
+    second = jev_review_questions(**kwargs)
+    assert calls == 1
+    assert first["cache_hit"] is False
+    assert second["cache_hit"] is True
+    assert second["answers"]["start_0"]["probabilities"] == {"unknown": 0.0, "w0": 0.99}
+    assert second["answers"]["start_0"]["confidence"] == 0.94
+
+
+@pytest.mark.parametrize(
+    "probabilities",
+    [{"unknown": 0.0, "w0": 0.98}, {"w0": 1.0}],
+)
+def test_review_choice_invalid_distribution_is_not_cached(tmp_path, probabilities):
+    questions = {
+        "evidence": {"type": "noul"},
+        "start_0": {
+            "type": "choice",
+            "criteria": {"unknown": "none", "w0": "word"},
+        },
+    }
+    calls = 0
+
+    def fetcher(_payload, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "answers": {
+                "evidence": {"noul": 0.96},
+                "start_0": {
+                    "choice": "w0",
+                    "confidence": 0.94,
+                    "probabilities": probabilities,
+                },
+            },
+            "usage": {"input_tokens": 3, "output_tokens": 2},
+        }
+
+    kwargs = {
+        "state": {"transcript": "transcript"},
+        "questions": questions,
+        "url": "u",
+        "api_key": "k",
+        "timeout": 1.0,
+        "cache_path": str(tmp_path / "review-cache.json"),
+        "model": "jev-latest",
+        "fetcher": fetcher,
+    }
+    with pytest.raises(ValueError):
+        jev_review_questions(**kwargs)
+    with pytest.raises(ValueError):
+        jev_review_questions(**kwargs)
+    assert calls == 2
 
 
 def test_review_validation_allowlist_and_confidence_are_independent():
