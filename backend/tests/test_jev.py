@@ -9,14 +9,17 @@ import httpx
 import pytest
 from app.config import Settings, settings
 from app.services.jev import (
+    JevCategoryValidationError,
     JevReviewValidationError,
     _retry_after_seconds,
     _review_answers,
+    build_category_payload,
     build_payload,
     call_payload,
     estimate_cost_usd,
     jev_ask,
     jev_category,
+    jev_review_questions,
     parse_response,
 )
 from app.utils.cache import JsonCache, hash_payload
@@ -30,6 +33,26 @@ ANSWER_BODY: dict[str, Any] = {
 REVIEW_QUESTIONS = {
     "evidence": {"type": "noul"},
     "start_0": {"type": "choice", "criteria": {"unknown": "none", "w0": "word"}},
+}
+
+CATEGORY_LABELS = [
+    "sponsor",
+    "cross_promo",
+    "self_promo",
+    "interaction",
+    "intro",
+    "outro",
+    "recap",
+]
+
+LEGACY_CATEGORY_DESCRIPTIONS = {
+    "sponsor": "a paid sponsor read or product advertisement for an outside advertiser",
+    "cross_promo": "a cross-promotion for another podcast or show",
+    "self_promo": "the host promoting their own show, Patreon, merch, membership, or back catalog",
+    "interaction": "a call to action to like, subscribe, rate, review, follow, or comment",
+    "intro": "an intro segment opening the episode",
+    "outro": "an outro segment closing the episode",
+    "recap": "a recap or summary of earlier content",
 }
 
 
@@ -82,8 +105,128 @@ def test_review_validation_error_exposes_only_fixed_rule_and_numeric_details():
     error = raised.value
     assert error.code == "jev_upstream_invalid_response"
     assert error.rule == "choice_probability_sum"
-    assert error.numeric_details == {"expected_total": 1.0, "actual_total": 0.4, "tolerance": 1e-6}
+    assert error.numeric_details == {
+        "expected_total": 1.0,
+        "actual_total": 0.4,
+        "tolerance": 0.01,
+    }
     assert "unknown" not in str(error)
+
+
+@pytest.mark.parametrize("total", [0.99, 1.01, 0.9900000000000001, 1.0099999999999998])
+def test_review_validation_accepts_rounded_choice_probability_totals(total):
+    body = _valid_review_body()
+    body["answers"]["start_0"]["probabilities"] = {
+        "unknown": max(0.0, total - 1.0),
+        "w0": min(1.0, total),
+    }
+    parsed = _review_answers(body, REVIEW_QUESTIONS)
+    assert parsed["answers"]["start_0"]["probabilities"] == {
+        "unknown": max(0.0, total - 1.0),
+        "w0": min(1.0, total),
+    }
+
+
+@pytest.mark.parametrize("total", [0.989, 1.011, 0.0, 0.4])
+def test_review_validation_rejects_materially_drifted_choice_probability_totals(total):
+    body = _valid_review_body()
+    body["answers"]["start_0"]["probabilities"] = {
+        "unknown": max(0.0, total - 1.0),
+        "w0": min(1.0, total),
+    }
+    with pytest.raises(JevReviewValidationError) as raised:
+        _review_answers(body, REVIEW_QUESTIONS)
+    assert raised.value.rule == "choice_probability_sum"
+
+
+def test_review_choice_cache_preserves_rounded_distribution(tmp_path):
+    questions = {
+        "evidence": {"type": "noul"},
+        "start_0": {
+            "type": "choice",
+            "criteria": {"unknown": "none", "w0": "word"},
+        },
+    }
+    calls = 0
+
+    def fetcher(_payload, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "answers": {
+                "evidence": {"noul": 0.96},
+                "start_0": {
+                    "choice": "w0",
+                    "confidence": 0.94,
+                    "probabilities": {"unknown": 0.0, "w0": 0.99},
+                },
+            },
+            "usage": {"input_tokens": 3, "output_tokens": 2},
+        }
+
+    kwargs = {
+        "state": {"transcript": "transcript"},
+        "questions": questions,
+        "url": "u",
+        "api_key": "k",
+        "timeout": 1.0,
+        "cache_path": str(tmp_path / "review-cache.json"),
+        "model": "jev-latest",
+        "fetcher": fetcher,
+    }
+    first = jev_review_questions(**kwargs)
+    second = jev_review_questions(**kwargs)
+    assert calls == 1
+    assert first["cache_hit"] is False
+    assert second["cache_hit"] is True
+    assert second["answers"]["start_0"]["probabilities"] == {"unknown": 0.0, "w0": 0.99}
+    assert second["answers"]["start_0"]["confidence"] == 0.94
+
+
+@pytest.mark.parametrize(
+    "probabilities",
+    [{"unknown": 0.0, "w0": 0.98}, {"w0": 1.0}],
+)
+def test_review_choice_invalid_distribution_is_not_cached(tmp_path, probabilities):
+    questions = {
+        "evidence": {"type": "noul"},
+        "start_0": {
+            "type": "choice",
+            "criteria": {"unknown": "none", "w0": "word"},
+        },
+    }
+    calls = 0
+
+    def fetcher(_payload, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "answers": {
+                "evidence": {"noul": 0.96},
+                "start_0": {
+                    "choice": "w0",
+                    "confidence": 0.94,
+                    "probabilities": probabilities,
+                },
+            },
+            "usage": {"input_tokens": 3, "output_tokens": 2},
+        }
+
+    kwargs = {
+        "state": {"transcript": "transcript"},
+        "questions": questions,
+        "url": "u",
+        "api_key": "k",
+        "timeout": 1.0,
+        "cache_path": str(tmp_path / "review-cache.json"),
+        "model": "jev-latest",
+        "fetcher": fetcher,
+    }
+    with pytest.raises(ValueError):
+        jev_review_questions(**kwargs)
+    with pytest.raises(ValueError):
+        jev_review_questions(**kwargs)
+    assert calls == 2
 
 
 def test_review_validation_allowlist_and_confidence_are_independent():
@@ -349,20 +492,194 @@ def test_detection_rejects_out_of_range_answers(tmp_path, value):
         )
 
 
-@pytest.mark.parametrize("answers", [{}, {"c0": {"noul": 1.1}}])
-def test_category_rejects_missing_or_invalid_answers(tmp_path, answers):
-    with pytest.raises(ValueError, match="valid answers"):
-        jev_category(
-            [{"sid": 1, "text": "ad"}],
-            [],
-            ["sponsor"],
-            url="u",
-            api_key="k",
-            timeout=1.0,
-            cache_path=str(tmp_path / "categories.json"),
-            model="m",
-            fetcher=lambda *_args, **_kwargs: {"answers": answers},
-        )
+def _category_body(category: str = "sponsor") -> dict[str, Any]:
+    return {
+        "answers": {
+            "category": {
+                "choice": category,
+                "confidence": 0.6,
+                "probabilities": {
+                    label: 0.4 if label == category else 0.1 for label in CATEGORY_LABELS
+                },
+            }
+        },
+        "usage": {"input_tokens": 7, "output_tokens": 3},
+    }
+
+
+def test_category_payload_is_one_choice_with_focus_context_and_uid():
+    payload = build_category_payload(
+        [{"sid": 3, "text": "focus"}],
+        [{"sid": 1, "text": "before"}, {"sid": 5, "text": "after"}],
+        CATEGORY_LABELS,
+        model="m",
+        uid="uid",
+        guidance="policy",
+    )
+    assert payload["state"] == {
+        "guidance": "policy",
+        "transcript": "L0001| before\nL0003| focus\nL0005| after",
+        "focus": "L0003",
+        "uid": "uid",
+    }
+    assert set(payload["questions"]) == {"category"}
+    question = payload["questions"]["category"]
+    assert question["type"] == "choice"
+    assert set(question["criteria"]) == set(CATEGORY_LABELS)
+    assert "paid ad for another podcast or show" in question["criteria"]["sponsor"]
+    assert "unpaid promotion" in question["criteria"]["cross_promo"]
+
+
+@pytest.mark.parametrize("category", CATEGORY_LABELS)
+def test_category_returns_selected_choice_and_cache_usage(tmp_path, category):
+    calls = 0
+
+    def fetcher(_payload, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _category_body(category)
+
+    kwargs = {
+        "url": "u",
+        "api_key": "k",
+        "timeout": 1.0,
+        "cache_path": str(tmp_path / "categories.json"),
+        "model": "m",
+        "fetcher": fetcher,
+    }
+    first = jev_category([{"sid": 1, "text": "ad"}], [], CATEGORY_LABELS, **kwargs)
+    second = jev_category([{"sid": 1, "text": "ad"}], [], CATEGORY_LABELS, **kwargs)
+    assert calls == 1
+    assert first["category"] == second["category"] == category
+    assert first["confidence"] == second["confidence"] == 0.6
+    assert first["cache_hit"] is False
+    assert second["cache_hit"] is True
+    assert second["usage"] == {"input_tokens": 7, "output_tokens": 3}
+
+
+@pytest.mark.parametrize(
+    ("body", "rule"),
+    [
+        ({"answers": {}}, "answers_keys"),
+        (_category_body("missing"), "choice_probability_keys"),
+        (
+            {
+                "answers": {
+                    "category": {
+                        "choice": "sponsor",
+                        "confidence": 0.6,
+                        "probabilities": {label: float("nan") for label in CATEGORY_LABELS},
+                    }
+                }
+            },
+            "choice_probability",
+        ),
+        (
+            {
+                "answers": {
+                    "category": {
+                        "choice": "sponsor",
+                        "confidence": 0.6,
+                        "probabilities": dict.fromkeys(CATEGORY_LABELS, 0.1),
+                    }
+                }
+            },
+            "choice_probability_sum",
+        ),
+    ],
+)
+def test_category_rejects_malformed_choice_without_caching(tmp_path, body, rule):
+    calls = 0
+
+    def fetcher(_payload, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return body
+
+    kwargs = {
+        "url": "u",
+        "api_key": "k",
+        "timeout": 1.0,
+        "cache_path": str(tmp_path / "categories.json"),
+        "model": "m",
+        "fetcher": fetcher,
+    }
+    for _ in range(2):
+        with pytest.raises(JevCategoryValidationError) as raised:
+            jev_category([{"sid": 1, "text": "ad"}], [], CATEGORY_LABELS, **kwargs)
+        assert raised.value.rule == rule
+    assert calls == 2
+
+
+def test_category_payload_does_not_reuse_legacy_noul_cache(tmp_path):
+    cache_path = str(tmp_path / "categories.json")
+    current_payload = build_category_payload(
+        [{"sid": 1, "text": "ad"}], [], CATEGORY_LABELS, model="m"
+    )
+    legacy_payload = {
+        "state": current_payload["state"],
+        "model": current_payload["model"],
+        "questions": {
+            f"c{index}": {
+                "type": "noul",
+                "instructions": (
+                    "The advertising break at lines L0001 is "
+                    f"{LEGACY_CATEGORY_DESCRIPTIONS[category]}."
+                ),
+            }
+            for index, category in enumerate(CATEGORY_LABELS)
+        },
+    }
+    JsonCache(cache_path).get_or_fetch(
+        legacy_payload,
+        lambda: {
+            "probabilities": {f"c{index}": 0.5 for index in range(len(CATEGORY_LABELS))},
+            "input_tokens": 1,
+            "output_tokens": 1,
+        },
+    )
+    calls = 0
+
+    def fetcher(_payload, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _category_body()
+
+    result = jev_category(
+        [{"sid": 1, "text": "ad"}],
+        [],
+        CATEGORY_LABELS,
+        url="u",
+        api_key="k",
+        timeout=1.0,
+        cache_path=cache_path,
+        model="m",
+        fetcher=fetcher,
+    )
+    assert hash_payload(legacy_payload) != hash_payload(current_payload)
+    assert calls == 1
+    assert result["cache_hit"] is False
+
+
+def test_category_accepts_rounded_distribution_without_changing_confidence(tmp_path):
+    body = _category_body()
+    body["answers"]["category"]["confidence"] = 0.6
+    body["answers"]["category"]["probabilities"] = {
+        label: 0.39 if label == "sponsor" else 0.1 for label in CATEGORY_LABELS
+    }
+    result = jev_category(
+        [{"sid": 1, "text": "ad"}],
+        [],
+        CATEGORY_LABELS,
+        url="u",
+        api_key="k",
+        timeout=1.0,
+        cache_path=str(tmp_path / "categories.json"),
+        model="m",
+        fetcher=lambda *_args, **_kwargs: body,
+    )
+    assert sum(result["probabilities"].values()) == pytest.approx(0.99)
+    assert result["confidence"] == 0.6
 
 
 def test_cache_keeps_entries_from_concurrent_processes(tmp_path):

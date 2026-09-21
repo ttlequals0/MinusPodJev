@@ -9,16 +9,19 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 import uuid
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from app.config import settings
+from app.services.jev import JevCategoryValidationError, _retry_after_seconds
 from app.services.openai_adapter import (
     ReviewInconclusiveError,
     ReviewInvalidRequestError,
@@ -143,6 +146,21 @@ def chat_completions(
         except ReviewUnavailableError:
             outcome, reason_code = "upstream_error", "upstream_failure"
             return _review_error(503, "jev_review_upstream_failure", "Review unavailable", request_id)
+        except JevCategoryValidationError as exc:
+            logger.warning(
+                "category validation_failed rule=%s details=%s",
+                exc.rule,
+                exc.numeric_details,
+            )
+            return _review_error(
+                503,
+                "jev_category_upstream_invalid_response",
+                "Category classification unavailable",
+                None,
+            )
+        except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.TransportError) as exc:
+            outcome, reason_code = "upstream_error", "upstream_failure"
+            return _upstream_error_response(exc, request_id)
         except Exception:
             if review:
                 outcome, reason_code = "internal_error", "internal_error"
@@ -174,6 +192,54 @@ def _review_error(status: int, code: str, message: str, request_id: str | None) 
     return JSONResponse(
         status_code=status,
         content={"error": {"message": message, "type": "invalid_request_error" if status == 422 else "api_error", "code": code}},
+        headers=headers,
+    )
+
+
+def _upstream_error_response(exc: Exception, request_id: str | None = None) -> JSONResponse:
+    status = 503
+    code = "jev_upstream_failure"
+    message = "Jev upstream unavailable"
+    headers: dict[str, str] = {}
+    upstream_status: int | None = None
+    if isinstance(exc, httpx.HTTPStatusError):
+        upstream_status = exc.response.status_code
+        if 400 <= upstream_status < 500:
+            status = upstream_status
+            code = "jev_upstream_request_error"
+            message = "Jev upstream rejected the request"
+        if upstream_status == 429:
+            code = "jev_upstream_rate_limited"
+            message = "Jev upstream rate limited the request"
+        if upstream_status in (401, 403):
+            code = "jev_upstream_authentication_error"
+            message = "Jev upstream authentication failed"
+        if upstream_status == 408 or upstream_status == 429 or upstream_status >= 500:
+            try:
+                retry_after = _retry_after_seconds(exc.response)
+            except (OverflowError, TypeError, ValueError):
+                retry_after = None
+            if retry_after is not None:
+                headers["Retry-After"] = str(math.ceil(retry_after))
+    elif isinstance(exc, httpx.TimeoutException):
+        status = 504
+        code = "jev_upstream_timeout"
+        message = "Jev upstream timed out"
+    elif isinstance(exc, httpx.TransportError):
+        code = "jev_upstream_connection_error"
+        message = "Jev upstream connection failed"
+    logger.warning(
+        "Jev upstream failure upstream_status=%s mapped_status=%s exception=%s request_id=%s",
+        upstream_status,
+        status,
+        type(exc).__name__,
+        request_id,
+    )
+    if request_id is not None:
+        headers["X-Request-ID"] = request_id
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"message": message, "type": "api_error", "code": code}},
         headers=headers,
     )
 

@@ -97,7 +97,7 @@ def _category_guidance(system_text: str) -> str:
         return CATEGORY_GUIDANCE
     return (
         f"{CATEGORY_GUIDANCE}\n\nCaller policy for category selection:\n"
-        f"{policy}\n\nAnswer only the supplied noul questions."
+        f"{policy}\n\nAnswer only the supplied Choice question."
     )
 
 
@@ -344,6 +344,12 @@ def run_chat_completion(
             category = cat_result["category"]
             input_tokens += int(cat_result["usage"]["input_tokens"])
             output_tokens += int(cat_result["usage"]["output_tokens"])
+            logger.info(
+                "category category=%s confidence=%s cache_hit=%s",
+                category,
+                cat_result["confidence"],
+                cat_result["cache_hit"],
+            )
         else:
             category = default_category
 
@@ -462,7 +468,12 @@ def _review_unavailable(pool: str, reason: str) -> NoReturn:
     raise ReviewInconclusiveError(reason)
 
 
-def _review_state(segments: Sequence[dict[str, Any]], cand: tuple[float, float], guidance: str) -> dict[str, Any]:
+def _review_state(
+    segments: Sequence[dict[str, Any]],
+    word_edges: dict[str, list[dict[str, Any]]],
+    cand: tuple[float, float],
+    guidance: str,
+) -> dict[str, Any]:
     return {
         "guidance": guidance,
         "transcript": build_state(segments),
@@ -471,70 +482,89 @@ def _review_state(segments: Sequence[dict[str, Any]], cand: tuple[float, float],
             {"line": f"L{int(s['sid']):04d}", "start": float(s["start"]), "end": float(s["end"])}
             for s in segments
         ],
+        "boundary_words": word_edges,
     }
 
 
-def _word_option(index: int) -> str:
-    return f"w{index:04d}"
+def _boundary_anchor(
+    words: Sequence[dict[str, Any]],
+    segments: Sequence[dict[str, Any]],
+    current: float,
+    direction: str,
+) -> tuple[float | None, float | None]:
+    """Return the closest meaningful inward and outward timed boundary."""
+    coarse_edges = {
+        float(segment["start"] if direction == "start" else segment["end"])
+        for segment in segments
+    }
+    candidates: list[float] = []
+    for index, word in enumerate(words):
+        value = float(word["start"] if direction == "start" else word["end"])
+        sentence_break = (
+            direction == "end"
+            and re.search(r"[.!?][\"')\]]*$", str(word.get("text", "")).rstrip()) is not None
+        ) or (
+            direction == "start"
+            and index > 0
+            and re.search(r"[.!?][\"')\]]*$", str(words[index - 1].get("text", "")).rstrip()) is not None
+        )
+        if sentence_break or any(math.isclose(value, edge, rel_tol=0.0, abs_tol=1e-6) for edge in coarse_edges):
+            candidates.append(value)
+    inward = [value for value in candidates if (value > current if direction == "start" else value < current)]
+    outward = [value for value in candidates if (value < current if direction == "start" else value > current)]
+    def choose(values: list[float]) -> float | None:
+        return min(values, key=lambda value: (abs(value - current), value)) if values else None
+
+    return choose(inward), choose(outward)
 
 
-def _choice_questions(prefix: str, words: Sequence[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Batch Choice questions in provider-sized groups, retaining every word."""
-    questions: dict[str, dict[str, Any]] = {}
-    lookup: dict[str, dict[str, Any]] = {}
-    for group_index, offset in enumerate(range(0, len(words), 254)):
-        group = words[offset : offset + 254]
-        criteria: dict[str, str] = {"unknown": "No supported boundary appears in this group."}
-        for index, word in enumerate(group, offset):
-            option = _word_option(index)
-            lookup[option] = word
-            edge = "before" if prefix == "start" else "after"
-            criteria[option] = f"Set the {prefix} boundary {edge} [{word['start']:.2f}s-{word['end']:.2f}s] {word['text']}"
-        questions[f"{prefix}_{group_index}"] = {
+def _edge_reference(words: Sequence[dict[str, Any]], value: float, direction: str, current: float) -> str:
+    if value == current:
+        return "current candidate boundary"
+    for index, word in enumerate(words):
+        timed = float(word["start"] if direction == "start" else word["end"])
+        if math.isclose(timed, value, rel_tol=0.0, abs_tol=1e-6):
+            if direction == "start" and index:
+                return f"before {word['text']!r}, after {words[index - 1]['text']!r}"
+            return f"before {word['text']!r}" if direction == "start" else f"after {word['text']!r}"
+    return f"at {value:.2f}s"
+
+
+def _pair_questions(
+    segments: Sequence[dict[str, Any]],
+    word_edges: dict[str, list[dict[str, Any]]],
+    cand: tuple[float, float],
+    corroborated: tuple[float, float],
+) -> tuple[dict[str, dict[str, Any]], dict[str, tuple[float, float]]]:
+    """Build one bounded Choice over valid, transcript-grounded boundary pairs."""
+    start_in, start_out = _boundary_anchor(word_edges["start"], segments, cand[0], "start")
+    end_in, end_out = _boundary_anchor(word_edges["end"], segments, cand[1], "end")
+    starts = [cand[0], *[value for value in (start_in, start_out) if value is not None]]
+    ends = [cand[1], *[value for value in (end_in, end_out) if value is not None]]
+    context_start = min(float(segment["start"]) for segment in segments)
+    context_end = max(float(segment["end"]) for segment in segments)
+    pairs: dict[str, tuple[float, float]] = {}
+    for start in starts:
+        for end in ends:
+            pair = (start, end)
+            if pair in pairs.values() or end <= start or start < context_start or end > context_end:
+                continue
+            if min(end, cand[1]) <= max(start, cand[0]) or min(end, corroborated[1]) <= max(start, corroborated[0]):
+                continue
+            pairs[f"pair_{len(pairs):02d}"] = pair
+    criteria = {"unknown": "No proposed range is supported by the transcript."}
+    for option, (start, end) in pairs.items():
+        criteria[option] = (
+            f"Ad {start:.2f}s-{end:.2f}s; start {_edge_reference(word_edges['start'], start, 'start', cand[0])}; "
+            f"end {_edge_reference(word_edges['end'], end, 'end', cand[1])}."
+        )
+    return {
+        "boundary_pair": {
             "type": "choice",
-            "instructions": f"Choose the best {prefix} boundary word in this group for the advertising candidate. Choose unknown only when this group has no supported boundary.",
+            "instructions": "Choose the complete ad range that includes advertising and excludes neighboring editorial content. Consult the supplied transcript context. Choose unknown when none is supported.",
             "criteria": criteria,
         }
-    return questions, lookup
-
-
-def _select_word(
-    *,
-    prefix: str,
-    words: Sequence[dict[str, Any]],
-    enter: float,
-    request: Callable[[dict[str, dict[str, Any]], str], dict[str, Any]],
-    review_request_id: str | None = None,
-) -> dict[str, Any] | None:
-    """Reduce Choice groups without dropping candidates; unknown is inconclusive."""
-    current = list(words)
-    while current:
-        questions, lookup = _choice_questions(prefix, current)
-        result = request(questions, f"choice_{prefix}")
-        winners: list[dict[str, Any]] = []
-        for key in questions:
-            answer = result["answers"][key]
-            choice = answer["choice"]
-            logger.info(
-                "review request_id=%s stage=choice_%s question=%s choice=%s confidence=%s threshold=%s",
-                review_request_id,
-                prefix,
-                key,
-                choice,
-                float(answer["confidence"]),
-                enter,
-            )
-            if answer["confidence"] < enter:
-                return None
-            if choice == "unknown":
-                continue
-            winners.append(lookup[choice])
-        if not winners:
-            return None
-        if len(winners) == 1:
-            return winners[0]
-        current = winners
-    return None
+    }, pairs
 
 
 def run_review(
@@ -662,7 +692,7 @@ def run_review(
         _review_unavailable(pool, "Jev did not produce one unambiguous overlapping span")
 
     ad_start, ad_end, confidence = overlapping[0]
-    state = _review_state(segments, cand, guidance)
+    state = _review_state(segments, word_edges, cand, guidance)
     review_input_tokens = 0
     review_output_tokens = 0
 
@@ -758,24 +788,20 @@ def run_review(
             cand_start,
             cand_end,
         )
+        questions, pairs = _pair_questions(segments, word_edges, cand, (ad_start, ad_end))
+        if not pairs:
+            metrics.record_review_refinement("inconclusive")
+            _review_unavailable(pool, "Jev boundary Choice had no valid pair")
         try:
-            start_word = _select_word(
-                prefix="start",
-                words=word_edges["start"],
-                enter=review_choice_enter,
-                request=review_questions,
-                review_request_id=review_request_id,
-            )
-            end_word = (
-                _select_word(
-                    prefix="end",
-                    words=word_edges["end"],
-                    enter=review_choice_enter,
-                    request=review_questions,
-                    review_request_id=review_request_id,
-                )
-                if start_word is not None
-                else None
+            result = review_questions(questions, "choice_pair")
+            answer = result["answers"]["boundary_pair"]
+            choice = answer["choice"]
+            logger.info(
+                "review request_id=%s stage=choice_pair choice=%s confidence=%s threshold=%s",
+                review_request_id,
+                choice,
+                float(answer["confidence"]),
+                review_choice_enter,
             )
         except ReviewUnavailableError:
             metrics.record_review_refinement("upstream_error")
@@ -786,7 +812,7 @@ def run_review(
                 cand_end,
             )
             raise
-        if start_word is None or end_word is None:
+        if answer["confidence"] < review_choice_enter or choice == "unknown":
             metrics.record_review_refinement("inconclusive")
             logger.info(
                 "review request_id=%s refinement=failed reason=choice_inconclusive original_start=%.3f original_end=%.3f",
@@ -795,7 +821,7 @@ def run_review(
                 cand_end,
             )
             _review_unavailable(pool, "Jev boundary Choice was inconclusive")
-        refined_start, refined_end = float(start_word["start"]), float(end_word["end"])
+        refined_start, refined_end = pairs[choice]
         if (
             refined_end <= refined_start
             or refined_start < context_start

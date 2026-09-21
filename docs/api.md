@@ -6,6 +6,7 @@
 
 - [Endpoints](#endpoints)
 - [Authentication](#authentication)
+- [Inference errors](#inference-errors)
 - [Status and metrics](#status-and-metrics)
 
 ## Endpoints
@@ -21,6 +22,15 @@
 
 `typesafe/jev` maps to the upstream Jev model internally. An inference request with neither a caller bearer token nor `TYPESAFE_API_KEY` is rejected with 503. When a fallback key is configured, a bearer token is still required unless `JEV_ALLOW_UNAUTHENTICATED_FALLBACK=true`. Settings writes use separate `Authorization: Bearer <MinusPod password>` authentication.
 
+## Inference errors
+
+- All inference phases return `429` when the proxy has no available request slot.
+- Detection, verification, and native requests preserve upstream `4xx` responses, including `429`. Upstream `5xx` responses and transport failures return `503`; request deadlines return `504`.
+- A malformed category Choice response returns `503` with `jev_category_upstream_invalid_response`.
+- Review returns `422` for invalid or inconclusive input, including an unknown or low-confidence boundary pair. Review upstream failures, including timeouts, return `503`.
+
+These mappings make failures safe for callers. They do not guarantee that an upstream outage is fixed.
+
 ## Status and metrics
 
 `GET /api/status` reports whether Jev and MinusPod are reachable and whether a MinusPod session is active. It uses cheap probes only, with no billable Jev call or login, so it is safe to poll. `GET /api/health` is liveness.
@@ -30,5 +40,5 @@
 - `proxy_requests` counts only inference endpoints and measures proxy handling from request receipt to response headers. Health, models, status, and stats requests are excluded.
 - `jev_http` counts every actual upstream POST, including retry attempts. Its latency is the Jev HTTP attempt time, not the full MinusPod request path.
 - `review` counts fixed outcomes and safe reason codes with review latency. It stores no request IDs, transcripts, boundaries, or secrets. Request IDs and numeric bounds are logged for diagnosis.
-- `review.refinement` reports attempts, completed selections, changed and unchanged results, inconclusive and upstream-error counts, plus skip counts for disabled refinement, missing word timings, insufficient evidence, ambiguous spans, and no overlap. Counters live in process memory and reset on restart. Changed and unchanged compare the final word pair with the candidate at the 0.1 s tolerance; they are separate from coarse span adjustments in review outcomes.
+- `review.refinement` reports attempts, completed selections, changed and unchanged results, inconclusive and upstream-error counts, plus skip counts for disabled refinement, missing word timings, insufficient evidence, ambiguous spans, and no overlap. Counters live in process memory and reset on restart. Changed and unchanged compare the selected boundary pair with the candidate at the 0.1 s tolerance; they are separate from coarse span adjustments in review outcomes.
 - `cache` separates cache hits and misses. `cost.estimated_input_usd` charges only successful, uncached upstream responses with valid reported input tokens, at Jev's published $0.042 per million input tokens. It is an estimate and excludes output token charges, fees, and taxes.

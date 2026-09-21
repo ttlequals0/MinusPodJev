@@ -29,6 +29,7 @@ class ThresholdUpdate(BaseModel):
     """The complete set of editable runtime thresholds."""
 
     detection_enter: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    detection_stay: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     review_evidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     review_choice: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
 
@@ -39,9 +40,9 @@ class ThresholdUpdate(BaseModel):
     def reject_non_numeric_values(cls, value: object) -> object:
         if not isinstance(value, dict):
             raise ValueError("thresholds must be an object")
-        expected = {"detection_enter", "review_evidence", "review_choice"}
+        expected = {"detection_enter", "detection_stay", "review_evidence", "review_choice"}
         if set(value) != expected:
-            raise ValueError("thresholds must contain exactly three fields")
+            raise ValueError("thresholds must contain exactly four fields")
         if any(
             isinstance(item, bool) or not isinstance(item, (int, float))
             for item in value.values()
@@ -124,7 +125,7 @@ def update_settings(
         raise HTTPException(status_code=422, detail="Invalid runtime settings", headers=_NO_STORE) from exc
     defaults = defaults_from_settings(settings)
     try:
-        effective = write(settings.JEV_SETTINGS_PATH, parsed.model_dump(), defaults)
+        effective = write(settings.JEV_SETTINGS_PATH, parsed.model_dump())
     except RuntimeSettingsValidationError as exc:
         raise HTTPException(
             status_code=422, detail="Invalid runtime settings", headers=_NO_STORE
@@ -134,8 +135,9 @@ def update_settings(
             status_code=503, detail="Runtime settings unavailable", headers=_NO_STORE
         ) from exc
     logger.info(
-        "runtime settings saved detection_enter=%s review_evidence=%s review_choice=%s",
+        "runtime settings saved detection_enter=%s detection_stay=%s review_evidence=%s review_choice=%s",
         effective.detection_enter,
+        effective.detection_stay,
         effective.review_evidence,
         effective.review_choice,
     )

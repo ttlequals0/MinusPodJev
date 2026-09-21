@@ -15,7 +15,7 @@ Jev scores one segment at a time ("is this line an ad?"); the client assembles t
 
 1. Parse MinusPod's window prompt into segments.
 2. Ask Jev one noul per segment.
-3. Assemble spans and run a second pass for category.
+3. Assemble spans and use one Choice question to classify each detected span.
 4. Name sponsors from MinusPod's sponsor list, with a gazetteer fallback.
 5. Return the `{"ads": [...]}` JSON in a chat-completion envelope.
 
@@ -81,7 +81,7 @@ flowchart TD
   category -->|queries categories| jevclient
   adapter -->|matches sponsors| sponsors
 
-  jevclient -->|sends nouls| typesafe
+  jevclient -->|sends NouLs and Choices| typesafe
   typesafe -->|returns probabilities| jevclient
   jevclient -->|caches answers| cache
 
