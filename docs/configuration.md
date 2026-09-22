@@ -97,7 +97,7 @@ The category pass uses one Jev Choice for each detected span. Its values are `sp
 - This local candidate set can miss further or intrasentence corrections. It does not claim an efficacy improvement.
 - Review logs include request ID, stage, evidence score and threshold, word counts, Choice confidence, and skip or failure reason.
 - An unknown or low-confidence pair selection returns 422 with `x-should-retry: false` and does not confirm or move the candidate.
-- MinusPod's local breaker still counts non-rate errors. An upstream or invalid-upstream review error returns 503. Diagnostics identify invalid-upstream validation failures but do not repair the response.
+- MinusPod's local breaker still counts non-rate errors. Review preserves upstream `4xx` responses, including `429`. A valid `Retry-After` header is forwarded for upstream `408`, `429`, and `5xx` responses. Timeouts return `504`; transport and upstream `5xx` failures return `503`. Invalid review responses return `503`.
 
 ## Sponsor naming
 

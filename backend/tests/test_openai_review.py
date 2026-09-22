@@ -9,6 +9,8 @@ ad_reviewer._review_single makes) plus a faithful copy of its verdict decision
 import json
 from typing import Any
 
+import app.services.jev as jev
+import httpx
 import pytest
 from app.config import settings
 from app.services.openai_adapter import (
@@ -25,6 +27,16 @@ from app.utils.metrics import metrics
 from minuspod_compat import extract_json_ads_array, format_window_prompt
 
 _AD_KW = ("sponsor", "betterhelp", "promo code", "brought to you by", "acast")
+
+
+def _upstream_status_error(
+    status: int, retry_after: str = "7"
+) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://api.example/v1/systemone")
+    response = httpx.Response(
+        status, request=request, headers={"Retry-After": retry_after}
+    )
+    return httpx.HTTPStatusError("upstream failure", request=request, response=response)
 
 
 @pytest.fixture
@@ -627,6 +639,87 @@ async def test_review_failure_returns_503(jev_env, client, monkeypatch):
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "jev_review_upstream_failure"
     assert "x-should-retry" not in response.headers
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_code", "retry_after"),
+    [
+        (_upstream_status_error(429), 429, "jev_upstream_rate_limited", "7"),
+        (_upstream_status_error(401), 401, "jev_upstream_authentication_error", None),
+        (_upstream_status_error(403), 403, "jev_upstream_authentication_error", None),
+        (httpx.ReadTimeout("timed out"), 504, "jev_upstream_timeout", None),
+    ],
+)
+async def test_review_detection_preserves_upstream_errors(
+    jev_env,
+    client,
+    monkeypatch,
+    error,
+    expected_status,
+    expected_code,
+    retry_after,
+):
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(jev, "call_payload", fail)
+    prompt = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 110.0, "This episode is sponsored by BetterHelp")],
+        [(110.0, 120.0, "Use promo code SHOW"), (120.0, 126.0, "context after")],
+    )
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": prompt}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == expected_status
+    assert response.json()["error"]["code"] == expected_code
+    assert response.headers.get("x-request-id")
+    if retry_after is None:
+        assert "retry-after" not in response.headers
+    else:
+        assert response.headers["retry-after"] == retry_after
+
+
+async def test_review_boundary_preserves_upstream_status_and_retry_after(
+    jev_env, client, monkeypatch
+):
+    monkeypatch.setattr(settings, "JEV_REVIEW_REFINE_BOUNDARIES", True)
+    normal = make_text_fake()
+    error = _upstream_status_error(503, "11")
+
+    def fake(payload, **kwargs):
+        if any(
+            question.get("type") == "choice"
+            for question in payload["questions"].values()
+        ):
+            raise error
+        return normal(payload, **kwargs)
+
+    monkeypatch.setattr(jev, "call_payload", fake)
+    prompt = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 120.0, "This episode is sponsored by BetterHelp")],
+        [(120.0, 126.0, "context after")],
+    )
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": _with_word_edges(prompt)}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "jev_upstream_failure"
+    assert response.headers["retry-after"] == "11"
+    assert response.headers.get("x-request-id")
+    assert metrics.snapshot()["review"]["refinement"]["upstream_error"] == 1
 
 
 async def test_inconclusive_review_returns_non_retryable_422(jev_env, client, monkeypatch):
