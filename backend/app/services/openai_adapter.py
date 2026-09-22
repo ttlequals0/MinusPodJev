@@ -18,6 +18,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from typing import Any, NoReturn
 
+import httpx
 from minuspod_compat import SEGMENT_CATEGORIES, SPONSOR_PRIORITY_FIELDS
 
 from app.services.jev import (
@@ -658,6 +659,8 @@ def run_review(
             review_request_id,
         )
         raise ReviewUpstreamInvalidResponseError("Jev review response was invalid") from exc
+    except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.TransportError):
+        raise
     except Exception as exc:  # noqa: BLE001 - classify the upstream service failure
         raise ReviewUnavailableError("Jev review request failed") from exc
 
@@ -736,6 +739,8 @@ def run_review(
                 stage,
             )
             raise ReviewUpstreamInvalidResponseError("Jev review response was invalid") from exc
+        except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.TransportError):
+            raise
         except Exception as exc:  # noqa: BLE001
             raise ReviewUnavailableError("Jev review request failed") from exc
 
@@ -803,7 +808,12 @@ def run_review(
                 float(answer["confidence"]),
                 review_choice_enter,
             )
-        except ReviewUnavailableError:
+        except (
+            ReviewUnavailableError,
+            httpx.HTTPStatusError,
+            httpx.TimeoutException,
+            httpx.TransportError,
+        ):
             metrics.record_review_refinement("upstream_error")
             logger.info(
                 "review request_id=%s refinement=failed reason=upstream_error original_start=%.3f original_end=%.3f",

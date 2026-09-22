@@ -27,7 +27,7 @@
 - All inference phases return `429` when the proxy has no available request slot.
 - Detection, verification, and native requests preserve upstream `4xx` responses, including `429`. Upstream `5xx` responses and transport failures return `503`; request deadlines return `504`.
 - A malformed category Choice response returns `503` with `jev_category_upstream_invalid_response`.
-- Review returns `422` for invalid or inconclusive input, including an unknown or low-confidence boundary pair. Review upstream failures, including timeouts, return `503`.
+- Review returns `422` for invalid or inconclusive input, including an unknown or low-confidence boundary pair. It preserves upstream `4xx` responses, including `429`. A valid `Retry-After` header is forwarded for upstream `408`, `429`, and `5xx` responses. Timeouts return `504`; transport and upstream `5xx` failures return `503`.
 
 These mappings make failures safe for callers. They do not guarantee that an upstream outage is fixed.
 

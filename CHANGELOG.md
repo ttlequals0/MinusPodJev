@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.7 - 2026-09-22
+
+- Preserve upstream status and retry metadata when review requests fail.
+
 ## 0.1.6 - 2026-09-21
 
 - Classify each detected span with one validated Jev Choice across MinusPod's category labels.
