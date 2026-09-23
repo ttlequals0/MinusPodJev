@@ -174,6 +174,8 @@ def chat_completions(
 
 def _inconclusive_reason(message: str) -> str:
     lowered = message.lower()
+    if "boundary search had no valid pairs" in lowered:
+        return "no_valid_pairs"
     if "unambiguous" in lowered:
         return "ambiguous_spans"
     if "evidence" in lowered:

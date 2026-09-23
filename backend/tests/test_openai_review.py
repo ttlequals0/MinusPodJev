@@ -16,7 +16,10 @@ from app.config import settings
 from app.services.openai_adapter import (
     ReviewInconclusiveError,
     ReviewUnavailableError,
+    _boundary_candidates,
     _pair_questions,
+    _shortlist_boundaries,
+    _valid_pairs,
     is_review_request,
     parse_candidate_bounds,
     parse_review_context,
@@ -71,12 +74,13 @@ def test_pair_candidates_mix_meaningful_inward_and_outward_edges():
         ],
     }
 
-    questions, pairs = _pair_questions(segments, words, (100.0, 120.0), (90.0, 130.0))
+    starts, ends = _boundary_candidates(segments, words, (100.0, 120.0))
+    candidate_pairs = _valid_pairs(starts, ends, (100.0, 120.0), (90.0, 130.0), 90.0, 130.0)
+    questions, pairs = _pair_questions(words, (100.0, 120.0), candidate_pairs)
 
     assert (100.0, 120.0) in pairs.values()
     assert (90.0, 115.0) in pairs.values()
     assert (106.0, 130.0) in pairs.values()
-    assert len(pairs) <= 9
     assert len(set(pairs.values())) == len(pairs)
     assert all(
         end > start
@@ -95,9 +99,45 @@ def test_pair_candidates_keep_only_when_no_meaningful_timed_edge_exists():
         "end": [{"start": 119.5, "end": 120.5, "text": "message"}],
     }
 
-    _, pairs = _pair_questions(segments, words, (100.0, 120.0), (100.0, 120.0))
+    starts, ends = _boundary_candidates(segments, words, (100.0, 120.0))
+    _, pairs = _pair_questions(
+        words,
+        (100.0, 120.0),
+        _valid_pairs(starts, ends, (100.0, 120.0), (100.0, 120.0), 94.0, 126.0),
+    )
 
     assert pairs == {"pair_00": (100.0, 120.0)}
+
+
+def test_boundary_candidates_snap_two_second_grid_within_thirty_seconds():
+    segments = [{"start": 90.0, "end": 170.0, "text": "context"}]
+    words = {
+        "start": [
+            {"start": value, "end": value + 0.1, "text": f"w{index}"}
+            for index, value in enumerate((100.0, 101.1, 109.9, 129.8, 130.1, 131.0, 161.0))
+        ],
+        "end": [
+            {"start": value - 0.1, "end": value, "text": f"w{index}"}
+            for index, value in enumerate((89.0, 90.0, 90.2, 110.1, 118.9, 120.0))
+        ],
+    }
+
+    starts, ends = _boundary_candidates(segments, words, (100.0, 120.0))
+
+    assert 100.0 in starts and 130.1 not in starts and 161.0 not in starts
+    assert 120.0 in ends and 89.0 not in ends
+    assert len(starts) == len(set(starts)) and len(ends) == len(set(ends))
+
+
+def test_shortlist_uses_two_positive_scores_and_retains_original():
+    values = {"start_00": 90.0, "start_01": 100.0, "start_02": 106.0, "start_03": 110.0}
+    answer = {
+        "choice": "start_02",
+        "confidence": 0.2,
+        "probabilities": {"unknown": 0.4, "start_00": 0.1, "start_01": 0.0, "start_02": 0.3, "start_03": 0.2},
+    }
+
+    assert _shortlist_boundaries(answer, values, 100.0) == [100.0, 106.0, 110.0]
 
 
 def test_no_valid_pair_is_inconclusive_without_choice_request(jev_env, tmp_path):
@@ -126,8 +166,8 @@ def test_no_valid_pair_is_inconclusive_without_choice_request(jev_env, tmp_path)
 
     assert choice_requests == 0
     refinement = metrics.snapshot()["review"]["refinement"]
-    assert refinement["attempted"] == 1
-    assert refinement["inconclusive"] == 1
+    assert refinement["attempted"] == 0
+    assert refinement["inconclusive"] == 0
     assert refinement["upstream_error"] == 0
 
 
@@ -150,16 +190,20 @@ def _select_pair_fake(start: float, end: float):
 
     def fake(payload, **kwargs):
         result = normal(payload, **kwargs)
-        for question in payload["questions"].values():
+        for key, question in payload["questions"].items():
             if question.get("type") != "choice":
                 continue
-            option = next(
-                name
-                for name, description in question["criteria"].items()
-                if description.startswith(f"Ad {start:.2f}s-{end:.2f}s")
-            )
-            result["answers"]["boundary_pair"]["choice"] = option
-            result["answers"]["boundary_pair"]["probabilities"] = {
+            if key == "boundary_pair":
+                option = next(
+                    name
+                    for name, description in question["criteria"].items()
+                    if description.startswith(f"Ad {start:.2f}s-{end:.2f}s")
+                )
+            else:
+                target = start if key == "boundary_start" else end
+                option = next(name for name, description in question["criteria"].items() if f"{target:.2f}s" in description)
+            result["answers"][key]["choice"] = option
+            result["answers"][key]["probabilities"] = {
                 name: 0.99 if name == option else 0.01 / (len(question["criteria"]) - 1)
                 for name in question["criteria"]
             }
@@ -190,7 +234,18 @@ def make_text_fake(*, keywords=_AD_KW, input_tokens=1200, output_tokens=6, raise
             question = payload["questions"][key]
             criteria = question.get("criteria", {})
             if question.get("type") == "choice":
-                option = next(name for name in criteria if name != "unknown")
+                candidate = payload["state"].get("candidate", {})
+                if key == "boundary_start":
+                    option = next(name for name, text in criteria.items() if f"{candidate.get('start'):.2f}s" in text)
+                elif key == "boundary_end":
+                    option = next(name for name, text in criteria.items() if f"{candidate.get('end'):.2f}s" in text)
+                elif key == "boundary_pair":
+                    option = next(
+                        name for name, text in criteria.items()
+                        if text.startswith(f"Ad {candidate.get('start'):.2f}s-{candidate.get('end'):.2f}s")
+                    )
+                else:
+                    option = next(name for name in criteria if name != "unknown")
                 remainder = 0.01 / max(len(criteria) - 1, 1)
                 answers[key] = {
                     "choice": option,
@@ -275,6 +330,9 @@ def _run(
     review_evidence_enter=None,
     review_choice_enter=None,
 ):
+    kwargs = {}
+    if fake is not None:
+        kwargs["fetcher"] = fake
     return run_review(
         messages=[
             {"role": "system", "content": "review ads"},
@@ -292,7 +350,7 @@ def _run(
         review_evidence_enter=review_evidence_enter,
         review_choice_enter=review_choice_enter,
         review_request_id=review_request_id,
-        fetcher=fake,
+        **kwargs,
     )
 
 
@@ -801,6 +859,37 @@ def test_refinement_metrics_changed_and_unchanged(jev_env, tmp_path):
     assert refinement["unchanged"] == 1
 
 
+def test_refinement_rank_and_pair_use_warm_cache(jev_env, tmp_path):
+    calls = 0
+    base = _select_pair_fake(100.0, 120.0)
+
+    def fake(payload, **kwargs):
+        nonlocal calls
+        calls += 1
+        return base(payload, **kwargs)
+
+    first = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+    second = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+
+    assert calls == 4
+    assert first["choices"][0]["message"]["content"] == second["choices"][0]["message"]["content"]
+
+
+def test_refinement_stages_share_one_deadline(jev_env, tmp_path, monkeypatch):
+    deadlines = []
+    base = make_text_fake()
+
+    def fake(payload, **kwargs):
+        deadlines.append(kwargs["deadline_at"])
+        return base(payload, **kwargs)
+
+    monkeypatch.setattr(jev, "call_payload", fake)
+    _run(_meaningful_pair_prompt(), None, tmp_path, refine_boundaries=True)
+
+    assert len(deadlines) == 4
+    assert len(set(deadlines)) == 1
+
+
 def test_refinement_gates_never_enter_choice(jev_env, tmp_path):
     base = build_review_prompt(
         100.0,
@@ -857,6 +946,7 @@ def test_refinement_gates_never_enter_choice(jev_env, tmp_path):
         "insufficient_evidence": 1,
         "ambiguous_spans": 1,
         "no_overlapping_span": 1,
+        "no_valid_pairs": 0,
     }
 
 
@@ -910,8 +1000,67 @@ def test_refinement_choice_failures_are_counted(jev_env, tmp_path):
     assert refinement["upstream_error"] == 2
 
 
+def test_unknown_rank_boundary_is_inconclusive_before_pair_choice(jev_env, tmp_path):
+    prompt = _meaningful_pair_prompt()
+    normal = make_text_fake()
+    stages = []
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if "boundary_start" not in payload["questions"]:
+            return result
+        stages.append(tuple(payload["questions"]))
+        criteria = payload["questions"]["boundary_start"]["criteria"]
+        result["answers"]["boundary_start"] = {
+            "choice": "unknown",
+            "confidence": 0.98,
+            "probabilities": {
+                option: 0.99 if option == "unknown" else 0.01 / (len(criteria) - 1)
+                for option in criteria
+            },
+        }
+        return result
+
+    with pytest.raises(ReviewInconclusiveError, match="Choice ranking"):
+        _run(prompt, fake, tmp_path, refine_boundaries=True)
+
+    assert stages == [("boundary_start", "boundary_end")]
+    refinement = metrics.snapshot()["review"]["refinement"]
+    assert refinement["attempted"] == 1 and refinement["inconclusive"] == 1
+
+
+async def test_post_rank_empty_pairs_are_inconclusive(jev_env, client, monkeypatch, tmp_path):
+    import app.services.openai_adapter as adapter
+
+    monkeypatch.setattr(settings, "JEV_REVIEW_REFINE_BOUNDARIES", True)
+    monkeypatch.setattr(settings, "JEV_CACHE_PATH", str(tmp_path / "post-rank-cache.json"))
+    monkeypatch.setattr(jev, "call_payload", make_text_fake())
+
+    def inverted_shortlist(_answer, _values, original):
+        return [110.0] if original == 100.0 else [100.0]
+
+    monkeypatch.setattr(adapter, "_shortlist_boundaries", inverted_shortlist)
+    prompt = _meaningful_pair_prompt() + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[110.0s-111.0s] Later\n"
+        "End edge:\n[99.0s-100.0s] Earlier\n"
+    )
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": prompt}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "jev_review_inconclusive"
+    refinement = metrics.snapshot()["review"]["refinement"]
+    assert refinement["attempted"] == 1 and refinement["inconclusive"] == 1
+    assert refinement["skipped"]["no_valid_pairs"] == 0
+    assert metrics.snapshot()["review"]["reasons"]["no_valid_pairs"] == 1
+
+
 @pytest.mark.parametrize("mode", ["low_confidence", "unknown"])
-def test_inconclusive_boundary_pair_uses_one_choice_request(jev_env, tmp_path, mode):
+def test_inconclusive_boundary_pair_follows_ranking(jev_env, tmp_path, mode):
     base = build_review_prompt(
         100.0,
         120.0,
@@ -930,9 +1079,9 @@ def test_inconclusive_boundary_pair_uses_one_choice_request(jev_env, tmp_path, m
             return normal(payload, **kwargs)
         stage = choice_questions[0]
         stages.append(stage)
-        if stage != "boundary_pair":
-            raise AssertionError("refinement must issue one boundary-pair Choice")
         result = normal(payload, **kwargs)
+        if stage != "boundary_pair":
+            return result
         for key in choice_questions:
             answer = result["answers"][key]
             if mode == "low_confidence":
@@ -951,7 +1100,7 @@ def test_inconclusive_boundary_pair_uses_one_choice_request(jev_env, tmp_path, m
     with pytest.raises(ReviewInconclusiveError):
         _run(_with_word_edges(base), fake, tmp_path, refine_boundaries=True)
 
-    assert stages == ["boundary_pair"]
+    assert stages == ["boundary_start", "boundary_pair"]
     refinement = metrics.snapshot()["review"]["refinement"]
     assert refinement["attempted"] == 1
     assert refinement["inconclusive"] == 1
@@ -975,9 +1124,9 @@ async def test_inconclusive_boundary_pair_returns_422(
             return normal(payload, **kwargs)
         stage = choice_questions[0]
         stages.append(stage)
-        if stage != "boundary_pair":
-            raise RuntimeError("refinement must issue one boundary-pair Choice")
         result = normal(payload, **kwargs)
+        if stage != "boundary_pair":
+            return result
         for answer in result["answers"].values():
             answer["confidence"] = 0.5
         return result
@@ -998,7 +1147,7 @@ async def test_inconclusive_boundary_pair_returns_422(
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "jev_review_inconclusive"
-    assert stages == ["boundary_pair"]
+    assert stages == ["boundary_start", "boundary_pair"]
 
 
 async def test_boundary_pair_upstream_failure_preserves_503(
@@ -1014,7 +1163,7 @@ async def test_boundary_pair_upstream_failure_preserves_503(
         choice_questions = [
             key for key, question in payload["questions"].items() if question.get("type") == "choice"
         ]
-        if choice_questions:
+        if choice_questions and choice_questions[0] == "boundary_pair":
             stages.append(choice_questions[0])
             raise RuntimeError("boundary pair upstream failure")
         return normal(payload, **kwargs)
@@ -1050,8 +1199,8 @@ async def test_malformed_choice_returns_503_with_safe_validation_diagnostic(
 
     def malformed(payload, **kwargs):
         result = normal(payload, **kwargs)
-        if any(question.get("type") == "choice" for question in payload["questions"].values()):
-            result["answers"][next(iter(result["answers"]))]["probabilities"] = {"bad": 1.0}
+        if "boundary_pair" in payload["questions"]:
+            result["answers"]["boundary_pair"]["probabilities"] = {"bad": 1.0}
         return result
 
     monkeypatch.setattr(jev, "call_payload", malformed)
@@ -1090,7 +1239,7 @@ async def test_foreign_validation_error_uses_generic_safe_diagnostic(
     normal = make_text_fake()
 
     def invalid(payload, **kwargs):
-        if any(question.get("type") == "choice" for question in payload["questions"].values()):
+        if "boundary_pair" in payload["questions"]:
             raise ValueError("sensitive upstream response")
         return normal(payload, **kwargs)
 

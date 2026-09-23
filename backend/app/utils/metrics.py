@@ -19,6 +19,7 @@ _REVIEW_OUTCOMES = (
 _REVIEW_REASON_CODES = (
     "ambiguous_spans",
     "insufficient_evidence",
+    "no_valid_pairs",
     "choice_inconclusive",
     "malformed_context",
     "invalid_choice",
@@ -34,6 +35,7 @@ _REFINEMENT_SKIP_REASONS = (
     "insufficient_evidence",
     "ambiguous_spans",
     "no_overlapping_span",
+    "no_valid_pairs",
 )
 
 

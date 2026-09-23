@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.8 - 2026-09-23
+
+- Search inward boundary trims at 2-second steps up to 30 seconds, snapping to supplied word timestamps.
+- Rank start and end boundaries in one Jev request, then choose a pair from the strongest candidates or keep the current pair. Unknown or low-confidence results return 422.
+- Use the raw transcript excerpt for confirmed local sponsor matches, avoiding MinusPod's generated-rationale rejection.
+- Clarify that boundary selections are recommendations; MinusPod controls cuts and DAI protection.
+- Count empty boundary searches as skipped before ranking, with an explicit `no_valid_pairs` reason.
+
 ## 0.1.7 - 2026-09-22
 
 - Preserve upstream status and retry metadata when review requests fail.

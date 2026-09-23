@@ -170,12 +170,10 @@ def test_pair_choice_has_unknown_and_a_concrete_keep_candidate():
         for word in _segments("ep-daily-tech-news-show-c1904b8605f7")[0]["words"][:1]
     ]
 
-    segments = [{"start": words[0]["start"], "end": words[0]["end"], "text": "context"}]
     questions, pairs = _pair_questions(
-        segments,
         {"start": words, "end": words},
         (words[0]["start"], words[0]["end"]),
-        (words[0]["start"], words[0]["end"]),
+        [(words[0]["start"], words[0]["end"])],
     )
     assert "unknown" in questions["boundary_pair"]["criteria"]
     assert pairs

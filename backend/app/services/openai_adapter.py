@@ -363,13 +363,16 @@ def run_chat_completion(
             ad["end_id"] = end_id
         ad["category"] = category
         ad["confidence"] = float(span["confidence"])
-        ad["reason"] = _grounded_reason(members, probabilities, enter)
         ad["end_text"] = str(members[-1].get("text", ""))
         sponsor = matched_sponsor_for_span(span_text, deadline_at=deadline_at)
+        excerpt = _transcript_evidence(members, probabilities, enter)
         if sponsor is not None:
             label = _jev_sponsor_label(sponsor)
             ad[SPONSOR_PRIORITY_FIELDS[0]] = label
+            ad["reason"] = excerpt
             logger.debug("sponsor: %s", label)
+        else:
+            ad["reason"] = f"Based on transcript: {excerpt}"
         ads.append(ad)
 
     return _envelope(
@@ -520,39 +523,167 @@ def _boundary_anchor(
 
 
 def _edge_reference(words: Sequence[dict[str, Any]], value: float, direction: str, current: float) -> str:
-    if value == current:
-        return "current candidate boundary"
     for index, word in enumerate(words):
         timed = float(word["start"] if direction == "start" else word["end"])
         if math.isclose(timed, value, rel_tol=0.0, abs_tol=1e-6):
             if direction == "start" and index:
-                return f"before {word['text']!r}, after {words[index - 1]['text']!r}"
-            return f"before {word['text']!r}" if direction == "start" else f"after {word['text']!r}"
+                return f"before {word['text']!r} at {value:.2f}s, after {words[index - 1]['text']!r}"
+            return f"before {word['text']!r} at {value:.2f}s" if direction == "start" else f"after {word['text']!r} at {value:.2f}s"
+    if value == current:
+        return f"current candidate boundary at {value:.2f}s"
     return f"at {value:.2f}s"
 
 
-def _pair_questions(
+_BOUNDARY_SEARCH_SECONDS = 30.0
+_BOUNDARY_GRID_SECONDS = 2.0
+
+
+def _inward_grid_candidates(
+    words: Sequence[dict[str, Any]],
+    current: float,
+    direction: str,
+    context_start: float,
+    context_end: float,
+) -> list[float]:
+    """Snap each inward two-second target to a supplied word boundary."""
+    values = sorted(
+        {
+            float(word["start"] if direction == "start" else word["end"])
+            for word in words
+            if context_start
+            <= float(word["start"] if direction == "start" else word["end"])
+            <= context_end
+            and 0.0
+            <= (float(word["start"] if direction == "start" else word["end"]) - current)
+            * (1.0 if direction == "start" else -1.0)
+            <= _BOUNDARY_SEARCH_SECONDS
+        }
+    )
+    snapped: list[float] = []
+    for step in range(0, int(_BOUNDARY_SEARCH_SECONDS / _BOUNDARY_GRID_SECONDS) + 1):
+        target = current + (step * _BOUNDARY_GRID_SECONDS if direction == "start" else -step * _BOUNDARY_GRID_SECONDS)
+        if not values:
+            break
+        closest = min(values, key=lambda value: (abs(value - target), value))
+        if closest not in snapped:
+            snapped.append(closest)
+    return snapped
+
+
+def _boundary_candidates(
     segments: Sequence[dict[str, Any]],
     word_edges: dict[str, list[dict[str, Any]]],
     cand: tuple[float, float],
-    corroborated: tuple[float, float],
-) -> tuple[dict[str, dict[str, Any]], dict[str, tuple[float, float]]]:
-    """Build one bounded Choice over valid, transcript-grounded boundary pairs."""
+) -> tuple[list[float], list[float]]:
+    """Return transcript-grounded inward candidates and the legacy outward anchor."""
     start_in, start_out = _boundary_anchor(word_edges["start"], segments, cand[0], "start")
     end_in, end_out = _boundary_anchor(word_edges["end"], segments, cand[1], "end")
-    starts = [cand[0], *[value for value in (start_in, start_out) if value is not None]]
-    ends = [cand[1], *[value for value in (end_in, end_out) if value is not None]]
     context_start = min(float(segment["start"]) for segment in segments)
     context_end = max(float(segment["end"]) for segment in segments)
-    pairs: dict[str, tuple[float, float]] = {}
+    starts = [cand[0], *_inward_grid_candidates(word_edges["start"], cand[0], "start", context_start, context_end)]
+    ends = [cand[1], *_inward_grid_candidates(word_edges["end"], cand[1], "end", context_start, context_end)]
+    if start_in is not None and abs(start_in - cand[0]) <= _BOUNDARY_SEARCH_SECONDS:
+        starts.append(start_in)
+    if end_in is not None and abs(end_in - cand[1]) <= _BOUNDARY_SEARCH_SECONDS:
+        ends.append(end_in)
+    if start_out is not None:
+        starts.append(start_out)
+    if end_out is not None:
+        ends.append(end_out)
+
+    def valid(values: list[float]) -> list[float]:
+        return sorted(
+            {
+                value
+                for value in values
+                if context_start <= value <= context_end
+            }
+        )
+
+    return valid(starts), valid(ends)
+
+
+def _edge_criteria(
+    key: str,
+    values: Sequence[float],
+    words: Sequence[dict[str, Any]],
+    direction: str,
+    current: float,
+) -> dict[str, str]:
+    criteria = {"unknown": "No proposed boundary is supported by the transcript."}
+    for index, value in enumerate(values):
+        criteria[f"{key}_{index:02d}"] = _edge_reference(words, value, direction, current)
+    return criteria
+
+
+def _rank_questions(
+    word_edges: dict[str, list[dict[str, Any]]], cand: tuple[float, float], starts: Sequence[float], ends: Sequence[float]
+) -> tuple[dict[str, dict[str, Any]], dict[str, float], dict[str, float]]:
+    start_criteria = _edge_criteria("start", starts, word_edges["start"], "start", cand[0])
+    end_criteria = _edge_criteria("end", ends, word_edges["end"], "end", cand[1])
+    return (
+        {
+            "boundary_start": {
+                "type": "choice",
+                "instructions": "Choose the best start boundary for the advertising interval. Consult adjacent transcript words. Choose unknown when none is supported.",
+                "criteria": start_criteria,
+            },
+            "boundary_end": {
+                "type": "choice",
+                "instructions": "Choose the best end boundary for the advertising interval. Consult adjacent transcript words. Choose unknown when none is supported.",
+                "criteria": end_criteria,
+            },
+        },
+        {f"start_{index:02d}": value for index, value in enumerate(starts)},
+        {f"end_{index:02d}": value for index, value in enumerate(ends)},
+    )
+
+
+def _shortlist_boundaries(
+    answer: dict[str, Any], values: dict[str, float], original: float
+) -> list[float]:
+    probabilities = answer["probabilities"]
+    ranked = sorted(
+        (key for key in values if probabilities.get(key, 0.0) > 0.0),
+        key=lambda key: (-float(probabilities[key]), values[key], key),
+    )[:2]
+    selected = [values[key] for key in ranked]
+    if original in values.values() and original not in selected:
+        selected.append(original)
+    return sorted(set(selected))
+
+
+def _valid_pairs(
+    starts: Sequence[float],
+    ends: Sequence[float],
+    cand: tuple[float, float],
+    corroborated: tuple[float, float],
+    context_start: float,
+    context_end: float,
+) -> list[tuple[float, float]]:
+    pairs: list[tuple[float, float]] = []
     for start in starts:
         for end in ends:
-            pair = (start, end)
-            if pair in pairs.values() or end <= start or start < context_start or end > context_end:
-                continue
-            if min(end, cand[1]) <= max(start, cand[0]) or min(end, corroborated[1]) <= max(start, corroborated[0]):
-                continue
-            pairs[f"pair_{len(pairs):02d}"] = pair
+            if (
+                end > start
+                and context_start <= start < end <= context_end
+                and min(end, cand[1]) > max(start, cand[0])
+                and min(end, corroborated[1]) > max(start, corroborated[0])
+                and (start, end) not in pairs
+            ):
+                pairs.append((start, end))
+    return pairs
+
+
+def _pair_questions(
+    word_edges: dict[str, list[dict[str, Any]]],
+    cand: tuple[float, float],
+    pair_options: Sequence[tuple[float, float]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, tuple[float, float]]]:
+    """Build one bounded Choice over the ranked, valid boundary pairs."""
+    pairs: dict[str, tuple[float, float]] = {}
+    for pair in pair_options:
+        pairs[f"pair_{len(pairs):02d}"] = pair
     criteria = {"unknown": "No proposed range is supported by the transcript."}
     for option, (start, end) in pairs.items():
         criteria[option] = (
@@ -786,6 +917,27 @@ def run_review(
             cand_end,
         )
     else:
+        starts, ends = _boundary_candidates(segments, word_edges, cand)
+        candidate_pairs = _valid_pairs(
+            starts, ends, cand, (ad_start, ad_end), context_start, context_end
+        )
+        if not candidate_pairs:
+            metrics.record_review_refinement("skipped", skip_reason="no_valid_pairs")
+            logger.info(
+                "review request_id=%s refinement=skipped reason=no_valid_pairs original_start=%.3f original_end=%.3f context_start=%.3f context_end=%.3f corroborated_start=%.3f corroborated_end=%.3f start_candidates=%d end_candidates=%d",
+                review_request_id,
+                cand_start,
+                cand_end,
+                context_start,
+                context_end,
+                ad_start,
+                ad_end,
+                len(starts),
+                len(ends),
+            )
+            _review_unavailable(pool, "Jev boundary search had no valid pairs")
+        starts = sorted({start for start, _ in candidate_pairs})
+        ends = sorted({end for _, end in candidate_pairs})
         metrics.record_review_refinement("attempted")
         logger.info(
             "review request_id=%s refinement=attempted original_start=%.3f original_end=%.3f",
@@ -793,11 +945,56 @@ def run_review(
             cand_start,
             cand_end,
         )
-        questions, pairs = _pair_questions(segments, word_edges, cand, (ad_start, ad_end))
-        if not pairs:
-            metrics.record_review_refinement("inconclusive")
-            _review_unavailable(pool, "Jev boundary Choice had no valid pair")
         try:
+            rank_questions, start_values, end_values = _rank_questions(word_edges, cand, starts, ends)
+            ranked = review_questions(rank_questions, "choice_rank")
+            start_answer = ranked["answers"]["boundary_start"]
+            end_answer = ranked["answers"]["boundary_end"]
+            logger.info(
+                "review request_id=%s stage=choice_rank start_choice=%s start_confidence=%s end_choice=%s end_confidence=%s start_candidates=%d end_candidates=%d",
+                review_request_id,
+                start_answer["choice"],
+                float(start_answer["confidence"]),
+                end_answer["choice"],
+                float(end_answer["confidence"]),
+                len(starts),
+                len(ends),
+            )
+            if start_answer["choice"] == "unknown" or end_answer["choice"] == "unknown":
+                metrics.record_review_refinement("inconclusive")
+                logger.info(
+                    "review request_id=%s refinement=failed reason=choice_inconclusive original_start=%.3f original_end=%.3f",
+                    review_request_id,
+                    cand_start,
+                    cand_end,
+                )
+                _review_unavailable(pool, "Jev boundary Choice ranking was inconclusive")
+            shortlisted_starts = _shortlist_boundaries(start_answer, start_values, cand_start)
+            shortlisted_ends = _shortlist_boundaries(end_answer, end_values, cand_end)
+            final_pairs = _valid_pairs(
+                shortlisted_starts,
+                shortlisted_ends,
+                cand,
+                (ad_start, ad_end),
+                context_start,
+                context_end,
+            )
+            if not final_pairs:
+                metrics.record_review_refinement("inconclusive")
+                logger.info(
+                    "review request_id=%s refinement=failed reason=no_valid_pairs original_start=%.3f original_end=%.3f context_start=%.3f context_end=%.3f corroborated_start=%.3f corroborated_end=%.3f start_candidates=%d end_candidates=%d",
+                    review_request_id,
+                    cand_start,
+                    cand_end,
+                    context_start,
+                    context_end,
+                    ad_start,
+                    ad_end,
+                    len(shortlisted_starts),
+                    len(shortlisted_ends),
+                )
+                _review_unavailable(pool, "Jev boundary search had no valid pairs")
+            questions, pairs = _pair_questions(word_edges, cand, final_pairs)
             result = review_questions(questions, "choice_pair")
             answer = result["answers"]["boundary_pair"]
             choice = answer["choice"]
@@ -808,6 +1005,8 @@ def run_review(
                 float(answer["confidence"]),
                 review_choice_enter,
             )
+        except ReviewInconclusiveError:
+            raise
         except (
             ReviewUnavailableError,
             httpx.HTTPStatusError,

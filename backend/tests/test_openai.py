@@ -18,6 +18,7 @@ from minuspod_compat import (
     parse_id_ads_from_response,
     resolve_segment_id_ads,
 )
+from minuspod_compat.sponsors import is_sponsor_reasoning_rationale
 
 _SCHEMA_AD_KEYS = set(
     AD_DETECTION_JSON_SCHEMA["properties"]["ads"]["items"]["properties"]
@@ -159,7 +160,8 @@ async def test_chat_completions_timestamps_round_trip(jev_env, client, monkeypat
     assert ad["confidence"] == 0.98
     assert ad["sponsor"] == "jev-BetterHelp"
     assert ad["end_text"].startswith("Use code SHOW")
-    assert ad["reason"].startswith("Based on transcript: This episode is sponsored by BetterHelp.")
+    assert ad["reason"].startswith("This episode is sponsored by BetterHelp.")
+    assert is_sponsor_reasoning_rationale(ad["reason"]) is False
 
 
 @pytest.mark.parametrize("category", SEGMENT_CATEGORIES)

@@ -90,13 +90,15 @@ The category pass uses one Jev Choice for each detected span. Its values are `sp
 
 - Jev review is correlated with Jev detection, not an independent judgment. It uses coarse context and separate word timing.
 - The evidence NouL adds an upstream call unless cached.
-- `JEV_REVIEW_REFINE_BOUNDARIES=false` disables boundary-pair refinement by default. Set it to `true` to select one complete range from supplied word timings.
-- A pair can retain the original boundary or use the closest meaningful timed boundary: a sentence break or a coarse segment edge with an exact word timestamp. It must overlap both the candidate and Jev's corroborated span.
-- The Choice contains up to 9 valid combinations of keep, trim, or extend boundaries, plus unknown.
+- `JEV_REVIEW_REFINE_BOUNDARIES=false` disables boundary refinement by default. Set it to `true` to search inward from the current boundaries.
+- After the evidence gate, the proxy checks inward trim targets every 2 seconds, up to 30 seconds. It snaps targets to supplied word-start or word-end timestamps and removes duplicates. It also keeps the current boundary and the closest meaningful outward option.
+- One Jev request ranks start and end candidates together. The final request chooses among the two strongest positive-probability candidates per edge, plus the current boundary. This yields at most 9 pairs plus unknown.
+- Unknown ranking or final choices, and low-confidence final choices, return 422 with `x-should-retry: false` and do not confirm or move the candidate. The final Choice threshold is unchanged.
+- Refinement still needs both word edges, sufficient evidence, context coverage and overlap, and the shared request deadline. Cache hits and retries follow the same policy as other Jev calls. The search steps and 30-second range are proxy policy; Jev's upstream Choice limit remains 255.
+- Boundary refinement is experimental and does not claim a quality improvement. It adds one upstream round over the earlier flow unless cache hits avoid requests. No new environment setting controls the search policy.
 - `GET /api/status` reports effective enabled state, model, evidence threshold, and Choice threshold. Enabled does not guarantee refinement: word timings, sufficient evidence, and a confident pair selection are required.
-- This local candidate set can miss further or intrasentence corrections. It does not claim an efficacy improvement.
-- Review logs include request ID, stage, evidence score and threshold, word counts, Choice confidence, and skip or failure reason.
-- An unknown or low-confidence pair selection returns 422 with `x-should-retry: false` and does not confirm or move the candidate.
+- Review logs include request ID, stage, evidence score and threshold, candidate counts, actual boundary selections, Choice confidence, and skip or failure reason. Attempt counts cover actual boundary selections, not empty candidate sets. A `no_valid_pairs` result before ranking is a skip; after ranking it is inconclusive.
+- Changed counts are recommendations, not confirmed applied cuts. MinusPod may clamp or reject them to protect DAI cores.
 - MinusPod's local breaker still counts non-rate errors. Review preserves upstream `4xx` responses, including `429`. A valid `Retry-After` header is forwarded for upstream `408`, `429`, and `5xx` responses. Timeouts return `504`; transport and upstream `5xx` failures return `503`. Invalid review responses return `503`.
 
 ## Sponsor naming
@@ -104,7 +106,8 @@ The category pass uses one Jev Choice for each detected span. Its values are `sp
 - Set `MINUSPOD_BASE_URL` and `MINUSPOD_PASSWORD`; the proxy logs into MinusPod (cached session) to read `GET /api/v1/sponsors`.
 - It emits `sponsor_name` only for one known sponsor with local ad evidence, using the `jev-` namespace, for example `jev-ButcherBox`.
 - The prefix identifies a proxy-generated learned record and the suffix is the matched canonical brand. An unmatched span leaves the field absent, preventing false sponsor evidence.
-- Its `Based on transcript:` rationale quotes source evidence rather than synthetic ad wording, and the compatibility parser recognizes it as rationale.
+- For a confirmed local sponsor match, the rationale uses the raw transcript excerpt instead of a `Based on transcript:` wrapper that MinusPod can reject as generated text.
+- Unmatched spans keep the wrapper and omit an explicit sponsor name. This preserves MinusPod's guard against minting unprefixed regex sponsors. Other learning guards still apply.
 - Unset `MINUSPOD_BASE_URL` falls back to the gazetteer.
 
 ## Runtime ownership

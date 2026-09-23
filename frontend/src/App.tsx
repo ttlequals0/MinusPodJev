@@ -35,7 +35,7 @@ type RefinementStats = {
   unchanged?: number
   inconclusive?: number
   upstream_error?: number
-  skipped?: Partial<Record<'disabled' | 'missing_word_timings' | 'insufficient_evidence' | 'ambiguous_spans' | 'no_overlapping_span', number>>
+  skipped?: Partial<Record<'disabled' | 'missing_word_timings' | 'insufficient_evidence' | 'ambiguous_spans' | 'no_overlapping_span' | 'no_valid_pairs', number>>
 }
 type Review = {
   count: number
@@ -438,7 +438,7 @@ function RefinementStats({ refinement }: { refinement: RefinementStats | undefin
   const skipped = refinement.skipped
   const count = (value: number | undefined) => value == null ? 'Not reported' : value.toLocaleString()
   return <section className="refinement-summary" aria-labelledby="refinement-title">
-    <div className="section-heading"><div><h3 id="refinement-title">Boundary refinement</h3><p>Candidate-pair refinement counters are separate from coarse review outcomes.</p></div></div>
+    <div className="section-heading"><div><h3 id="refinement-title">Boundary refinement</h3><p>Candidate-pair refinement counters are separate from coarse review outcomes.</p><p>An attempt starts when boundary selection begins. The model ranks expanded start and end candidates, then chooses a valid pair jointly.</p></div></div>
     <div className="metric-grid">
       <Metric label="Refinement attempts" value={count(refinement.attempted)} detail="Reviews that started boundary selection" />
       <Metric label="Refinement completed" value={count(refinement.completed)} detail={`${count(refinement.changed)} changed, ${count(refinement.unchanged)} unchanged`} />
@@ -451,6 +451,7 @@ function RefinementStats({ refinement }: { refinement: RefinementStats | undefin
       <Definition label="Insufficient evidence" value={count(skipped?.insufficient_evidence)} />
       <Definition label="Ambiguous spans" value={count(skipped?.ambiguous_spans)} />
       <Definition label="No overlapping span" value={count(skipped?.no_overlapping_span)} />
+      <Definition label="No valid pairs before ranking" value={count(skipped?.no_valid_pairs)} />
     </dl></article>
     <p className="refinement-note">Changed and unchanged compare the selected boundary pair with the original candidate at the 0.1 s tolerance. They do not include coarse span adjustments counted under review outcomes.</p>
   </section>

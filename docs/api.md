@@ -18,6 +18,8 @@
 - `GET /api/settings`, `PUT /api/settings`: runtime threshold settings.
 - `GET /api/docs` when `PRODUCTION=false`.
 
+Confirmed local sponsor matches use the raw transcript excerpt as rationale. Unmatched spans keep the `Based on transcript:` wrapper and omit an explicit sponsor name.
+
 ## Authentication
 
 `typesafe/jev` maps to the upstream Jev model internally. An inference request with neither a caller bearer token nor `TYPESAFE_API_KEY` is rejected with 503. When a fallback key is configured, a bearer token is still required unless `JEV_ALLOW_UNAUTHENTICATED_FALLBACK=true`. Settings writes use separate `Authorization: Bearer <MinusPod password>` authentication.
@@ -40,5 +42,5 @@ These mappings make failures safe for callers. They do not guarantee that an ups
 - `proxy_requests` counts only inference endpoints and measures proxy handling from request receipt to response headers. Health, models, status, and stats requests are excluded.
 - `jev_http` counts every actual upstream POST, including retry attempts. Its latency is the Jev HTTP attempt time, not the full MinusPod request path.
 - `review` counts fixed outcomes and safe reason codes with review latency. It stores no request IDs, transcripts, boundaries, or secrets. Request IDs and numeric bounds are logged for diagnosis.
-- `review.refinement` reports attempts, completed selections, changed and unchanged results, inconclusive and upstream-error counts, plus skip counts for disabled refinement, missing word timings, insufficient evidence, ambiguous spans, and no overlap. Counters live in process memory and reset on restart. Changed and unchanged compare the selected boundary pair with the candidate at the 0.1 s tolerance; they are separate from coarse span adjustments in review outcomes.
+- `review.refinement` reports actual selection attempts, completed selections, recommended changes, unchanged results, inconclusive and upstream-error counts, plus skip counts. `no_valid_pairs` before ranking is a skip; after ranking it is inconclusive. Counters live in process memory and reset on restart. Changed and unchanged compare the recommended timing with the candidate at the 0.1 s tolerance. These are recommendations, not confirmed applied cuts; MinusPod may clamp or reject them to protect DAI cores.
 - `cache` separates cache hits and misses. `cost.estimated_input_usd` charges only successful, uncached upstream responses with valid reported input tokens, at Jev's published $0.042 per million input tokens. It is an estimate and excludes output token charges, fees, and taxes.
