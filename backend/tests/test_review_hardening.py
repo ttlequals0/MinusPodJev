@@ -1,6 +1,7 @@
 """Regression coverage for typed review calls and review route accounting."""
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -111,7 +112,10 @@ def test_review_helper_rejects_cache_entry_with_missing_usage(tmp_path):
     assert calls == 1
 
 
-async def test_review_gap_is_rejected_before_upstream(jev_env, client, monkeypatch):
+@pytest.mark.parametrize("pool", ["accepted", "resurrection"])
+async def test_review_gap_is_inconclusive_before_upstream(
+    jev_env, client, monkeypatch, caplog, pool
+):
     import app.services.jev as jev
 
     called = False
@@ -123,13 +127,79 @@ async def test_review_gap_is_rejected_before_upstream(jev_env, client, monkeypat
 
     monkeypatch.setattr(jev, "call_payload", fetcher)
     rows = _segments("ep-oxide-and-friends-ce789ff5b62e")
-    prompt = _corpus_prompt(8.0, 9.0, rows[:1], [], rows[1:2])
+    prompt = _corpus_prompt(8.0, 9.0, rows[:1], [], rows[1:2], pool=pool)
+    with caplog.at_level(logging.INFO):
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": prompt}]},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status_code == 422
+    assert response.headers["x-should-retry"] == "false"
+    request_id = response.headers["x-request-id"]
+    assert response.json()["error"]["code"] == "jev_review_inconclusive"
+    assert called is False
+    review_metrics = metrics.snapshot()["review"]
+    assert review_metrics["outcomes"]["inconclusive"] == 1
+    assert review_metrics["outcomes"]["invalid_request"] == 0
+    assert review_metrics["outcomes"]["rejected"] == 0
+    refinement = review_metrics["refinement"]
+    assert refinement["attempted"] == 0
+    assert refinement["skipped"]["transcript_gap"] == 1
+    assert review_metrics["reasons"]["transcript_gap"] == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        f"request_id={request_id} unavailable reason=candidate lies in a transcript gap" in message
+        for message in messages
+    )
+    assert any(
+        f"request_id={request_id} status=422 error_code=jev_review_inconclusive reason=transcript_gap"
+        in message
+        for message in messages
+    )
+    assert any(
+        f"request_id={request_id} outcome=inconclusive reason=transcript_gap" in message
+        for message in messages
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["before", "after", "zero_width", "negative"],
+)
+async def test_review_outside_or_invalid_bounds_remain_invalid_request(
+    jev_env, client, monkeypatch, case
+):
+    import app.services.jev as jev
+
+    called = False
+
+    def fetcher(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("invalid review input must not call Jev")
+
+    monkeypatch.setattr(jev, "call_payload", fetcher)
+    rows = _segments("ep-oxide-and-friends-ce789ff5b62e")
+    context_start = float(rows[0]["start"])
+    context_end = float(rows[1]["end"])
+    candidates = {
+        "before": (context_start - 2.0, context_start - 1.0),
+        "after": (context_end + 1.0, context_end + 2.0),
+        "zero_width": (context_start, context_start),
+        "negative": (-1.0, 1.0),
+    }
+    prompt = _corpus_prompt(*candidates[case], rows[:1], [], rows[1:2])
     response = await client.post(
         "/v1/chat/completions",
         json={"messages": [{"role": "user", "content": prompt}]},
         headers={"Authorization": "Bearer test-key"},
     )
+
     assert response.status_code == 422
+    assert response.headers["x-should-retry"] == "false"
+    assert response.headers["x-request-id"]
     assert response.json()["error"]["code"] == "jev_review_invalid_request"
     assert called is False
 
@@ -179,11 +249,26 @@ def test_pair_choice_has_unknown_and_a_concrete_keep_candidate():
     assert pairs
 
 
-def _corpus_prompt(start: float, end: float, before: list[dict], candidate: list[dict], after: list[dict]) -> str:
+def _corpus_prompt(
+    start: float,
+    end: float,
+    before: list[dict],
+    candidate: list[dict],
+    after: list[dict],
+    *,
+    pool: str = "accepted",
+) -> str:
     def as_rows(rows):
         return [(row["start"], row["end"], row["text"]) for row in rows]
 
-    return build_review_prompt(start, end, as_rows(before), as_rows(candidate), as_rows(after))
+    return build_review_prompt(
+        start,
+        end,
+        as_rows(before),
+        as_rows(candidate),
+        as_rows(after),
+        pool=pool,
+    )
 
 
 async def test_review_api_metrics_and_request_ids(jev_env, client, monkeypatch, tmp_path):

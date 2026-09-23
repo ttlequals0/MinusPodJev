@@ -89,6 +89,8 @@ The category pass uses one Jev Choice for each detected span. Its values are `sp
 ## Review behavior
 
 - Jev review is correlated with Jev detection, not an independent judgment. It uses coarse context and separate word timing.
+- A valid candidate inside coarse context with no segment overlap is a transcript gap. It returns `422 jev_review_inconclusive` and `x-should-retry: false`, without calling Jev or starting boundary selection.
+- Metrics count the inconclusive outcome, `review.reasons.transcript_gap`, and `review.refinement.skipped.transcript_gap`. Missing, malformed, and entirely out-of-context candidates remain invalid requests.
 - The evidence NouL adds an upstream call unless cached.
 - `JEV_REVIEW_REFINE_BOUNDARIES=false` disables boundary refinement by default. Set it to `true` to search inward from the current boundaries.
 - After the evidence gate, the proxy checks inward trim targets every 2 seconds, up to 30 seconds. It snaps targets to supplied word-start or word-end timestamps and removes duplicates. It also keeps the current boundary and the closest meaningful outward option.
@@ -97,7 +99,7 @@ The category pass uses one Jev Choice for each detected span. Its values are `sp
 - Refinement still needs both word edges, sufficient evidence, context coverage and overlap, and the shared request deadline. Cache hits and retries follow the same policy as other Jev calls. The search steps and 30-second range are proxy policy; Jev's upstream Choice limit remains 255.
 - Boundary refinement is experimental and does not claim a quality improvement. It adds one upstream round over the earlier flow unless cache hits avoid requests. No new environment setting controls the search policy.
 - `GET /api/status` reports effective enabled state, model, evidence threshold, and Choice threshold. Enabled does not guarantee refinement: word timings, sufficient evidence, and a confident pair selection are required.
-- Review logs include request ID, stage, evidence score and threshold, candidate counts, actual boundary selections, Choice confidence, and skip or failure reason. Attempt counts cover actual boundary selections, not empty candidate sets. A `no_valid_pairs` result before ranking is a skip; after ranking it is inconclusive.
+- Review-abstention and API-error logs include the existing `X-Request-ID`. Review logs also include stage, evidence score and threshold, candidate counts, boundary selections, Choice confidence, and skip or failure reason. Attempt counts cover actual boundary selections, not empty candidate sets. A `no_valid_pairs` result before ranking is a skip; after ranking it is inconclusive.
 - Changed counts are recommendations, not confirmed applied cuts. MinusPod may clamp or reject them to protect DAI cores.
 - MinusPod's local breaker still counts non-rate errors. Review preserves upstream `4xx` responses, including `429`. A valid `Retry-After` header is forwarded for upstream `408`, `429`, and `5xx` responses. Timeouts return `504`; transport and upstream `5xx` failures return `503`. Invalid review responses return `503`.
 

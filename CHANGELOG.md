@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.9 - 2026-09-23
+
+- Return `422 jev_review_inconclusive` when a valid candidate inside the coarse context overlaps no segment. Skip Jev calls and boundary-selection attempts, and count the inconclusive outcome, reason, and skip.
+- Include the existing `X-Request-ID` in review-abstention and API-error logs.
+
 ## 0.1.8 - 2026-09-23
 
 - Search inward boundary trims at 2-second steps up to 30 seconds, snapping to supplied word timestamps.

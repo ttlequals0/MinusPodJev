@@ -128,6 +128,7 @@ def test_review_metrics_use_fixed_safe_values_and_reset():
         "ambiguous_spans": 0,
         "insufficient_evidence": 1,
         "no_valid_pairs": 0,
+        "transcript_gap": 0,
         "choice_inconclusive": 0,
         "malformed_context": 0,
         "invalid_choice": 0,
@@ -144,11 +145,16 @@ def test_review_metrics_use_fixed_safe_values_and_reset():
 
 def test_no_valid_pairs_reason_and_refinement_skip_are_reported():
     assert _inconclusive_reason("Jev boundary search had no valid pairs") == "no_valid_pairs"
+    assert _inconclusive_reason("candidate lies in a transcript gap") == "transcript_gap"
     metrics.record_review("inconclusive", 5.0, "no_valid_pairs")
     metrics.record_review_refinement("skipped", skip_reason="no_valid_pairs")
+    metrics.record_review("inconclusive", 5.0, "transcript_gap")
+    metrics.record_review_refinement("skipped", skip_reason="transcript_gap")
     snapshot = metrics.snapshot()["review"]
     assert snapshot["reasons"]["no_valid_pairs"] == 1
     assert snapshot["refinement"]["skipped"]["no_valid_pairs"] == 1
+    assert snapshot["reasons"]["transcript_gap"] == 1
+    assert snapshot["refinement"]["skipped"]["transcript_gap"] == 1
 
 
 async def test_stats_schema_and_inference_path_scope(client):
@@ -189,6 +195,7 @@ async def test_stats_schema_and_inference_path_scope(client):
         "ambiguous_spans",
         "insufficient_evidence",
         "no_valid_pairs",
+        "transcript_gap",
         "choice_inconclusive",
         "malformed_context",
         "invalid_choice",
@@ -212,6 +219,7 @@ async def test_stats_schema_and_inference_path_scope(client):
             "ambiguous_spans": 0,
             "no_overlapping_span": 0,
             "no_valid_pairs": 0,
+            "transcript_gap": 0,
         },
     }
     assert set(snapshot["proxy_requests"]["latency_ms"]) == {

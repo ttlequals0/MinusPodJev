@@ -947,6 +947,7 @@ def test_refinement_gates_never_enter_choice(jev_env, tmp_path):
         "ambiguous_spans": 1,
         "no_overlapping_span": 1,
         "no_valid_pairs": 0,
+        "transcript_gap": 0,
     }
 
 

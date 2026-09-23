@@ -35,7 +35,7 @@ type RefinementStats = {
   unchanged?: number
   inconclusive?: number
   upstream_error?: number
-  skipped?: Partial<Record<'disabled' | 'missing_word_timings' | 'insufficient_evidence' | 'ambiguous_spans' | 'no_overlapping_span' | 'no_valid_pairs', number>>
+  skipped?: Partial<Record<'disabled' | 'missing_word_timings' | 'insufficient_evidence' | 'ambiguous_spans' | 'no_overlapping_span' | 'no_valid_pairs' | 'transcript_gap', number>>
 }
 type Review = {
   count: number
@@ -452,6 +452,7 @@ function RefinementStats({ refinement }: { refinement: RefinementStats | undefin
       <Definition label="Ambiguous spans" value={count(skipped?.ambiguous_spans)} />
       <Definition label="No overlapping span" value={count(skipped?.no_overlapping_span)} />
       <Definition label="No valid pairs before ranking" value={count(skipped?.no_valid_pairs)} />
+      <Definition label="Transcript gap" value={count(skipped?.transcript_gap)} />
     </dl></article>
     <p className="refinement-note">Changed and unchanged compare the selected boundary pair with the original candidate at the 0.1 s tolerance. They do not include coarse span adjustments counted under review outcomes.</p>
   </section>

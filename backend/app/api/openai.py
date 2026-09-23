@@ -136,16 +136,40 @@ def chat_completions(
             return response
         except ReviewInvalidRequestError:
             outcome, reason_code = "invalid_request", "invalid_request"
-            return _review_error(422, "jev_review_invalid_request", "Review request is invalid", request_id)
+            return _review_error(
+                422,
+                "jev_review_invalid_request",
+                "Review request is invalid",
+                request_id,
+                reason_code,
+            )
         except ReviewInconclusiveError as exc:
             outcome, reason_code = "inconclusive", _inconclusive_reason(str(exc))
-            return _review_error(422, "jev_review_inconclusive", "Review is inconclusive", request_id)
+            return _review_error(
+                422,
+                "jev_review_inconclusive",
+                "Review is inconclusive",
+                request_id,
+                reason_code,
+            )
         except ReviewUpstreamInvalidResponseError:
             outcome, reason_code = "upstream_error", "upstream_invalid_response"
-            return _review_error(503, "jev_review_upstream_invalid_response", "Review unavailable", request_id)
+            return _review_error(
+                503,
+                "jev_review_upstream_invalid_response",
+                "Review unavailable",
+                request_id,
+                reason_code,
+            )
         except ReviewUnavailableError:
             outcome, reason_code = "upstream_error", "upstream_failure"
-            return _review_error(503, "jev_review_upstream_failure", "Review unavailable", request_id)
+            return _review_error(
+                503,
+                "jev_review_upstream_failure",
+                "Review unavailable",
+                request_id,
+                reason_code,
+            )
         except JevCategoryValidationError as exc:
             logger.warning(
                 "category validation_failed rule=%s details=%s",
@@ -176,6 +200,8 @@ def _inconclusive_reason(message: str) -> str:
     lowered = message.lower()
     if "boundary search had no valid pairs" in lowered:
         return "no_valid_pairs"
+    if "transcript gap" in lowered:
+        return "transcript_gap"
     if "unambiguous" in lowered:
         return "ambiguous_spans"
     if "evidence" in lowered:
@@ -185,12 +211,25 @@ def _inconclusive_reason(message: str) -> str:
     return "malformed_context"
 
 
-def _review_error(status: int, code: str, message: str, request_id: str | None) -> JSONResponse:
+def _review_error(
+    status: int,
+    code: str,
+    message: str,
+    request_id: str | None,
+    reason: str | None = None,
+) -> JSONResponse:
     headers: dict[str, str] = {}
     if status == 422:
         headers["x-should-retry"] = "false"
     if request_id is not None:
         headers["X-Request-ID"] = request_id
+        logger.warning(
+            "review request_id=%s status=%d error_code=%s reason=%s",
+            request_id,
+            status,
+            code,
+            reason or "unknown",
+        )
     return JSONResponse(
         status_code=status,
         content={"error": {"message": message, "type": "invalid_request_error" if status == 422 else "api_error", "code": code}},

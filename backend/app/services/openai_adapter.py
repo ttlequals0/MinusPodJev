@@ -467,8 +467,13 @@ def parse_review_segments(text: str) -> list[dict[str, Any]]:
     return parse_review_context(text)[0]
 
 
-def _review_unavailable(pool: str, reason: str) -> NoReturn:
-    logger.warning("review unavailable (%s, pool=%s)", reason, pool)
+def _review_unavailable(pool: str, reason: str, review_request_id: str | None) -> NoReturn:
+    logger.warning(
+        "review request_id=%s unavailable reason=%s pool=%s",
+        review_request_id,
+        reason,
+        pool,
+    )
     raise ReviewInconclusiveError(reason)
 
 
@@ -748,10 +753,22 @@ def run_review(
         review_evidence_enter,
         review_choice_enter,
     )
-    if not any(
+    has_overlap = any(
         min(float(segment["end"]), cand[1]) > max(float(segment["start"]), cand[0])
         for segment in segments
-    ):
+    )
+    if not has_overlap:
+        if context_start <= cand[0] and cand[1] <= context_end:
+            metrics.record_review_refinement("skipped", skip_reason="transcript_gap")
+            logger.info(
+                "review request_id=%s refinement=skipped reason=transcript_gap original_start=%.3f original_end=%.3f context_start=%.3f context_end=%.3f",
+                review_request_id,
+                cand[0],
+                cand[1],
+                context_start,
+                context_end,
+            )
+            _review_unavailable(pool, "candidate lies in a transcript gap", review_request_id)
         raise ReviewInvalidRequestError("candidate does not overlap the review transcript")
 
     try:
@@ -823,7 +840,7 @@ def run_review(
             cand_start,
             cand_end,
         )
-        _review_unavailable(pool, "Jev did not produce one unambiguous overlapping span")
+        _review_unavailable(pool, "Jev did not produce one unambiguous overlapping span", review_request_id)
 
     ad_start, ad_end, confidence = overlapping[0]
     state = _review_state(segments, word_edges, cand, guidance)
@@ -898,7 +915,7 @@ def run_review(
             cand_start,
             cand_end,
         )
-        _review_unavailable(pool, "Jev did not find sufficient advertising evidence")
+        _review_unavailable(pool, "Jev did not find sufficient advertising evidence", review_request_id)
 
     if not refine_boundaries:
         metrics.record_review_refinement("skipped", skip_reason="disabled")
@@ -935,7 +952,7 @@ def run_review(
                 len(starts),
                 len(ends),
             )
-            _review_unavailable(pool, "Jev boundary search had no valid pairs")
+            _review_unavailable(pool, "Jev boundary search had no valid pairs", review_request_id)
         starts = sorted({start for start, _ in candidate_pairs})
         ends = sorted({end for _, end in candidate_pairs})
         metrics.record_review_refinement("attempted")
@@ -968,7 +985,7 @@ def run_review(
                     cand_start,
                     cand_end,
                 )
-                _review_unavailable(pool, "Jev boundary Choice ranking was inconclusive")
+                _review_unavailable(pool, "Jev boundary Choice ranking was inconclusive", review_request_id)
             shortlisted_starts = _shortlist_boundaries(start_answer, start_values, cand_start)
             shortlisted_ends = _shortlist_boundaries(end_answer, end_values, cand_end)
             final_pairs = _valid_pairs(
@@ -993,7 +1010,7 @@ def run_review(
                     len(shortlisted_starts),
                     len(shortlisted_ends),
                 )
-                _review_unavailable(pool, "Jev boundary search had no valid pairs")
+                _review_unavailable(pool, "Jev boundary search had no valid pairs", review_request_id)
             questions, pairs = _pair_questions(word_edges, cand, final_pairs)
             result = review_questions(questions, "choice_pair")
             answer = result["answers"]["boundary_pair"]
@@ -1029,7 +1046,7 @@ def run_review(
                 cand_start,
                 cand_end,
             )
-            _review_unavailable(pool, "Jev boundary Choice was inconclusive")
+            _review_unavailable(pool, "Jev boundary Choice was inconclusive", review_request_id)
         refined_start, refined_end = pairs[choice]
         if (
             refined_end <= refined_start
@@ -1047,7 +1064,7 @@ def run_review(
                 refined_start,
                 refined_end,
             )
-            _review_unavailable(pool, "Jev boundary Choice returned an invalid pair")
+            _review_unavailable(pool, "Jev boundary Choice returned an invalid pair", review_request_id)
         changed = abs(refined_start - cand_start) > 0.1 or abs(refined_end - cand_end) > 0.1
         metrics.record_review_refinement("completed", changed=changed)
         logger.info(
