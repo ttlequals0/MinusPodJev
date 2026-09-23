@@ -22,6 +22,7 @@ _REVIEW_REASON_CODES = (
     "no_valid_pairs",
     "transcript_gap",
     "choice_inconclusive",
+    "missing_boundary_coverage",
     "malformed_context",
     "invalid_choice",
     "upstream_failure",

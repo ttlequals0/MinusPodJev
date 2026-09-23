@@ -17,6 +17,7 @@ from app.services.openai_adapter import (
     ReviewInconclusiveError,
     ReviewUnavailableError,
     _boundary_candidates,
+    _range_boundary_support,
     _recover_review_segments,
     is_review_request,
     parse_candidate_bounds,
@@ -110,6 +111,30 @@ def test_word_only_candidate_recovery_reaches_jev(jev_env, tmp_path):
     assert json.loads(response["choices"][0]["message"]["content"])["ads"]
 
 
+def test_transcript_gap_abstains_without_upstream_request(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        100.0,
+        120.0,
+        [(94.0, 99.0, "context before")],
+        [],
+        [(121.0, 126.0, "context after")],
+    )
+    calls = 0
+
+    def fake(payload, **kwargs):
+        nonlocal calls
+        calls += 1
+        return make_text_fake()(payload, **kwargs)
+
+    with pytest.raises(ReviewInconclusiveError) as raised:
+        _run(prompt, fake, tmp_path)
+
+    assert raised.value.reason == "transcript_gap"
+    assert raised.value.stage == "context"
+    assert calls == 0
+    assert metrics.snapshot()["review"]["refinement"]["skipped"]["transcript_gap"] == 1
+
+
 def test_boundary_candidates_snap_two_second_grid_within_thirty_seconds():
     segments = [{"start": 90.0, "end": 170.0, "text": "context"}]
     words = {
@@ -130,35 +155,123 @@ def test_boundary_candidates_snap_two_second_grid_within_thirty_seconds():
     assert len(starts) == len(set(starts)) and len(ends) == len(set(ends))
 
 
-def test_uncovered_original_boundaries_are_inconclusive_without_choice_request(jev_env, tmp_path):
+def test_unsupported_original_can_trim_to_word_supported_range(jev_env, tmp_path):
     prompt = build_review_prompt(
         90.0,
         110.0,
-        [],
+        [(80.0, 89.9, "earlier context")],
         [(94.0, 100.0, "This episode is sponsored by BetterHelp")],
         [(100.0, 120.0, "context after")],
     ) + (
         "Boundary word timing, use these timestamps for corrections:\n"
-        "Start edge:\n[90.0s-90.0s] candidate\n"
-        "End edge:\n[109.0s-110.0s] candidate\n"
+        "Start edge:\n[93.9s-94.1s] sponsor\n"
+        "End edge:\n[100.0s-100.0s] sponsor\n"
     )
     normal = make_text_fake()
-    choice_requests = 0
+    focused_ranges = []
 
     def fake(payload, **kwargs):
-        nonlocal choice_requests
-        if any(question.get("type") == "choice" for question in payload["questions"].values()):
-            choice_requests += 1
-        return normal(payload, **kwargs)
+        result = normal(payload, **kwargs)
+        if "boundary_start" in payload["questions"]:
+            for key, target in (("boundary_start", 93.9), ("boundary_end", 100.0)):
+                criteria = payload["questions"][key]["criteria"]
+                option = next(name for name, text in criteria.items() if f"{target:.2f}s" in text)
+                result["answers"][key]["choice"] = option
+                result["answers"][key]["probabilities"] = {
+                    name: 0.99 if name == option else 0.01 / (len(criteria) - 1)
+                    for name in criteria
+                }
+        if "proposed_range" in payload["questions"]:
+            focused_ranges.append(payload["questions"]["proposed_range"]["instructions"])
+        return result
 
-    with pytest.raises(ReviewInconclusiveError, match="original complete range"):
-        _run(prompt, fake, tmp_path, refine_boundaries=True)
+    response = _run(prompt, fake, tmp_path, refine_boundaries=True)
 
-    assert choice_requests == 0
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+    assert (ad["start"], ad["end"]) == (93.9, 100.0)
+    assert focused_ranges == [
+        "The complete proposed advertising interval is 93.90s-100.00s. "
+        "Confirm only when the supplied transcript supports the entire interval as "
+        "advertising and excludes neighboring editorial content. Abstain when either "
+        "boundary or any interior portion lacks observed transcript evidence."
+    ]
     refinement = metrics.snapshot()["review"]["refinement"]
-    assert refinement["attempted"] == 0
-    assert refinement["inconclusive"] == 1
+    assert refinement["attempted"] == 1
+    assert refinement["changed"] == 1
+    assert refinement["completed"] == 1
     assert refinement["upstream_error"] == 0
+
+
+@pytest.mark.parametrize(
+    ("focused_score", "approved"),
+    [(0.98, True), (0.5, False)],
+)
+def test_zero_duration_word_supports_selected_endpoint_outside_coarse_context(
+    jev_env, tmp_path, focused_score, approved
+):
+    prompt = build_review_prompt(
+        90.0,
+        110.0,
+        [(80.0, 89.9, "earlier context")],
+        [(94.0, 100.0, "This episode is sponsored by BetterHelp")],
+        [],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[93.9s-94.1s] sponsor\n"
+        "End edge:\n[110.0s-110.0s] sponsor\n"
+    )
+    normal = make_text_fake()
+    focused_payloads = []
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if "boundary_start" in payload["questions"]:
+            for key, target in (("boundary_start", 93.9), ("boundary_end", 110.0)):
+                criteria = payload["questions"][key]["criteria"]
+                option = next(name for name, text in criteria.items() if f"{target:.2f}s" in text)
+                result["answers"][key]["choice"] = option
+                result["answers"][key]["probabilities"] = {
+                    name: 0.99 if name == option else 0.01 / (len(criteria) - 1)
+                    for name in criteria
+                }
+        if "proposed_range" in payload["questions"]:
+            focused_payloads.append(payload)
+            result["answers"]["proposed_range"] = {"noul": focused_score}
+        return result
+
+    if approved:
+        response = _run(prompt, fake, tmp_path, refine_boundaries=True)
+        ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+        assert (ad["start"], ad["end"]) == (93.9, 110.0)
+    else:
+        with pytest.raises(ReviewInconclusiveError) as raised:
+            _run(prompt, fake, tmp_path, refine_boundaries=True)
+        assert raised.value.reason == "missing_boundary_coverage"
+        assert raised.value.stage == "boundary_coverage"
+
+    assert len(focused_payloads) == 1
+    focused = focused_payloads[0]
+    assert focused["questions"]["proposed_range"]["instructions"] == (
+        "The complete proposed advertising interval is 93.90s-110.00s. "
+        "Confirm only when the supplied transcript supports the entire interval as "
+        "advertising and excludes neighboring editorial content. Abstain when either "
+        "boundary or any interior portion lacks observed transcript evidence."
+    )
+    assert [(row["start"], row["end"]) for row in focused["state"]["timeline"]] == [
+        (80.0, 89.9),
+        (94.0, 100.0),
+    ]
+    assert focused["state"]["transcript"].splitlines() == [
+        "L0000| earlier context",
+        "L0001| This episode is sponsored by BetterHelp",
+    ]
+    coarse = [{"start": 80.0, "end": 89.9}, {"start": 94.0, "end": 100.0}]
+    words = {
+        "start": [{"start": 93.9, "end": 94.1}],
+        "end": [{"start": 110.0, "end": 110.0}],
+    }
+    assert _range_boundary_support(coarse, words, (93.9, 110.0)) == (True, True)
+    assert _range_boundary_support(coarse, words, (93.9, 109.999)) == (True, False)
 
 
 def _meaningful_pair_prompt() -> str:
@@ -1068,34 +1181,91 @@ def test_low_proposal_and_original_are_inconclusive(jev_env, tmp_path):
         _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
 
 
-def test_partial_original_context_cannot_confirm_even_with_high_noul(jev_env, tmp_path):
-    prompt = _with_word_edges(
-        build_review_prompt(
-            100.0,
-            120.0,
-            [(94.0, 100.0, "context")],
-            [(100.0, 110.0, "This episode is sponsored by BetterHelp")],
-            [],
-        ),
-        end=(109.0, 110.0, "sponsor"),
+def test_unsupported_original_cannot_be_confirmed_unchanged(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        90.0,
+        110.0,
+        [(80.0, 89.9, "earlier context")],
+        [(94.0, 100.0, "This episode is sponsored by BetterHelp")],
+        [(100.0, 120.0, "context after")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[93.9s-94.1s] sponsor\n"
+        "End edge:\n[100.0s-100.0s] sponsor\n"
     )
-
     normal = make_text_fake()
+    focused_requests = []
 
     def fake(payload, **kwargs):
         result = normal(payload, **kwargs)
-        for key, question in payload["questions"].items():
-            if question.get("type") == "choice" and key == "boundary_end":
-                option = next(name for name in question["criteria"] if name != "unknown")
-                result["answers"][key]["choice"] = option
-                result["answers"][key]["probabilities"] = {
-                    name: 0.99 if name == option else 0.01 / (len(question["criteria"]) - 1)
-                    for name in question["criteria"]
-                }
+        focused_requests.extend(
+            key for key in payload["questions"] if key in {"proposed_range", "original_range"}
+        )
         return result
 
-    with pytest.raises(ReviewInconclusiveError, match="original complete range"):
+    with pytest.raises(ReviewInconclusiveError) as raised:
         _run(prompt, fake, tmp_path, refine_boundaries=True)
+
+    assert raised.value.reason == "missing_boundary_coverage"
+    assert raised.value.stage == "boundary_coverage"
+    assert raised.value.range_start == 90.0 and raised.value.range_end == 110.0
+    assert raised.value.start_supported is False and raised.value.end_supported is True
+    assert focused_requests == []
+    refinement = metrics.snapshot()["review"]["refinement"]
+    assert refinement["attempted"] == 1 and refinement["inconclusive"] == 1
+
+
+def test_low_proposal_logs_score_before_unsupported_original_fallback(
+    jev_env, tmp_path, caplog
+):
+    import logging
+
+    prompt = build_review_prompt(
+        90.0,
+        110.0,
+        [(80.0, 89.9, "earlier context")],
+        [(94.0, 100.0, "This episode is sponsored by BetterHelp")],
+        [(100.0, 120.0, "context after")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[93.9s-94.1s] sponsor\n"
+        "End edge:\n[100.0s-100.0s] sponsor\n"
+    )
+    normal = make_text_fake()
+    focused_requests = []
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if "boundary_start" in payload["questions"]:
+            for key, target in (("boundary_start", 93.9), ("boundary_end", 100.0)):
+                criteria = payload["questions"][key]["criteria"]
+                option = next(name for name, text in criteria.items() if f"{target:.2f}s" in text)
+                result["answers"][key]["choice"] = option
+                result["answers"][key]["probabilities"] = {
+                    name: 0.99 if name == option else 0.01 / (len(criteria) - 1)
+                    for name in criteria
+                }
+        if "proposed_range" in payload["questions"]:
+            focused_requests.append("proposed_range")
+            result["answers"]["proposed_range"] = {"noul": 0.5}
+        if "original_range" in payload["questions"]:
+            focused_requests.append("original_range")
+        return result
+
+    with caplog.at_level(logging.INFO, logger="app.services.openai_adapter"):
+        with pytest.raises(ReviewInconclusiveError) as raised:
+            _run(prompt, fake, tmp_path, refine_boundaries=True)
+
+    assert raised.value.reason == "missing_boundary_coverage"
+    assert raised.value.stage == "boundary_coverage"
+    assert focused_requests == ["proposed_range"]
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("stage=focused_validation range=(93.9, 100.0) score=0.5" in message for message in messages)
+    assert any("stage=boundary_coverage validation_skipped range_kind=original_range" in message for message in messages)
+    refinement = metrics.snapshot()["review"]["refinement"]
+    assert refinement["attempted"] == 1
+    assert refinement["inconclusive"] == 1
+    assert refinement["completed"] == 0
 
 
 async def test_focused_validation_upstream_failure_preserves_503(

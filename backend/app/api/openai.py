@@ -209,10 +209,11 @@ _INCONCLUSIVE_REASONS = frozenset(
         "invalid_pair",
         "proposed_range_not_confirmed",
         "original_range_not_confirmed",
+        "missing_boundary_coverage",
     }
 )
 _INCONCLUSIVE_STAGES = frozenset(
-    {"context", "evidence", "choice_rank", "focused_validation"}
+    {"context", "evidence", "choice_rank", "focused_validation", "boundary_coverage"}
 )
 _METRIC_REASONS = frozenset(
     {
@@ -222,6 +223,7 @@ _METRIC_REASONS = frozenset(
         "transcript_gap",
         "choice_inconclusive",
         "malformed_context",
+        "missing_boundary_coverage",
     }
 )
 
@@ -239,6 +241,14 @@ def _inconclusive_diagnostics(exc: ReviewInconclusiveError) -> dict[str, Any]:
     cache_hit = getattr(exc, "cache_hit", None)
     if isinstance(cache_hit, bool):
         details["cache_hit"] = cache_hit
+    for key in ("range_start", "range_end"):
+        value = getattr(exc, key, None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            details[key] = value
+    for key in ("start_supported", "end_supported"):
+        value = getattr(exc, key, None)
+        if isinstance(value, bool):
+            details[key] = value
     return details
 
 
@@ -246,7 +256,10 @@ def _inconclusive_message(diagnostics: dict[str, Any]) -> str:
     parts = [f"reason={diagnostics['reason']}", f"stage={diagnostics['stage']}"]
     parts.extend(
         f"{key}={diagnostics[key]}"
-        for key in ("score", "threshold", "cache_hit")
+        for key in (
+            "score", "threshold", "cache_hit", "range_start", "range_end",
+            "start_supported", "end_supported",
+        )
         if key in diagnostics
     )
     return "Review is inconclusive (" + ", ".join(parts) + ")"

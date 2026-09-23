@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.11 - 2026-09-23
+
+- Fix the original endpoint gate so supported corrections can reach boundary review.
+- Account for partial or zero-point word timing without inventing transcript text.
+- Report safe `missing_boundary_coverage` diagnostics and metrics while retaining independent complete-range validation and original-cut fallback.
+- Keep review thresholds and cache behavior unchanged.
+- Changes tracked in [PR #7](https://github.com/ttlequals0/MinusPodJev/pull/7), covering boundary search, sponsor learning, transcript-gap recovery, and review-gate corrections.
+
 ## 0.1.10 - 2026-09-23
 
 - Recover valid ad candidates when supplied word timings expose a gap in transcript segmentation. Candidates still inside the supplied context with no segment overlap return `422 jev_review_inconclusive` without Jev calls.

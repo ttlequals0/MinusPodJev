@@ -131,6 +131,7 @@ def test_review_metrics_use_fixed_safe_values_and_reset():
         "no_valid_pairs": 0,
         "transcript_gap": 0,
         "choice_inconclusive": 0,
+        "missing_boundary_coverage": 0,
         "malformed_context": 0,
         "invalid_choice": 0,
         "upstream_failure": 0,
@@ -151,21 +152,30 @@ def test_no_valid_pairs_reason_and_refinement_skip_are_reported():
     gap_error = ReviewInconclusiveError(
         "not used for classification", reason="transcript_gap", stage="context"
     )
+    coverage_error = ReviewInconclusiveError(
+        "not used for classification",
+        reason="missing_boundary_coverage",
+        stage="boundary_coverage",
+    )
     pairs = _inconclusive_diagnostics(pairs_error)
     gap = _inconclusive_diagnostics(gap_error)
+    coverage = _inconclusive_diagnostics(coverage_error)
     assert pairs["reason"] == "no_valid_pairs"
     assert gap["reason"] == "transcript_gap"
     assert _metric_inconclusive_reason(pairs) == "no_valid_pairs"
     assert _metric_inconclusive_reason(gap) == "transcript_gap"
+    assert _metric_inconclusive_reason(coverage) == "missing_boundary_coverage"
     metrics.record_review("inconclusive", 5.0, "no_valid_pairs")
     metrics.record_review_refinement("skipped", skip_reason="no_valid_pairs")
     metrics.record_review("inconclusive", 5.0, "transcript_gap")
     metrics.record_review_refinement("skipped", skip_reason="transcript_gap")
+    metrics.record_review("inconclusive", 5.0, _metric_inconclusive_reason(coverage))
     snapshot = metrics.snapshot()["review"]
     assert snapshot["reasons"]["no_valid_pairs"] == 1
     assert snapshot["refinement"]["skipped"]["no_valid_pairs"] == 1
     assert snapshot["reasons"]["transcript_gap"] == 1
     assert snapshot["refinement"]["skipped"]["transcript_gap"] == 1
+    assert snapshot["reasons"]["missing_boundary_coverage"] == 1
 
 
 async def test_stats_schema_and_inference_path_scope(client):
@@ -208,6 +218,7 @@ async def test_stats_schema_and_inference_path_scope(client):
         "no_valid_pairs",
         "transcript_gap",
         "choice_inconclusive",
+        "missing_boundary_coverage",
         "malformed_context",
         "invalid_choice",
         "upstream_failure",
