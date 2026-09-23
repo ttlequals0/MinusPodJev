@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.12 - 2026-09-23
+
+- Send the selected review cut as an explicit `assessment_range` while retaining the original candidate range for reference.
+- Clarify that timestamp gaps alone do not prove a pause, silence, or content absent from the transcript.
+- Return separately sanitized proposal and fallback diagnostics when neither the proposed cut nor original fallback can be confirmed.
+- Keep review thresholds and cache behavior unchanged. Boundary refinement remains experimental. Its accuracy is unproven.
+
 ## 0.1.11 - 2026-09-23
 
 - Fix the original endpoint gate so supported corrections can reach boundary review.

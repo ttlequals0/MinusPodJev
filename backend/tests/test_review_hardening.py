@@ -250,12 +250,13 @@ def test_pair_choice_keeps_all_supplied_words_in_shared_state():
     assert state["boundary_words"]["end"] == words
 
 
-def test_focused_range_question_requires_complete_observed_support():
-    question = _focused_range_question("proposed_range", (10.0, 20.0))
+def test_focused_range_question_labels_reference_and_assessment_range():
+    question = _focused_range_question("proposed_range", (10.0, 20.0), (8.0, 22.0))
 
     assert question["proposed_range"]["type"] == "noul"
-    assert "entire interval" in question["proposed_range"]["instructions"]
-    assert "interior portion lacks observed transcript evidence" in question["proposed_range"]["instructions"]
+    assert "reference candidate interval is 8.00s-22.00s" in question["proposed_range"]["instructions"]
+    assert "Assess only assessment_range 10.00s-20.00s" in question["proposed_range"]["instructions"]
+    assert "Timestamp gaps alone do not establish missing speech" in question["proposed_range"]["instructions"]
 
 
 def _corpus_prompt(

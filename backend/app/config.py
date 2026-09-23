@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     # Application
     APP_NAME: str = Field(default="Jev Proxy", description="Application name")
-    APP_VERSION: str = Field(default="0.1.11", description="Application version")
+    APP_VERSION: str = Field(default="0.1.12", description="Application version")
     APP_DESCRIPTION: str = Field(
         default="Thin HTTP proxy around the TypeSafe Jev System One endpoint",
         description="Application description",

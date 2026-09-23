@@ -201,3 +201,95 @@ def test_boundary_support_flags_require_booleans(value: Any) -> None:
     diagnostics = openai._inconclusive_diagnostics(error)
     assert "start_supported" not in diagnostics
     assert "end_supported" not in diagnostics
+
+
+def test_dual_range_diagnostics_are_bounded_and_keep_coverage_without_cache() -> None:
+    error = ReviewInconclusiveError(
+        "unused", reason="missing_boundary_coverage", stage="boundary_coverage"
+    )
+    error.proposal = {
+        "reason": "proposed_range_not_confirmed",
+        "stage": "focused_validation",
+        "range_start": 10.0,
+        "range_end": 20.0,
+        "score": 0.4,
+        "threshold": 0.6,
+        "cache_hit": False,
+        "private": "credential",
+    }
+    error.fallback = {
+        "reason": "missing_boundary_coverage",
+        "stage": "boundary_coverage",
+        "range_start": 8.0,
+        "range_end": 20.0,
+        "start_supported": False,
+        "end_supported": True,
+        "score": 0.1,
+        "cache_hit": True,
+    }
+
+    diagnostics = openai._inconclusive_diagnostics(error)
+
+    assert diagnostics["proposal"] == {
+        "reason": "proposed_range_not_confirmed",
+        "stage": "focused_validation",
+        "range_start": 10.0,
+        "range_end": 20.0,
+        "score": 0.4,
+        "threshold": 0.6,
+        "cache_hit": False,
+    }
+    assert diagnostics["fallback"] == {
+        "reason": "missing_boundary_coverage",
+        "stage": "boundary_coverage",
+        "range_start": 8.0,
+        "range_end": 20.0,
+        "start_supported": False,
+        "end_supported": True,
+    }
+
+
+def test_malformed_dual_range_diagnostics_are_dropped() -> None:
+    error = ReviewInconclusiveError("unused", reason="transcript_gap", stage="context")
+    error.proposal = {
+        "reason": ["private reason"],
+        "stage": {"private stage": "value"},
+        "range_start": 1.0,
+        "range_end": 2.0,
+        "score": 0.5,
+        "threshold": 0.6,
+        "cache_hit": False,
+    }
+    error.fallback = {
+        "reason": "original_range_not_confirmed",
+        "stage": "focused_validation",
+        "range_start": float("nan"),
+        "range_end": 2.0,
+        "score": 0.5,
+        "threshold": 0.6,
+        "cache_hit": "private text",
+    }
+
+    diagnostics = openai._inconclusive_diagnostics(error)
+
+    assert "proposal" not in diagnostics
+    assert "fallback" not in diagnostics
+
+
+def test_exception_constructor_drops_nested_container_values() -> None:
+    error = ReviewInconclusiveError(
+        "unused",
+        reason="transcript_gap",
+        stage="context",
+        proposal={
+            "reason": ["proposed_range_not_confirmed"],
+            "stage": {"stage": "focused_validation"},
+            "range_start": 1.0,
+            "range_end": 2.0,
+            "score": 0.5,
+            "threshold": 0.6,
+            "cache_hit": False,
+        },
+    )
+
+    assert error.proposal is None

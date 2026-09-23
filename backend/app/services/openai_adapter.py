@@ -68,6 +68,64 @@ class ReviewUnavailableError(RuntimeError):
     """The proxy cannot produce a safe review verdict."""
 
 
+def sanitize_review_range_diagnostic(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    reason = value.get("reason")
+    stage = value.get("stage")
+    start = value.get("range_start")
+    end = value.get("range_end")
+    if not (
+        isinstance(start, (int, float))
+        and not isinstance(start, bool)
+        and math.isfinite(start)
+        and isinstance(end, (int, float))
+        and not isinstance(end, bool)
+        and math.isfinite(end)
+    ):
+        return None
+    if isinstance(reason, str) and isinstance(stage, str) and reason == "missing_boundary_coverage" and stage == "boundary_coverage":
+        start_supported = value.get("start_supported")
+        end_supported = value.get("end_supported")
+        if isinstance(start_supported, bool) and isinstance(end_supported, bool):
+            return {
+                "reason": reason,
+                "stage": stage,
+                "range_start": start,
+                "range_end": end,
+                "start_supported": start_supported,
+                "end_supported": end_supported,
+            }
+    if (
+        isinstance(reason, str)
+        and isinstance(stage, str)
+        and reason in {"proposed_range_not_confirmed", "original_range_not_confirmed"}
+        and stage == "focused_validation"
+    ):
+        score = value.get("score")
+        threshold = value.get("threshold")
+        cache_hit = value.get("cache_hit")
+        if (
+            isinstance(score, (int, float))
+            and not isinstance(score, bool)
+            and math.isfinite(score)
+            and isinstance(threshold, (int, float))
+            and not isinstance(threshold, bool)
+            and math.isfinite(threshold)
+            and isinstance(cache_hit, bool)
+        ):
+            return {
+                "reason": reason,
+                "stage": stage,
+                "range_start": start,
+                "range_end": end,
+                "score": score,
+                "threshold": threshold,
+                "cache_hit": cache_hit,
+            }
+    return None
+
+
 class ReviewInconclusiveError(ReviewUnavailableError):
     """The valid review input did not support a safe verdict."""
 
@@ -101,9 +159,11 @@ class ReviewInconclusiveError(ReviewUnavailableError):
         range_end: float | None = None,
         start_supported: bool | None = None,
         end_supported: bool | None = None,
+        proposal: dict[str, Any] | None = None,
+        fallback: dict[str, Any] | None = None,
     ):
-        self.reason = reason if reason in self._REASONS else "choice_inconclusive"
-        self.stage = stage if stage in self._STAGES else "context"
+        self.reason = reason if isinstance(reason, str) and reason in self._REASONS else "choice_inconclusive"
+        self.stage = stage if isinstance(stage, str) and stage in self._STAGES else "context"
         self.score = (
             score if isinstance(score, (int, float)) and not isinstance(score, bool) and math.isfinite(score) else None
         )
@@ -125,6 +185,8 @@ class ReviewInconclusiveError(ReviewUnavailableError):
         )
         self.start_supported = start_supported if isinstance(start_supported, bool) else None
         self.end_supported = end_supported if isinstance(end_supported, bool) else None
+        self.proposal = sanitize_review_range_diagnostic(proposal)
+        self.fallback = sanitize_review_range_diagnostic(fallback)
         super().__init__(message)
 
 
@@ -537,6 +599,8 @@ def _review_unavailable(
     range_end: float | None = None,
     start_supported: bool | None = None,
     end_supported: bool | None = None,
+    proposal: dict[str, Any] | None = None,
+    fallback: dict[str, Any] | None = None,
 ) -> NoReturn:
     logger.warning(
         "review request_id=%s unavailable reason=%s pool=%s",
@@ -555,6 +619,8 @@ def _review_unavailable(
         range_end=range_end,
         start_supported=start_supported,
         end_supported=end_supported,
+        proposal=proposal,
+        fallback=fallback,
     )
 
 
@@ -779,16 +845,21 @@ def _rank_questions(
     )
 
 
-def _focused_range_question(name: str, proposed: tuple[float, float]) -> dict[str, dict[str, Any]]:
-    start, end = proposed
+def _focused_range_question(
+    name: str, assessment_range: tuple[float, float], candidate: tuple[float, float]
+) -> dict[str, dict[str, Any]]:
+    start, end = assessment_range
     return {
         name: {
             "type": "noul",
             "instructions": (
-                f"The complete proposed advertising interval is {start:.2f}s-{end:.2f}s. "
-                "Confirm only when the supplied transcript supports the entire interval as "
-                "advertising and excludes neighboring editorial content. Abstain when either "
-                "boundary or any interior portion lacks observed transcript evidence."
+                f"The reference candidate interval is {candidate[0]:.2f}s-{candidate[1]:.2f}s. "
+                f"Assess only assessment_range {start:.2f}s-{end:.2f}s. "
+                "Confirm only when its boundaries are supported, all observed speech within "
+                "the assessed interval is advertising under the supplied guidance, and it "
+                "excludes neighboring editorial content. Timestamp gaps alone do not establish "
+                "missing speech or editorial content: do not assume silence or invent content. "
+                "Abstain when missing evidence prevents judging the complete interval."
             ),
         }
     }
@@ -975,12 +1046,25 @@ def run_review(
     review_input_tokens = 0
     review_output_tokens = 0
 
-    def review_questions(questions: dict[str, dict[str, Any]], stage: str) -> dict[str, Any]:
+    def review_questions(
+        questions: dict[str, dict[str, Any]],
+        stage: str,
+        assessment_range: tuple[float, float] | None = None,
+    ) -> dict[str, Any]:
         nonlocal review_input_tokens, review_output_tokens
         started = time.monotonic()
+        question_state = state
+        if assessment_range is not None:
+            question_state = {
+                **state,
+                "assessment_range": {
+                    "start": assessment_range[0],
+                    "end": assessment_range[1],
+                },
+            }
         try:
             result = jev_review_questions(
-                state=state,
+                state=question_state,
                 questions=questions,
                 url=url,
                 api_key=api_key,
@@ -1137,12 +1221,15 @@ def run_review(
             focused_name = "proposed_range" if proposed != cand else "original_range"
             focused = None
             focused_score = None
+            proposal_diagnostic: dict[str, Any] | None = None
             proposed_start_supported, proposed_end_supported = _range_boundary_support(
                 coarse_segments, word_edges, proposed
             )
             if proposed_start_supported and proposed_end_supported:
                 focused = review_questions(
-                    _focused_range_question(focused_name, proposed), "focused_validation"
+                    _focused_range_question(focused_name, proposed, cand),
+                    "focused_validation",
+                    proposed,
                 )
                 focused_score = float(focused["answers"][focused_name])
                 logger.info(
@@ -1153,6 +1240,16 @@ def run_review(
                     review_choice_enter,
                     focused["cache_hit"],
                 )
+                if proposed != cand:
+                    proposal_diagnostic = {
+                        "reason": "proposed_range_not_confirmed",
+                        "stage": "focused_validation",
+                        "range_start": proposed[0],
+                        "range_end": proposed[1],
+                        "score": focused_score,
+                        "threshold": review_choice_enter,
+                        "cache_hit": bool(focused["cache_hit"]),
+                    }
             else:
                 logger.info(
                     "review request_id=%s stage=boundary_coverage validation_skipped range_kind=%s range_start=%.3f range_end=%.3f start_supported=%s end_supported=%s",
@@ -1163,6 +1260,15 @@ def run_review(
                     proposed_start_supported,
                     proposed_end_supported,
                 )
+                if proposed != cand:
+                    proposal_diagnostic = {
+                        "reason": "missing_boundary_coverage",
+                        "stage": "boundary_coverage",
+                        "range_start": proposed[0],
+                        "range_end": proposed[1],
+                        "start_supported": proposed_start_supported,
+                        "end_supported": proposed_end_supported,
+                    }
             if focused_score is not None and focused_score >= review_choice_enter:
                 ad_start, ad_end = proposed
                 metrics.record_review_refinement(
@@ -1176,12 +1282,15 @@ def run_review(
             elif proposed != cand:
                 original = None
                 original_score = None
+                fallback_diagnostic: dict[str, Any] | None = None
                 original_start_supported, original_end_supported = _range_boundary_support(
                     coarse_segments, word_edges, cand
                 )
                 if original_start_supported and original_end_supported:
                     original = review_questions(
-                        _focused_range_question("original_range", cand), "focused_validation"
+                        _focused_range_question("original_range", cand, cand),
+                        "focused_validation",
+                        cand,
                     )
                     original_score = float(original["answers"]["original_range"])
                     logger.info(
@@ -1192,6 +1301,15 @@ def run_review(
                         review_choice_enter,
                         original["cache_hit"],
                     )
+                    fallback_diagnostic = {
+                        "reason": "original_range_not_confirmed",
+                        "stage": "focused_validation",
+                        "range_start": cand[0],
+                        "range_end": cand[1],
+                        "score": original_score,
+                        "threshold": review_choice_enter,
+                        "cache_hit": bool(original["cache_hit"]),
+                    }
                 else:
                     logger.info(
                         "review request_id=%s stage=boundary_coverage validation_skipped range_kind=original_range range_start=%.3f range_end=%.3f start_supported=%s end_supported=%s",
@@ -1201,6 +1319,14 @@ def run_review(
                         original_start_supported,
                         original_end_supported,
                     )
+                    fallback_diagnostic = {
+                        "reason": "missing_boundary_coverage",
+                        "stage": "boundary_coverage",
+                        "range_start": cand[0],
+                        "range_end": cand[1],
+                        "start_supported": original_start_supported,
+                        "end_supported": original_end_supported,
+                    }
                 if original_score is not None and original_score >= review_choice_enter:
                     ad_start, ad_end = cand
                     metrics.record_review_refinement("completed", changed=False)
@@ -1221,6 +1347,8 @@ def run_review(
                             range_end=cand[1],
                             start_supported=original_start_supported,
                             end_supported=original_end_supported,
+                            proposal=proposal_diagnostic,
+                            fallback=fallback_diagnostic,
                         )
                     _review_unavailable(
                         pool,
@@ -1231,6 +1359,8 @@ def run_review(
                         score=original_score,
                         threshold=review_choice_enter,
                         cache_hit=bool(original["cache_hit"]) if original is not None else None,
+                        proposal=proposal_diagnostic,
+                        fallback=fallback_diagnostic,
                     )
             else:
                 metrics.record_review_refinement("inconclusive")

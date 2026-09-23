@@ -32,6 +32,7 @@ from app.services.openai_adapter import (
     is_review_request,
     parse_candidate_bounds,
     run_chat_completion,
+    sanitize_review_range_diagnostic,
 )
 from app.services.runtime_settings import RuntimeSettingsError, effective_from_settings
 from app.utils.metrics import metrics
@@ -228,27 +229,54 @@ _METRIC_REASONS = frozenset(
 )
 
 
+def _finite_number(value: Any) -> float | int | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return value
+    return None
+
+
 def _inconclusive_diagnostics(exc: ReviewInconclusiveError) -> dict[str, Any]:
-    reason = exc.reason if exc.reason in _INCONCLUSIVE_REASONS else "malformed_context"
+    return _inconclusive_diagnostics_from_dict(
+        {
+            key: getattr(exc, key, None)
+            for key in (
+                "reason",
+                "stage",
+                "score",
+                "threshold",
+                "cache_hit",
+                "range_start",
+                "range_end",
+                "start_supported",
+                "end_supported",
+                "proposal",
+                "fallback",
+            )
+        }
+    )
+
+
+def _inconclusive_diagnostics_from_dict(value: dict[str, Any] | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    reason = value.get("reason")
+    stage = value.get("stage")
     details: dict[str, Any] = {
-        "reason": reason,
-        "stage": exc.stage if exc.stage in _INCONCLUSIVE_STAGES else "context",
+        "reason": reason if isinstance(reason, str) and reason in _INCONCLUSIVE_REASONS else "malformed_context",
+        "stage": stage if isinstance(stage, str) and stage in _INCONCLUSIVE_STAGES else "context",
     }
-    for key in ("score", "threshold"):
-        value = getattr(exc, key, None)
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
-            details[key] = value
-    cache_hit = getattr(exc, "cache_hit", None)
-    if isinstance(cache_hit, bool):
-        details["cache_hit"] = cache_hit
-    for key in ("range_start", "range_end"):
-        value = getattr(exc, key, None)
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
-            details[key] = value
-    for key in ("start_supported", "end_supported"):
-        value = getattr(exc, key, None)
-        if isinstance(value, bool):
-            details[key] = value
+    for key in ("score", "threshold", "range_start", "range_end"):
+        number = _finite_number(value.get(key))
+        if number is not None:
+            details[key] = number
+    for key in ("cache_hit", "start_supported", "end_supported"):
+        flag = value.get(key)
+        if isinstance(flag, bool):
+            details[key] = flag
+    for key in ("proposal", "fallback"):
+        diagnostic = sanitize_review_range_diagnostic(value.get(key))
+        if diagnostic is not None:
+            details[key] = diagnostic
     return details
 
 
@@ -262,6 +290,12 @@ def _inconclusive_message(diagnostics: dict[str, Any]) -> str:
         )
         if key in diagnostics
     )
+    for name in ("proposal", "fallback"):
+        diagnostic = sanitize_review_range_diagnostic(diagnostics.get(name))
+        if diagnostic is not None:
+            parts.append(
+                name + "=" + ";".join(f"{key}={value}" for key, value in diagnostic.items())
+            )
     return "Review is inconclusive (" + ", ".join(parts) + ")"
 
 
@@ -282,29 +316,32 @@ def _review_error(
     reason: str | None = None,
     diagnostics: dict[str, Any] | None = None,
 ) -> JSONResponse:
+    safe_diagnostics = _inconclusive_diagnostics_from_dict(diagnostics)
     headers: dict[str, str] = {}
     if status == 422:
         headers["x-should-retry"] = "false"
     if request_id is not None:
         headers["X-Request-ID"] = request_id
         logger.warning(
-            "review request_id=%s status=%d error_code=%s reason=%s stage=%s score=%s threshold=%s cache_hit=%s",
+            "review request_id=%s status=%d error_code=%s reason=%s stage=%s score=%s threshold=%s cache_hit=%s proposal=%s fallback=%s",
             request_id,
             status,
             code,
             reason or "unknown",
-            (diagnostics or {}).get("stage", "unknown"),
-            (diagnostics or {}).get("score", "unknown"),
-            (diagnostics or {}).get("threshold", "unknown"),
-            (diagnostics or {}).get("cache_hit", "unknown"),
+            safe_diagnostics.get("stage", "unknown"),
+            safe_diagnostics.get("score", "unknown"),
+            safe_diagnostics.get("threshold", "unknown"),
+            safe_diagnostics.get("cache_hit", "unknown"),
+            safe_diagnostics.get("proposal", "unknown"),
+            safe_diagnostics.get("fallback", "unknown"),
         )
     error: dict[str, Any] = {
         "message": message,
         "type": "invalid_request_error" if status == 422 else "api_error",
         "code": code,
     }
-    if diagnostics:
-        error.update(diagnostics)
+    if safe_diagnostics:
+        error.update(safe_diagnostics)
     return JSONResponse(
         status_code=status,
         content={"error": error},

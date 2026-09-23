@@ -190,10 +190,13 @@ def test_unsupported_original_can_trim_to_word_supported_range(jev_env, tmp_path
     ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
     assert (ad["start"], ad["end"]) == (93.9, 100.0)
     assert focused_ranges == [
-        "The complete proposed advertising interval is 93.90s-100.00s. "
-        "Confirm only when the supplied transcript supports the entire interval as "
-        "advertising and excludes neighboring editorial content. Abstain when either "
-        "boundary or any interior portion lacks observed transcript evidence."
+        "The reference candidate interval is 90.00s-110.00s. "
+        "Assess only assessment_range 93.90s-100.00s. "
+        "Confirm only when its boundaries are supported, all observed speech within "
+        "the assessed interval is advertising under the supplied guidance, and it "
+        "excludes neighboring editorial content. Timestamp gaps alone do not establish "
+        "missing speech or editorial content: do not assume silence or invent content. "
+        "Abstain when missing evidence prevents judging the complete interval."
     ]
     refinement = metrics.snapshot()["review"]["refinement"]
     assert refinement["attempted"] == 1
@@ -252,11 +255,16 @@ def test_zero_duration_word_supports_selected_endpoint_outside_coarse_context(
     assert len(focused_payloads) == 1
     focused = focused_payloads[0]
     assert focused["questions"]["proposed_range"]["instructions"] == (
-        "The complete proposed advertising interval is 93.90s-110.00s. "
-        "Confirm only when the supplied transcript supports the entire interval as "
-        "advertising and excludes neighboring editorial content. Abstain when either "
-        "boundary or any interior portion lacks observed transcript evidence."
+        "The reference candidate interval is 90.00s-110.00s. "
+        "Assess only assessment_range 93.90s-110.00s. "
+        "Confirm only when its boundaries are supported, all observed speech within "
+        "the assessed interval is advertising under the supplied guidance, and it "
+        "excludes neighboring editorial content. Timestamp gaps alone do not establish "
+        "missing speech or editorial content: do not assume silence or invent content. "
+        "Abstain when missing evidence prevents judging the complete interval."
     )
+    assert focused["state"]["candidate"] == {"start": 90.0, "end": 110.0}
+    assert focused["state"]["assessment_range"] == {"start": 93.9, "end": 110.0}
     assert [(row["start"], row["end"]) for row in focused["state"]["timeline"]] == [
         (80.0, 89.9),
         (94.0, 100.0),
@@ -1170,15 +1178,48 @@ def test_low_proposal_with_confirmed_original_keeps_original(jev_env, tmp_path):
 
 def test_low_proposal_and_original_are_inconclusive(jev_env, tmp_path):
     select = _select_pair_fake(106.0, 120.0)
+    states = {}
 
     def fake(payload, **kwargs):
         result = select(payload, **kwargs)
+        for key in ("evidence", "boundary_start", "proposed_range", "original_range"):
+            if key in payload["questions"]:
+                states[key] = payload["state"]
         if "proposed_range" in payload["questions"] or "original_range" in payload["questions"]:
             result["answers"][next(iter(payload["questions"]))] = {"noul": 0.5}
         return result
 
-    with pytest.raises(ReviewInconclusiveError, match="proposed or original"):
+    with pytest.raises(ReviewInconclusiveError, match="proposed or original") as raised:
         _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+
+    assert raised.value.proposal == {
+        "reason": "proposed_range_not_confirmed",
+        "stage": "focused_validation",
+        "range_start": 106.0,
+        "range_end": 120.0,
+        "score": 0.5,
+        "threshold": 0.95,
+        "cache_hit": False,
+    }
+    assert raised.value.fallback == {
+        "reason": "original_range_not_confirmed",
+        "stage": "focused_validation",
+        "range_start": 100.0,
+        "range_end": 120.0,
+        "score": 0.5,
+        "threshold": 0.95,
+        "cache_hit": False,
+    }
+    assert states["evidence"]["candidate"] == {"start": 100.0, "end": 120.0}
+    assert states["boundary_start"]["candidate"] == {"start": 100.0, "end": 120.0}
+    assert "assessment_range" not in states["evidence"]
+    assert "assessment_range" not in states["boundary_start"]
+    assert states["proposed_range"]["candidate"] == {"start": 100.0, "end": 120.0}
+    assert states["proposed_range"]["assessment_range"] == {"start": 106.0, "end": 120.0}
+    assert states["original_range"]["candidate"] == {"start": 100.0, "end": 120.0}
+    assert states["original_range"]["assessment_range"] == {"start": 100.0, "end": 120.0}
+    assert states["proposed_range"]["timeline"] == states["evidence"]["timeline"]
+    assert states["proposed_range"]["transcript"] == states["evidence"]["transcript"]
 
 
 def test_unsupported_original_cannot_be_confirmed_unchanged(jev_env, tmp_path):
@@ -1266,6 +1307,75 @@ def test_low_proposal_logs_score_before_unsupported_original_fallback(
     assert refinement["attempted"] == 1
     assert refinement["inconclusive"] == 1
     assert refinement["completed"] == 0
+
+
+async def test_review_api_reports_proposal_and_coverage_fallback_diagnostics(
+    jev_env, client, monkeypatch
+):
+    monkeypatch.setattr(settings, "JEV_REVIEW_REFINE_BOUNDARIES", True)
+    normal = make_text_fake()
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if "boundary_start" in payload["questions"]:
+            for key, target in (("boundary_start", 93.9), ("boundary_end", 100.0)):
+                criteria = payload["questions"][key]["criteria"]
+                option = next(name for name, text in criteria.items() if f"{target:.2f}s" in text)
+                result["answers"][key]["choice"] = option
+                result["answers"][key]["probabilities"] = {
+                    name: 0.99 if name == option else 0.01 / (len(criteria) - 1)
+                    for name in criteria
+                }
+        if "proposed_range" in payload["questions"]:
+            result["answers"]["proposed_range"] = {"noul": 0.5}
+        return result
+
+    monkeypatch.setattr(jev, "call_payload", fake)
+    prompt = build_review_prompt(
+        90.0,
+        110.0,
+        [(80.0, 89.9, "earlier context")],
+        [(94.0, 100.0, "This episode is sponsored by BetterHelp")],
+        [(100.0, 120.0, "context after")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[93.9s-94.1s] sponsor\n"
+        "End edge:\n[100.0s-100.0s] sponsor\n"
+    )
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": prompt}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    error = response.json()["error"]
+    assert response.status_code == 422
+    assert response.headers["x-should-retry"] == "false"
+    assert response.headers["x-request-id"]
+    assert error["reason"] == "missing_boundary_coverage"
+    assert error["proposal"] == {
+        "reason": "proposed_range_not_confirmed",
+        "stage": "focused_validation",
+        "range_start": 93.9,
+        "range_end": 100.0,
+        "score": 0.5,
+        "threshold": 0.95,
+        "cache_hit": False,
+    }
+    assert error["fallback"] == {
+        "reason": "missing_boundary_coverage",
+        "stage": "boundary_coverage",
+        "range_start": 90.0,
+        "range_end": 110.0,
+        "start_supported": False,
+        "end_supported": True,
+    }
+    assert "score" not in error["fallback"]
+    assert "proposal=reason=proposed_range_not_confirmed" in error["message"]
+    assert "fallback=reason=missing_boundary_coverage" in error["message"]
+    review = metrics.snapshot()["review"]
+    assert review["outcomes"]["inconclusive"] == 1
+    assert sum(review["outcomes"].values()) == 1
 
 
 async def test_focused_validation_upstream_failure_preserves_503(
