@@ -435,7 +435,7 @@ def _review_answers(body: dict[str, Any], questions: dict[str, dict[str, Any]]) 
     for key, answer in answers.items():
         if not isinstance(answer, dict):
             raise JevReviewValidationError("answer_object")
-        if key == "evidence":
+        if questions[key].get("type") == "noul":
             value = answer.get("noul")
             numeric = _finite_float(value)
             if numeric is None or not 0 <= numeric <= 1:
@@ -552,9 +552,9 @@ def jev_review_questions(
             return False
         normalized = {"answers": {}, "usage": {"input_tokens": entry.get("input_tokens"), "output_tokens": entry.get("output_tokens")}}
         for key, value in answers.items():
-            if key == "evidence" and isinstance(value, (int, float)) and not isinstance(value, bool):
+            if questions[key].get("type") == "noul" and isinstance(value, (int, float)) and not isinstance(value, bool):
                 normalized["answers"][key] = {"noul": value}
-            elif key != "evidence" and isinstance(value, dict):
+            elif questions[key].get("type") == "choice" and isinstance(value, dict):
                 normalized["answers"][key] = value
             else:
                 return False

@@ -5,8 +5,9 @@ from typing import Any
 
 import httpx
 import pytest
-from app.api.openai import _inconclusive_reason
+from app.api.openai import _inconclusive_diagnostics, _metric_inconclusive_reason
 from app.services.jev import call_payload, jev_ask
+from app.services.openai_adapter import ReviewInconclusiveError
 from app.utils.metrics import metrics
 
 ANSWER: dict[str, Any] = {
@@ -144,8 +145,18 @@ def test_review_metrics_use_fixed_safe_values_and_reset():
 
 
 def test_no_valid_pairs_reason_and_refinement_skip_are_reported():
-    assert _inconclusive_reason("Jev boundary search had no valid pairs") == "no_valid_pairs"
-    assert _inconclusive_reason("candidate lies in a transcript gap") == "transcript_gap"
+    pairs_error = ReviewInconclusiveError(
+        "not used for classification", reason="no_valid_pairs", stage="choice_rank"
+    )
+    gap_error = ReviewInconclusiveError(
+        "not used for classification", reason="transcript_gap", stage="context"
+    )
+    pairs = _inconclusive_diagnostics(pairs_error)
+    gap = _inconclusive_diagnostics(gap_error)
+    assert pairs["reason"] == "no_valid_pairs"
+    assert gap["reason"] == "transcript_gap"
+    assert _metric_inconclusive_reason(pairs) == "no_valid_pairs"
+    assert _metric_inconclusive_reason(gap) == "transcript_gap"
     metrics.record_review("inconclusive", 5.0, "no_valid_pairs")
     metrics.record_review_refinement("skipped", skip_reason="no_valid_pairs")
     metrics.record_review("inconclusive", 5.0, "transcript_gap")

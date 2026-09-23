@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.10 - 2026-09-23
+
+- Recover valid ad candidates when supplied word timings expose a gap in transcript segmentation. Candidates still inside the supplied context with no segment overlap return `422 jev_review_inconclusive` without Jev calls.
+- Rank inward boundary choices, then validate the proposed complete cut with a focused NouL. If the adjustment is uncertain, confirm the original cut only after validating it independently.
+- Keep review evidence and boundary validation thresholds unchanged. Cache behavior is unchanged.
+- Include safe reason, stage, and available score, threshold, and cache-hit diagnostics in inconclusive review responses and logs, without request text.
+
 ## 0.1.9 - 2026-09-23
 
 - Return `422 jev_review_inconclusive` when a valid candidate inside the coarse context overlaps no segment. Skip Jev calls and boundary-selection attempts, and count the inconclusive outcome, reason, and skip.

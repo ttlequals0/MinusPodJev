@@ -71,6 +71,39 @@ class ReviewUnavailableError(RuntimeError):
 class ReviewInconclusiveError(ReviewUnavailableError):
     """The valid review input did not support a safe verdict."""
 
+    _REASONS = frozenset(
+        {
+            "transcript_gap",
+            "ambiguous_spans",
+            "insufficient_evidence",
+            "no_valid_pairs",
+            "choice_inconclusive",
+            "invalid_pair",
+            "proposed_range_not_confirmed",
+            "original_range_not_confirmed",
+        }
+    )
+    _STAGES = frozenset({"context", "evidence", "choice_rank", "focused_validation"})
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        stage: str,
+        score: float | None = None,
+        threshold: float | None = None,
+        cache_hit: bool | None = None,
+    ):
+        self.reason = reason if reason in self._REASONS else "choice_inconclusive"
+        self.stage = stage if stage in self._STAGES else "context"
+        self.score = score if isinstance(score, (int, float)) and math.isfinite(score) else None
+        self.threshold = (
+            threshold if isinstance(threshold, (int, float)) and math.isfinite(threshold) else None
+        )
+        self.cache_hit = cache_hit if isinstance(cache_hit, bool) else None
+        super().__init__(message)
+
 
 class ReviewInvalidRequestError(ReviewUnavailableError):
     """The caller's review framing cannot be evaluated."""
@@ -467,14 +500,62 @@ def parse_review_segments(text: str) -> list[dict[str, Any]]:
     return parse_review_context(text)[0]
 
 
-def _review_unavailable(pool: str, reason: str, review_request_id: str | None) -> NoReturn:
+def _review_unavailable(
+    pool: str,
+    message: str,
+    review_request_id: str | None,
+    *,
+    reason: str,
+    stage: str,
+    score: float | None = None,
+    threshold: float | None = None,
+    cache_hit: bool | None = None,
+) -> NoReturn:
     logger.warning(
         "review request_id=%s unavailable reason=%s pool=%s",
         review_request_id,
-        reason,
+        message,
         pool,
     )
-    raise ReviewInconclusiveError(reason)
+    raise ReviewInconclusiveError(
+        message,
+        reason=reason,
+        stage=stage,
+        score=score,
+        threshold=threshold,
+        cache_hit=cache_hit,
+    )
+
+
+def _covers_boundary(segments: Sequence[dict[str, Any]], value: float) -> bool:
+    return any(float(segment["start"]) <= value <= float(segment["end"]) for segment in segments)
+
+
+def _range_boundaries_observed(segments: Sequence[dict[str, Any]], value: tuple[float, float]) -> bool:
+    return _covers_boundary(segments, value[0]) and _covers_boundary(segments, value[1])
+
+
+def _recover_review_segments(
+    segments: Sequence[dict[str, Any]], word_edges: dict[str, list[dict[str, Any]]]
+) -> list[dict[str, Any]]:
+    """Use only complete, positive-duration edge words that fill coarse gaps."""
+    recovered = [dict(segment) for segment in segments]
+    coarse = [(float(segment["start"]), float(segment["end"])) for segment in recovered]
+    seen: set[tuple[float, float, str]] = set()
+    for edge in ("start", "end"):
+        for word in word_edges[edge]:
+            start, end = float(word["start"]), float(word["end"])
+            key = (start, end, str(word.get("text", "")))
+            if key in seen or end <= start:
+                continue
+            seen.add(key)
+            if all(end <= covered_start or start >= covered_end for covered_start, covered_end in coarse):
+                recovered.append({"start": start, "end": end, "text": key[2]})
+                coarse.append((start, end))
+    recovered.sort(key=lambda segment: (float(segment["start"]), float(segment["end"]), str(segment["text"])))
+    for sid, segment in enumerate(recovered):
+        segment["sid"] = sid
+    return recovered
 
 
 def _review_state(
@@ -644,18 +725,19 @@ def _rank_questions(
     )
 
 
-def _shortlist_boundaries(
-    answer: dict[str, Any], values: dict[str, float], original: float
-) -> list[float]:
-    probabilities = answer["probabilities"]
-    ranked = sorted(
-        (key for key in values if probabilities.get(key, 0.0) > 0.0),
-        key=lambda key: (-float(probabilities[key]), values[key], key),
-    )[:2]
-    selected = [values[key] for key in ranked]
-    if original in values.values() and original not in selected:
-        selected.append(original)
-    return sorted(set(selected))
+def _focused_range_question(name: str, proposed: tuple[float, float]) -> dict[str, dict[str, Any]]:
+    start, end = proposed
+    return {
+        name: {
+            "type": "noul",
+            "instructions": (
+                f"The complete proposed advertising interval is {start:.2f}s-{end:.2f}s. "
+                "Confirm only when the supplied transcript supports the entire interval as "
+                "advertising and excludes neighboring editorial content. Abstain when either "
+                "boundary or any interior portion lacks observed transcript evidence."
+            ),
+        }
+    }
 
 
 def _valid_pairs(
@@ -678,30 +760,6 @@ def _valid_pairs(
             ):
                 pairs.append((start, end))
     return pairs
-
-
-def _pair_questions(
-    word_edges: dict[str, list[dict[str, Any]]],
-    cand: tuple[float, float],
-    pair_options: Sequence[tuple[float, float]],
-) -> tuple[dict[str, dict[str, Any]], dict[str, tuple[float, float]]]:
-    """Build one bounded Choice over the ranked, valid boundary pairs."""
-    pairs: dict[str, tuple[float, float]] = {}
-    for pair in pair_options:
-        pairs[f"pair_{len(pairs):02d}"] = pair
-    criteria = {"unknown": "No proposed range is supported by the transcript."}
-    for option, (start, end) in pairs.items():
-        criteria[option] = (
-            f"Ad {start:.2f}s-{end:.2f}s; start {_edge_reference(word_edges['start'], start, 'start', cand[0])}; "
-            f"end {_edge_reference(word_edges['end'], end, 'end', cand[1])}."
-        )
-    return {
-        "boundary_pair": {
-            "type": "choice",
-            "instructions": "Choose the complete ad range that includes advertising and excludes neighboring editorial content. Consult the supplied transcript context. Choose unknown when none is supported.",
-            "criteria": criteria,
-        }
-    }, pairs
 
 
 def run_review(
@@ -737,9 +795,10 @@ def run_review(
     pool = _review_pool(text)
     cand = parse_candidate_bounds(text)
     try:
-        segments, word_edges = parse_review_context(text)
+        coarse_segments, word_edges = parse_review_context(text)
     except ValueError as exc:
         raise ReviewInvalidRequestError("malformed review transcript context") from exc
+    segments = _recover_review_segments(coarse_segments, word_edges)
     if cand is None or not all(math.isfinite(value) for value in cand) or cand[1] <= cand[0] or not segments:
         raise ReviewInvalidRequestError("candidate bounds or transcript could not be parsed")
     context_start = min(float(segment["start"]) for segment in segments)
@@ -768,7 +827,13 @@ def run_review(
                 context_start,
                 context_end,
             )
-            _review_unavailable(pool, "candidate lies in a transcript gap", review_request_id)
+            _review_unavailable(
+                pool,
+                "candidate lies in a transcript gap",
+                review_request_id,
+                reason="transcript_gap",
+                stage="context",
+            )
         raise ReviewInvalidRequestError("candidate does not overlap the review transcript")
 
     try:
@@ -840,7 +905,13 @@ def run_review(
             cand_start,
             cand_end,
         )
-        _review_unavailable(pool, "Jev did not produce one unambiguous overlapping span", review_request_id)
+        _review_unavailable(
+            pool,
+            "Jev did not produce one unambiguous overlapping span",
+            review_request_id,
+            reason="ambiguous_spans",
+            stage="context",
+        )
 
     ad_start, ad_end, confidence = overlapping[0]
     state = _review_state(segments, word_edges, cand, guidance)
@@ -915,7 +986,16 @@ def run_review(
             cand_start,
             cand_end,
         )
-        _review_unavailable(pool, "Jev did not find sufficient advertising evidence", review_request_id)
+        _review_unavailable(
+            pool,
+            "Jev did not find sufficient advertising evidence",
+            review_request_id,
+            reason="insufficient_evidence",
+            stage="evidence",
+            score=evidence_score,
+            threshold=review_evidence_enter,
+            cache_hit=bool(evidence["cache_hit"]),
+        )
 
     if not refine_boundaries:
         metrics.record_review_refinement("skipped", skip_reason="disabled")
@@ -932,6 +1012,16 @@ def run_review(
             review_request_id,
             cand_start,
             cand_end,
+        )
+    elif not _range_boundaries_observed(segments, cand):
+        metrics.record_review_refinement("inconclusive")
+        _review_unavailable(
+            pool,
+            "Jev cannot confirm the original complete range without observed boundaries",
+            review_request_id,
+            reason="original_range_not_confirmed",
+            stage="focused_validation",
+            threshold=review_choice_enter,
         )
     else:
         starts, ends = _boundary_candidates(segments, word_edges, cand)
@@ -952,7 +1042,13 @@ def run_review(
                 len(starts),
                 len(ends),
             )
-            _review_unavailable(pool, "Jev boundary search had no valid pairs", review_request_id)
+            _review_unavailable(
+                pool,
+                "Jev boundary search had no valid pairs",
+                review_request_id,
+                reason="no_valid_pairs",
+                stage="choice_rank",
+            )
         starts = sorted({start for start, _ in candidate_pairs})
         ends = sorted({end for _, end in candidate_pairs})
         metrics.record_review_refinement("attempted")
@@ -968,115 +1064,98 @@ def run_review(
             start_answer = ranked["answers"]["boundary_start"]
             end_answer = ranked["answers"]["boundary_end"]
             logger.info(
-                "review request_id=%s stage=choice_rank start_choice=%s start_confidence=%s end_choice=%s end_confidence=%s start_candidates=%d end_candidates=%d",
+                "review request_id=%s stage=choice_rank start_choice=%s start_score=%s end_choice=%s end_score=%s threshold=%s cache_hit=%s",
                 review_request_id,
                 start_answer["choice"],
-                float(start_answer["confidence"]),
+                start_answer["confidence"],
                 end_answer["choice"],
-                float(end_answer["confidence"]),
-                len(starts),
-                len(ends),
-            )
-            if start_answer["choice"] == "unknown" or end_answer["choice"] == "unknown":
-                metrics.record_review_refinement("inconclusive")
-                logger.info(
-                    "review request_id=%s refinement=failed reason=choice_inconclusive original_start=%.3f original_end=%.3f",
-                    review_request_id,
-                    cand_start,
-                    cand_end,
-                )
-                _review_unavailable(pool, "Jev boundary Choice ranking was inconclusive", review_request_id)
-            shortlisted_starts = _shortlist_boundaries(start_answer, start_values, cand_start)
-            shortlisted_ends = _shortlist_boundaries(end_answer, end_values, cand_end)
-            final_pairs = _valid_pairs(
-                shortlisted_starts,
-                shortlisted_ends,
-                cand,
-                (ad_start, ad_end),
-                context_start,
-                context_end,
-            )
-            if not final_pairs:
-                metrics.record_review_refinement("inconclusive")
-                logger.info(
-                    "review request_id=%s refinement=failed reason=no_valid_pairs original_start=%.3f original_end=%.3f context_start=%.3f context_end=%.3f corroborated_start=%.3f corroborated_end=%.3f start_candidates=%d end_candidates=%d",
-                    review_request_id,
-                    cand_start,
-                    cand_end,
-                    context_start,
-                    context_end,
-                    ad_start,
-                    ad_end,
-                    len(shortlisted_starts),
-                    len(shortlisted_ends),
-                )
-                _review_unavailable(pool, "Jev boundary search had no valid pairs", review_request_id)
-            questions, pairs = _pair_questions(word_edges, cand, final_pairs)
-            result = review_questions(questions, "choice_pair")
-            answer = result["answers"]["boundary_pair"]
-            choice = answer["choice"]
-            logger.info(
-                "review request_id=%s stage=choice_pair choice=%s confidence=%s threshold=%s",
-                review_request_id,
-                choice,
-                float(answer["confidence"]),
+                end_answer["confidence"],
                 review_choice_enter,
+                ranked["cache_hit"],
             )
+            proposed = (cand_start, cand_end)
+            if start_answer["choice"] != "unknown" and end_answer["choice"] != "unknown":
+                selected = (start_values[start_answer["choice"]], end_values[end_answer["choice"]])
+                if selected in candidate_pairs:
+                    proposed = selected
+            focused_name = "proposed_range" if proposed != cand else "original_range"
+            focused = None
+            focused_score = None
+            if _range_boundaries_observed(segments, proposed):
+                focused = review_questions(
+                    _focused_range_question(focused_name, proposed), "focused_validation"
+                )
+                focused_score = float(focused["answers"][focused_name])
+                logger.info(
+                    "review request_id=%s stage=focused_validation range=%s score=%s threshold=%s cache_hit=%s",
+                    review_request_id,
+                    proposed,
+                    focused_score,
+                    review_choice_enter,
+                    focused["cache_hit"],
+                )
+            if focused_score is not None and focused_score >= review_choice_enter:
+                ad_start, ad_end = proposed
+                metrics.record_review_refinement(
+                    "completed",
+                    changed=abs(proposed[0] - cand_start) > 0.1 or abs(proposed[1] - cand_end) > 0.1,
+                )
+                logger.info(
+                    "review request_id=%s refinement=completed original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f",
+                    review_request_id, cand_start, cand_end, ad_start, ad_end,
+                )
+            elif proposed != cand:
+                original = None
+                original_score = None
+                if _range_boundaries_observed(segments, cand):
+                    original = review_questions(
+                        _focused_range_question("original_range", cand), "focused_validation"
+                    )
+                    original_score = float(original["answers"]["original_range"])
+                    logger.info(
+                        "review request_id=%s stage=focused_validation range=%s score=%s threshold=%s cache_hit=%s",
+                        review_request_id,
+                        cand,
+                        original_score,
+                        review_choice_enter,
+                        original["cache_hit"],
+                    )
+                if original_score is not None and original_score >= review_choice_enter:
+                    ad_start, ad_end = cand
+                    metrics.record_review_refinement("completed", changed=False)
+                    logger.info(
+                        "review request_id=%s refinement=completed original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f",
+                        review_request_id, cand_start, cand_end, ad_start, ad_end,
+                    )
+                else:
+                    metrics.record_review_refinement("inconclusive")
+                    _review_unavailable(
+                        pool,
+                        "Jev did not confirm the proposed or original complete range",
+                        review_request_id,
+                        reason="original_range_not_confirmed",
+                        stage="focused_validation",
+                        score=original_score,
+                        threshold=review_choice_enter,
+                        cache_hit=bool(original["cache_hit"]) if original is not None else None,
+                    )
+            else:
+                metrics.record_review_refinement("inconclusive")
+                _review_unavailable(
+                    pool,
+                    "Jev did not confirm the original complete range",
+                    review_request_id,
+                    reason="original_range_not_confirmed",
+                    stage="focused_validation",
+                    score=focused_score,
+                    threshold=review_choice_enter,
+                    cache_hit=bool(focused["cache_hit"]) if focused is not None else None,
+                )
         except ReviewInconclusiveError:
             raise
-        except (
-            ReviewUnavailableError,
-            httpx.HTTPStatusError,
-            httpx.TimeoutException,
-            httpx.TransportError,
-        ):
+        except (ReviewUnavailableError, httpx.HTTPStatusError, httpx.TimeoutException, httpx.TransportError):
             metrics.record_review_refinement("upstream_error")
-            logger.info(
-                "review request_id=%s refinement=failed reason=upstream_error original_start=%.3f original_end=%.3f",
-                review_request_id,
-                cand_start,
-                cand_end,
-            )
             raise
-        if answer["confidence"] < review_choice_enter or choice == "unknown":
-            metrics.record_review_refinement("inconclusive")
-            logger.info(
-                "review request_id=%s refinement=failed reason=choice_inconclusive original_start=%.3f original_end=%.3f",
-                review_request_id,
-                cand_start,
-                cand_end,
-            )
-            _review_unavailable(pool, "Jev boundary Choice was inconclusive", review_request_id)
-        refined_start, refined_end = pairs[choice]
-        if (
-            refined_end <= refined_start
-            or refined_start < context_start
-            or refined_end > context_end
-            or min(refined_end, cand_end) <= max(refined_start, cand_start)
-            or min(refined_end, ad_end) <= max(refined_start, ad_start)
-        ):
-            metrics.record_review_refinement("inconclusive")
-            logger.info(
-                "review request_id=%s refinement=failed reason=invalid_pair original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f",
-                review_request_id,
-                cand_start,
-                cand_end,
-                refined_start,
-                refined_end,
-            )
-            _review_unavailable(pool, "Jev boundary Choice returned an invalid pair", review_request_id)
-        changed = abs(refined_start - cand_start) > 0.1 or abs(refined_end - cand_end) > 0.1
-        metrics.record_review_refinement("completed", changed=changed)
-        logger.info(
-            "review request_id=%s refinement=completed reason=%s original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f",
-            review_request_id,
-            "changed" if changed else "unchanged",
-            cand_start,
-            cand_end,
-            refined_start,
-            refined_end,
-        )
-        ad_start, ad_end = refined_start, refined_end
     verdict = {
         "is_ad": True,
         "start": ad_start,

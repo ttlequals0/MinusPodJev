@@ -53,9 +53,9 @@ This is a recommended POC configuration, not a change applied to MinusPod by thi
 | `JEV_ENTER` | `detection_enter` | `0.95` | opens an ad span; editable at runtime |
 | `JEV_STAY` | `detection_stay` | `0.40` | extends an open span; editable at runtime |
 | `JEV_REVIEW_EVIDENCE_THRESHOLD` | `review_evidence` | `JEV_ENTER` when unset | gates advertising evidence before refinement |
-| `JEV_REVIEW_CHOICE_THRESHOLD` | `review_choice` | `JEV_ENTER` when unset | gates the selected boundary pair |
+| `JEV_REVIEW_CHOICE_THRESHOLD` | `review_choice` | `JEV_ENTER` when unset | gates boundary validation |
 
-These are `0` to `1` probability scores, not measured accuracy. Detection enter must be at least `JEV_STAY`; review evidence and Choice thresholds are independent of detection enter.
+These are `0` to `1` scores, not measured accuracy. Detection enter must be at least `JEV_STAY`; review evidence and boundary validation thresholds are independent of detection enter.
 
 ### Save and authentication
 
@@ -89,17 +89,18 @@ The category pass uses one Jev Choice for each detected span. Its values are `sp
 ## Review behavior
 
 - Jev review is correlated with Jev detection, not an independent judgment. It uses coarse context and separate word timing.
-- A valid candidate inside coarse context with no segment overlap is a transcript gap. It returns `422 jev_review_inconclusive` and `x-should-retry: false`, without calling Jev or starting boundary selection.
-- Metrics count the inconclusive outcome, `review.reasons.transcript_gap`, and `review.refinement.skipped.transcript_gap`. Missing, malformed, and entirely out-of-context candidates remain invalid requests.
+- Word timings can recover a valid candidate missed by transcript segmentation. If a candidate inside the supplied context still overlaps no segment, it is a transcript gap and returns `422 jev_review_inconclusive` with `x-should-retry: false`, without calling Jev. Missing, malformed, and entirely out-of-context candidates remain invalid requests.
+- Metrics count the inconclusive outcome, `review.reasons.transcript_gap`, and `review.refinement.skipped.transcript_gap`.
 - The evidence NouL adds an upstream call unless cached.
 - `JEV_REVIEW_REFINE_BOUNDARIES=false` disables boundary refinement by default. Set it to `true` to search inward from the current boundaries.
 - After the evidence gate, the proxy checks inward trim targets every 2 seconds, up to 30 seconds. It snaps targets to supplied word-start or word-end timestamps and removes duplicates. It also keeps the current boundary and the closest meaningful outward option.
-- One Jev request ranks start and end candidates together. The final request chooses among the two strongest positive-probability candidates per edge, plus the current boundary. This yields at most 9 pairs plus unknown.
-- Unknown ranking or final choices, and low-confidence final choices, return 422 with `x-should-retry: false` and do not confirm or move the candidate. The final Choice threshold is unchanged.
+- A Jev Choice ranks start and end candidates together. The strongest start and end choices define a proposed cut, which a focused NouL validates as a complete range.
+- If the proposed cut fails validation, the proxy checks the original cut with a separate focused NouL. It confirms the original only if that check passes.
+- The existing `JEV_REVIEW_CHOICE_THRESHOLD` value gates the focused NouL score for complete-range validation. Its value and default are unchanged, but its meaning differs from the former Choice confidence threshold. Neither threshold measures accuracy.
 - Refinement still needs both word edges, sufficient evidence, context coverage and overlap, and the shared request deadline. Cache hits and retries follow the same policy as other Jev calls. The search steps and 30-second range are proxy policy; Jev's upstream Choice limit remains 255.
-- Boundary refinement is experimental and does not claim a quality improvement. It adds one upstream round over the earlier flow unless cache hits avoid requests. No new environment setting controls the search policy.
-- `GET /api/status` reports effective enabled state, model, evidence threshold, and Choice threshold. Enabled does not guarantee refinement: word timings, sufficient evidence, and a confident pair selection are required.
-- Review-abstention and API-error logs include the existing `X-Request-ID`. Review logs also include stage, evidence score and threshold, candidate counts, boundary selections, Choice confidence, and skip or failure reason. Attempt counts cover actual boundary selections, not empty candidate sets. A `no_valid_pairs` result before ranking is a skip; after ranking it is inconclusive.
+- Boundary refinement is experimental and makes no accuracy claim. After the evidence check, it uses one ranking Choice and one focused validation NouL. If the proposed cut fails validation, it also checks the original cut. Cache hits may satisfy any of these questions; cache behavior is unchanged. No new environment setting controls the search policy.
+- `GET /api/status` reports effective enabled state, model, evidence threshold, and boundary validation threshold. Enabled does not guarantee refinement: word timings, sufficient evidence, and valid boundary choices are required.
+- Review-abstention and API-error logs include the existing `X-Request-ID`. Inconclusive response details and logs include reason and stage, plus score, threshold, and cache-hit status when available. These diagnostics do not include request text. Review logs also include boundary selections and skip or failure reason. Attempt counts cover actual boundary selections, not empty candidate sets. `no_valid_pairs` before ranking is a skip.
 - Changed counts are recommendations, not confirmed applied cuts. MinusPod may clamp or reject them to protect DAI cores.
 - MinusPod's local breaker still counts non-rate errors. Review preserves upstream `4xx` responses, including `429`. A valid `Retry-After` header is forwarded for upstream `408`, `429`, and `5xx` responses. Timeouts return `504`; transport and upstream `5xx` failures return `503`. Invalid review responses return `503`.
 

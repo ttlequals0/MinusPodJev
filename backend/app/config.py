@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     # Application
     APP_NAME: str = Field(default="Jev Proxy", description="Application name")
-    APP_VERSION: str = Field(default="0.1.9", description="Application version")
+    APP_VERSION: str = Field(default="0.1.10", description="Application version")
     APP_DESCRIPTION: str = Field(
         default="Thin HTTP proxy around the TypeSafe Jev System One endpoint",
         description="Application description",
@@ -98,7 +98,7 @@ class Settings(BaseSettings):
         ge=0.0,
         le=1.0,
         allow_inf_nan=False,
-        description="Review Choice threshold; defaults to JEV_ENTER",
+        description="Review boundary validation threshold; defaults to JEV_ENTER",
     )
     JEV_SETTINGS_PATH: str = Field(
         default="./data/runtime-settings.json",
@@ -106,7 +106,7 @@ class Settings(BaseSettings):
     )
     JEV_REVIEW_REFINE_BOUNDARIES: bool = Field(
         default=False,
-        description="Use Jev Choice questions and supplied word timings to refine review boundaries",
+        description="Rank timed boundary choices, then validate the proposed cut with a focused NouL",
     )
     JEV_CATEGORY_PASS: bool = Field(
         default=True, description="Run the per-span category second pass"

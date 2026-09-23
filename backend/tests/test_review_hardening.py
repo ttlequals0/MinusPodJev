@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from app.config import settings
 from app.services.jev import jev_review_questions
-from app.services.openai_adapter import _pair_questions, _review_state
+from app.services.openai_adapter import _focused_range_question, _review_state
 from app.utils.cache import hash_payload
 from app.utils.metrics import metrics
 
@@ -110,6 +110,22 @@ def test_review_helper_rejects_cache_entry_with_missing_usage(tmp_path):
     result = _review_call(tmp_path, fetcher, questions)
     assert result["cache_hit"] is False
     assert calls == 1
+
+
+def test_review_helper_accepts_focused_noul_and_validates_its_cache(tmp_path):
+    questions = {
+        "proposed_range": {
+            "type": "noul",
+            "instructions": "The proposed complete range is advertising.",
+        }
+    }
+
+    def fetcher(_payload, **_kwargs):
+        return {"answers": {"proposed_range": {"noul": 0.99}}, "usage": {"input_tokens": 3, "output_tokens": 2}}
+
+    result = _review_call(tmp_path, fetcher, questions)
+
+    assert result["answers"]["proposed_range"] == 0.99
 
 
 @pytest.mark.parametrize("pool", ["accepted", "resurrection"])
@@ -234,19 +250,12 @@ def test_pair_choice_keeps_all_supplied_words_in_shared_state():
     assert state["boundary_words"]["end"] == words
 
 
-def test_pair_choice_has_unknown_and_a_concrete_keep_candidate():
-    words = [
-        {"start": word["start"], "end": word["end"], "text": word["word"].strip()}
-        for word in _segments("ep-daily-tech-news-show-c1904b8605f7")[0]["words"][:1]
-    ]
+def test_focused_range_question_requires_complete_observed_support():
+    question = _focused_range_question("proposed_range", (10.0, 20.0))
 
-    questions, pairs = _pair_questions(
-        {"start": words, "end": words},
-        (words[0]["start"], words[0]["end"]),
-        [(words[0]["start"], words[0]["end"])],
-    )
-    assert "unknown" in questions["boundary_pair"]["criteria"]
-    assert pairs
+    assert question["proposed_range"]["type"] == "noul"
+    assert "entire interval" in question["proposed_range"]["instructions"]
+    assert "interior portion lacks observed transcript evidence" in question["proposed_range"]["instructions"]
 
 
 def _corpus_prompt(

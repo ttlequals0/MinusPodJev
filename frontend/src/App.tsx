@@ -371,19 +371,19 @@ function ReviewCard({
         <Definition label="Boundary refinement" value={settings?.refine_boundaries == null ? 'Not reported' : settings.refine_boundaries ? 'Enabled' : 'Disabled'} tone={settings?.refine_boundaries ? 'success' : undefined} />
         <Definition label="Model" value={settings?.model ?? 'Not reported'} />
         <Definition label="Evidence threshold" value={evidenceThreshold == null ? 'Not reported' : String(evidenceThreshold)} />
-        <Definition label="Choice threshold" value={choiceThreshold == null ? 'Not reported' : String(choiceThreshold)} />
+        <Definition label="Boundary validation threshold" value={choiceThreshold == null ? 'Not reported' : String(choiceThreshold)} />
       </dl>
       <p className="card-note">Enabled does not mean every review runs refinement. Both word-timing edges and sufficient evidence are required.</p>
       {runtimeSettings && draft && <form className="settings-form" onSubmit={onSave}>
         <h4>Runtime thresholds</h4>
-        <p className="card-note">Thresholds are probabilities from 0 to 1. Detection enter must be at least detection stay. Review evidence and Choice are independent. Values apply to new requests; in-flight requests keep existing settings.</p>
-        <dl className="settings-saved"><Definition label="Saved detection enter" value={String(runtimeSettings.thresholds.detection_enter)} /><Definition label="Saved detection stay" value={String(runtimeSettings.thresholds.detection_stay)} /><Definition label="Saved review evidence" value={String(runtimeSettings.thresholds.review_evidence)} /><Definition label="Saved review Choice" value={String(runtimeSettings.thresholds.review_choice)} /><Definition label="Persistence" value={runtimeSettings.persisted ? 'Saved override' : 'Environment defaults'} /></dl>
-        <p className="card-note">Environment defaults: detection enter {String(runtimeSettings.defaults.detection_enter)}, detection stay {String(runtimeSettings.defaults.detection_stay)}, review evidence {String(runtimeSettings.defaults.review_evidence)}, review Choice {String(runtimeSettings.defaults.review_choice)}.</p>
+        <p className="card-note">Thresholds are scores from 0 to 1, not accuracy measurements. Detection enter must be at least detection stay. Review evidence and boundary validation are independent. Values apply to new requests; in-flight requests keep existing settings.</p>
+        <dl className="settings-saved"><Definition label="Saved detection enter" value={String(runtimeSettings.thresholds.detection_enter)} /><Definition label="Saved detection stay" value={String(runtimeSettings.thresholds.detection_stay)} /><Definition label="Saved review evidence" value={String(runtimeSettings.thresholds.review_evidence)} /><Definition label="Saved boundary validation" value={String(runtimeSettings.thresholds.review_choice)} /><Definition label="Persistence" value={runtimeSettings.persisted ? 'Saved override' : 'Environment defaults'} /></dl>
+        <p className="card-note">Environment defaults: detection enter {String(runtimeSettings.defaults.detection_enter)}, detection stay {String(runtimeSettings.defaults.detection_stay)}, review evidence {String(runtimeSettings.defaults.review_evidence)}, boundary validation {String(runtimeSettings.defaults.review_choice)}.</p>
         <div className="settings-fields">
           <SettingsField id="detection-enter" label="Draft detection enter (JEV_ENTER)" value={draft.detection_enter} min={0} onChange={(value) => onDraftChange('detection_enter', value)} disabled={!runtimeSettings.editable || saving} />
           <SettingsField id="detection-stay" label="Draft detection stay (JEV_STAY)" value={draft.detection_stay} min={0} onChange={(value) => onDraftChange('detection_stay', value)} disabled={!runtimeSettings.editable || saving} />
           <SettingsField id="review-evidence" label="Draft review evidence" value={draft.review_evidence} min={0} onChange={(value) => onDraftChange('review_evidence', value)} disabled={!runtimeSettings.editable || saving} />
-          <SettingsField id="review-choice" label="Draft review Choice" value={draft.review_choice} min={0} onChange={(value) => onDraftChange('review_choice', value)} disabled={!runtimeSettings.editable || saving} />
+          <SettingsField id="review-choice" label="Draft boundary validation" value={draft.review_choice} min={0} onChange={(value) => onDraftChange('review_choice', value)} disabled={!runtimeSettings.editable || saving} />
         </div>
         {runtimeSettings.editable ? <>
           <label className="settings-credential" htmlFor="settings-credential">MinusPod password</label>
@@ -438,12 +438,12 @@ function RefinementStats({ refinement }: { refinement: RefinementStats | undefin
   const skipped = refinement.skipped
   const count = (value: number | undefined) => value == null ? 'Not reported' : value.toLocaleString()
   return <section className="refinement-summary" aria-labelledby="refinement-title">
-    <div className="section-heading"><div><h3 id="refinement-title">Boundary refinement</h3><p>Candidate-pair refinement counters are separate from coarse review outcomes.</p><p>An attempt starts when boundary selection begins. The model ranks expanded start and end candidates, then chooses a valid pair jointly.</p></div></div>
+    <div className="section-heading"><div><h3 id="refinement-title">Boundary refinement</h3><p>Candidate refinement counters are separate from coarse review outcomes.</p><p>An attempt starts when boundary selection begins. Jev ranks start and end choices, then a focused NouL validates the proposed complete cut.</p></div></div>
     <div className="metric-grid">
       <Metric label="Refinement attempts" value={count(refinement.attempted)} detail="Reviews that started boundary selection" />
       <Metric label="Refinement completed" value={count(refinement.completed)} detail={`${count(refinement.changed)} changed, ${count(refinement.unchanged)} unchanged`} />
       <Metric label="Refinement inconclusive" value={count(refinement.inconclusive)} detail="Uncertain selection or invalid boundary pair" />
-      <Metric label="Refinement upstream failures" value={count(refinement.upstream_error)} detail="Choice request failed or returned an invalid response" />
+      <Metric label="Refinement upstream failures" value={count(refinement.upstream_error)} detail="A review question failed or returned an invalid response" />
     </div>
     <article className="card refinement-skips"><h4>Refinement skipped</h4><dl>
       <Definition label="Disabled" value={count(skipped?.disabled)} />
