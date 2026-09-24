@@ -155,6 +155,11 @@ async def test_review_gap_is_inconclusive_before_upstream(
     assert response.headers["x-should-retry"] == "false"
     request_id = response.headers["x-request-id"]
     assert response.json()["error"]["code"] == "jev_review_inconclusive"
+    error = response.json()["error"]
+    assert error["candidate_start"] == 8.0
+    assert error["candidate_end"] == 9.0
+    assert error["context_start"] == float(rows[0]["start"])
+    assert error["context_end"] == float(rows[1]["end"])
     assert called is False
     review_metrics = metrics.snapshot()["review"]
     assert review_metrics["outcomes"]["inconclusive"] == 1
@@ -178,6 +183,85 @@ async def test_review_gap_is_inconclusive_before_upstream(
         f"request_id={request_id} outcome=inconclusive reason=transcript_gap" in message
         for message in messages
     )
+
+
+@pytest.mark.parametrize(
+    "position",
+    ["tail", "head"],
+)
+async def test_review_adjacent_empty_candidate_abstains_before_upstream(
+    jev_env, client, monkeypatch, position
+):
+    import app.services.jev as jev
+
+    called = False
+
+    def fetcher(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("an adjacent empty candidate must not call Jev")
+
+    monkeypatch.setattr(jev, "call_payload", fetcher)
+    rows = _segments("ep-oxide-and-friends-ce789ff5b62e")
+    tail_word = rows[0]["words"][-1]
+    head_word = rows[1]["words"][0]
+    candidate = (float(tail_word["end"]), float(head_word["start"]))
+    edge = tail_word if position == "tail" else head_word
+    edge_name = "End" if position == "tail" else "Start"
+    prompt = build_review_prompt(*candidate, [], [], []) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        f"{edge_name} edge:\n"
+        f"[{edge['start']}s-{edge['end']}s] {edge['word']}\n"
+    )
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": prompt}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == 422
+    assert response.headers["x-should-retry"] == "false"
+    assert response.headers["x-request-id"]
+    error = response.json()["error"]
+    assert error["code"] == "jev_review_inconclusive"
+    assert error["reason"] == "transcript_gap"
+    assert error["stage"] == "context"
+    assert error["candidate_start"] == candidate[0]
+    assert error["candidate_end"] == candidate[1]
+    assert called is False
+    review_metrics = metrics.snapshot()["review"]
+    assert review_metrics["outcomes"]["inconclusive"] == 1
+    assert review_metrics["refinement"]["skipped"]["transcript_gap"] == 1
+
+
+async def test_review_incident_tail_word_endpoint_abstains_before_upstream(
+    jev_env, client, monkeypatch
+):
+    import app.services.jev as jev
+
+    def fetcher(*_args, **_kwargs):
+        raise AssertionError("an adjacent empty candidate must not call Jev")
+
+    monkeypatch.setattr(jev, "call_payload", fetcher)
+    prompt = build_review_prompt(8746.15, 8759.95, [], [], []) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "End edge:\n"
+        "[8746.13s-8746.15s] you.\n"
+    )
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": prompt}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == 422
+    assert response.headers["x-should-retry"] == "false"
+    error = response.json()["error"]
+    assert error["code"] == "jev_review_inconclusive"
+    assert error["reason"] == "transcript_gap"
+    assert error["stage"] == "context"
+    assert error["candidate_start"] == 8746.15
+    assert error["context_end"] == 8746.15
 
 
 @pytest.mark.parametrize(
@@ -216,7 +300,17 @@ async def test_review_outside_or_invalid_bounds_remain_invalid_request(
     assert response.status_code == 422
     assert response.headers["x-should-retry"] == "false"
     assert response.headers["x-request-id"]
-    assert response.json()["error"]["code"] == "jev_review_invalid_request"
+    error = response.json()["error"]
+    assert error["code"] == "jev_review_invalid_request"
+    assert error["reason"] == (
+        "outside_context" if case == "after" else "invalid_bounds"
+    )
+    assert error["stage"] == "context"
+    if case == "after":
+        assert error["candidate_start"] == candidates[case][0]
+        assert error["candidate_end"] == candidates[case][1]
+    assert error["context_start"] == context_start
+    assert error["context_end"] == context_end
     assert called is False
 
 

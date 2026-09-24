@@ -156,10 +156,13 @@ def build_payload(
     model: str,
     uid: str | None = None,
     guidance: str = GUIDANCE,
+    caller_context: str = "",
 ) -> dict[str, Any]:
     """One request covering a whole window. System One requires the model field
     (omitting it returns 422 Unprocessable Entity)."""
     state: dict[str, Any] = {"guidance": guidance, "transcript": build_state(segments)}
+    if caller_context.strip():
+        state["caller_context"] = caller_context
     if uid is not None:
         state["uid"] = uid
     return {"state": state, "model": model, "questions": build_questions(segments)}
@@ -374,11 +377,14 @@ def jev_ask(
     deadline_at: float | None = None,
     cache_max_entries: int = 10_000,
     guidance: str = GUIDANCE,
+    caller_context: str = "",
     fetcher: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the payload, serve from cache or upstream, and shape the reply."""
     end = deadline_at if deadline_at is not None else time.monotonic() + request_deadline
-    payload = build_payload(segments, model=model, uid=uid, guidance=guidance)
+    payload = build_payload(
+        segments, model=model, uid=uid, guidance=guidance, caller_context=caller_context
+    )
     cache = JsonCache(cache_path, max_entries=cache_max_entries)
     send = fetcher or call_payload
     expected_keys = set(payload["questions"])

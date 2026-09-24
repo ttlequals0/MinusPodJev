@@ -135,14 +135,16 @@ def chat_completions(
                 outcome = _review_outcome(response, extract_user_text(messages))
                 return JSONResponse(content=response, headers={"X-Request-ID": request_id or ""})
             return response
-        except ReviewInvalidRequestError:
+        except ReviewInvalidRequestError as exc:
             outcome, reason_code = "invalid_request", "invalid_request"
+            diagnostics = _invalid_request_diagnostics(exc)
             return _review_error(
                 422,
                 "jev_review_invalid_request",
                 "Review request is invalid",
                 request_id,
-                reason_code,
+                diagnostics["reason"],
+                diagnostics,
             )
         except ReviewInconclusiveError as exc:
             diagnostics = _inconclusive_diagnostics(exc)
@@ -235,6 +237,15 @@ def _finite_number(value: Any) -> float | int | None:
     return None
 
 
+def _context_diagnostics_from_dict(value: dict[str, Any]) -> dict[str, float | int]:
+    details: dict[str, float | int] = {}
+    for key in ("candidate_start", "candidate_end", "context_start", "context_end"):
+        number = _finite_number(value.get(key))
+        if number is not None:
+            details[key] = number
+    return details
+
+
 def _inconclusive_diagnostics(exc: ReviewInconclusiveError) -> dict[str, Any]:
     return _inconclusive_diagnostics_from_dict(
         {
@@ -251,6 +262,10 @@ def _inconclusive_diagnostics(exc: ReviewInconclusiveError) -> dict[str, Any]:
                 "end_supported",
                 "proposal",
                 "fallback",
+                "candidate_start",
+                "candidate_end",
+                "context_start",
+                "context_end",
             )
         }
     )
@@ -269,6 +284,7 @@ def _inconclusive_diagnostics_from_dict(value: dict[str, Any] | None) -> dict[st
         number = _finite_number(value.get(key))
         if number is not None:
             details[key] = number
+    details.update(_context_diagnostics_from_dict(value))
     for key in ("cache_hit", "start_supported", "end_supported"):
         flag = value.get(key)
         if isinstance(flag, bool):
@@ -277,6 +293,32 @@ def _inconclusive_diagnostics_from_dict(value: dict[str, Any] | None) -> dict[st
         diagnostic = sanitize_review_range_diagnostic(value.get(key))
         if diagnostic is not None:
             details[key] = diagnostic
+    return details
+
+
+def _invalid_request_diagnostics(exc: ReviewInvalidRequestError) -> dict[str, Any]:
+    return _invalid_request_diagnostics_from_dict(
+        {
+            "reason": getattr(exc, "reason", None),
+            "candidate_start": getattr(exc, "candidate_start", None),
+            "candidate_end": getattr(exc, "candidate_end", None),
+            "context_start": getattr(exc, "context_start", None),
+            "context_end": getattr(exc, "context_end", None),
+        }
+    )
+
+
+def _invalid_request_diagnostics_from_dict(value: dict[str, Any] | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    reason = value.get("reason")
+    details: dict[str, Any] = {
+        "reason": reason
+        if isinstance(reason, str) and reason in {"malformed_context", "invalid_bounds", "outside_context"}
+        else "malformed_context",
+        "stage": "context",
+    }
+    details.update(_context_diagnostics_from_dict(value))
     return details
 
 
@@ -316,19 +358,27 @@ def _review_error(
     reason: str | None = None,
     diagnostics: dict[str, Any] | None = None,
 ) -> JSONResponse:
-    safe_diagnostics = _inconclusive_diagnostics_from_dict(diagnostics)
+    safe_diagnostics = (
+        _invalid_request_diagnostics_from_dict(diagnostics)
+        if code == "jev_review_invalid_request"
+        else _inconclusive_diagnostics_from_dict(diagnostics)
+    )
     headers: dict[str, str] = {}
     if status == 422:
         headers["x-should-retry"] = "false"
     if request_id is not None:
         headers["X-Request-ID"] = request_id
         logger.warning(
-            "review request_id=%s status=%d error_code=%s reason=%s stage=%s score=%s threshold=%s cache_hit=%s proposal=%s fallback=%s",
+            "review request_id=%s status=%d error_code=%s reason=%s stage=%s candidate_start=%s candidate_end=%s context_start=%s context_end=%s score=%s threshold=%s cache_hit=%s proposal=%s fallback=%s",
             request_id,
             status,
             code,
             reason or "unknown",
             safe_diagnostics.get("stage", "unknown"),
+            safe_diagnostics.get("candidate_start", "unknown"),
+            safe_diagnostics.get("candidate_end", "unknown"),
+            safe_diagnostics.get("context_start", "unknown"),
+            safe_diagnostics.get("context_end", "unknown"),
             safe_diagnostics.get("score", "unknown"),
             safe_diagnostics.get("threshold", "unknown"),
             safe_diagnostics.get("cache_hit", "unknown"),

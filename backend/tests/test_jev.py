@@ -90,6 +90,24 @@ def test_build_payload_shape():
     assert "L0001" in question["instructions"]
 
 
+def test_build_payload_keeps_caller_context_separate_and_hashes_it():
+    segments = [{"sid": 1, "text": " hello "}]
+    base = build_payload(segments, model="jev-latest")
+    empty = build_payload(segments, model="jev-latest", caller_context=" \n ")
+    contextual = build_payload(
+        segments,
+        model="jev-latest",
+        caller_context="Podcast description: show notes and cue metadata",
+    )
+
+    assert empty == base
+    assert "caller_context" not in base["state"]
+    assert contextual["state"]["caller_context"] == "Podcast description: show notes and cue metadata"
+    assert contextual["state"]["transcript"] == base["state"]["transcript"]
+    assert contextual["state"]["guidance"] == base["state"]["guidance"]
+    assert hash_payload(contextual) != hash_payload(base)
+
+
 def test_parse_response_keeps_noul_answers_and_usage():
     entry = parse_response(ANSWER_BODY)
     assert entry["probabilities"] == {"s1": 0.98}

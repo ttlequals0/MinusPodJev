@@ -4,7 +4,7 @@ from typing import Any
 import pytest
 from app.api import openai
 from app.config import settings
-from app.services.openai_adapter import ReviewInconclusiveError
+from app.services.openai_adapter import ReviewInconclusiveError, ReviewInvalidRequestError
 from fastapi.responses import JSONResponse
 
 
@@ -112,6 +112,46 @@ def test_untrusted_exception_attributes_are_filtered_from_response_and_logs(
     assert "credential-private" not in body.decode()
     assert "private text" not in caplog.text
     assert openai._metric_inconclusive_reason(error) == "malformed_context"
+
+
+def test_invalid_request_diagnostics_filter_untrusted_attributes(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(settings, "TYPESAFE_API_KEY", "test-key")
+    monkeypatch.setattr(openai, "is_review_request", lambda *_args: True)
+    monkeypatch.setattr(
+        openai,
+        "effective_from_settings",
+        lambda _settings: type(
+            "Thresholds",
+            (),
+            {"detection_enter": 0.5, "detection_stay": 0.5, "review_evidence": 0.7, "review_choice": 0.6},
+        )(),
+    )
+
+    def fail(**_kwargs: Any) -> None:
+        error = ReviewInvalidRequestError("private transcript")
+        error.reason = ["private-reason"]
+        error.candidate_start = True
+        error.candidate_end = float("nan")
+        error.context_start = float("inf")
+        error.context_end = "private-context"
+        raise error
+
+    monkeypatch.setattr(openai, "run_chat_completion", fail)
+    response = openai.chat_completions(
+        openai.ChatCompletionRequest(messages=[]), "Bearer caller-token"
+    )
+    assert isinstance(response, JSONResponse)
+    body = bytes(response.body).decode()
+    error = json.loads(body)["error"]
+
+    assert error["reason"] == "malformed_context"
+    assert error["stage"] == "context"
+    for key in ("candidate_start", "candidate_end", "context_start", "context_end"):
+        assert key not in error
+    assert "private" not in body
+    assert "private" not in caplog.text
 
 
 def test_new_inconclusive_reasons_map_to_existing_metric_enums() -> None:

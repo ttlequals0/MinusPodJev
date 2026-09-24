@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.13 - 2026-09-24
+
+- Forward the review prompt preamble as separate `caller_context` data through Jev review calls.
+- Abstain with non-retryable `422` and no Jev call for transcript gaps inside the recovered envelope or exactly at its head or tail.
+- Return fixed context error reasons and finite candidate/context bounds without transcript text.
+
 ## 0.1.12 - 2026-09-23
 
 - Send the selected review cut as an explicit `assessment_range` while retaining the original candidate range for reference.

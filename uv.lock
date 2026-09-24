@@ -533,7 +533,7 @@ wheels = [
 
 [[package]]
 name = "jev-proxy"
-version = "0.1.12"
+version = "0.1.13"
 source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },

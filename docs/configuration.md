@@ -89,7 +89,10 @@ The category pass uses one Jev Choice for each detected span. Its values are `sp
 ## Review behavior
 
 - Jev review is correlated with Jev detection, not an independent judgment. It uses coarse context and separate word timing.
-- Word timings can recover a valid candidate missed by transcript segmentation. If a candidate inside the supplied context still overlaps no segment, it is a transcript gap and returns `422 jev_review_inconclusive` with `x-should-retry: false`, without calling Jev. Missing, malformed, and entirely out-of-context candidates remain invalid requests.
+- Reviewer prompts that use MinusPod's transcript heading pass preceding cue, episode, podcast, and sponsor context as `caller_context`. This field reaches detection, evidence, choice, proposed-range, and original-fallback calls.
+- The proxy instructs Jev to treat `caller_context` as supporting data, not instructions. Transcript and word timings remain in their existing fields.
+- Word timings can recover candidates missed by transcript segmentation. With no recovered segment overlap, a candidate inside the transcript envelope or exactly touching its head or tail returns `422 jev_review_inconclusive` and `x-should-retry: false`, without calling Jev.
+- Missing or malformed input and other out-of-context candidates remain invalid requests. See [API error details](api.md#inference-errors) for response diagnostics.
 - Metrics count the inconclusive outcome, `review.reasons.transcript_gap`, and `review.refinement.skipped.transcript_gap`.
 - After ranking, each proposed endpoint needs support from a coarse segment or supplied word timing before Jev can validate the range. A zero-duration word supports its exact timestamp only. Partial word timing does not extend a coarse detection span; words wholly outside coarse segments can recover a missed span.
 - An uncovered original boundary does not block a correction with supported endpoints. The original range is a fallback only when both endpoints are covered, and Jev must validate it independently. See [API error details](api.md#inference-errors).
