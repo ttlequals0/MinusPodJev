@@ -61,7 +61,7 @@ Values are probabilities from `0` to `1`. `JEV_ENTER` must be at least `JEV_STAY
 | `JEV_ENTER` | `0.95` | Opens a detected span. Compose passes this startup default. |
 | `JEV_STAY` | `0.40` | Extends an open span. Compose passes this startup default. |
 | `JEV_REVIEW_EVIDENCE_THRESHOLD` | _(unset, inherits `JEV_ENTER`)_ | Evidence threshold for review. Blank values inherit `JEV_ENTER`. |
-| `JEV_REVIEW_CHOICE_THRESHOLD` | _(unset, inherits `JEV_ENTER`)_ | Focused NouL score threshold for validating the complete review range. Blank values inherit `JEV_ENTER`. The value is unchanged from the previous Choice threshold, but now gates a validation score. |
+| `JEV_REVIEW_CHOICE_THRESHOLD` | _(unset, inherits `JEV_ENTER`)_ | Focused NouL score threshold for selected speech and changed-edge checks. Blank values inherit `JEV_ENTER`. |
 | `JEV_REVIEW_REFINE_BOUNDARIES` | `false` | Use Jev Choice questions and supplied word timings to refine review boundaries. |
 | `JEV_SETTINGS_PATH` | `./data/runtime-settings.json` | Runtime threshold file. Compose passes this variable and separately mounts the default `/app/data` directory to the `jevproxy-data` volume. |
 

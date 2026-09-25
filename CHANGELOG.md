@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.15 - 2026-09-25
+
+- Offer Jev word-timed boundary choices with nearby speech and include unpunctuated word edges close to the current cut.
+- Validate only the selected speech, then check any speech added to or removed from the original cut before accepting a boundary change.
+- Abstain when a partial transcript row cannot be reconstructed from word timing, and report `insufficient_boundary_text` separately from missing endpoint coverage.
+
 ## 0.1.14 - 2026-09-25
 
 - Read only the transcript block in detection requests so timestamped show notes cannot override segment IDs.

@@ -33,7 +33,7 @@ Confirmed local sponsor matches use the raw transcript excerpt as rationale. Unm
 - A candidate with no recovered segment overlap is a `transcript_gap` if it lies inside the recovered transcript envelope or exactly touches its head or tail. The proxy returns `jev_review_inconclusive` with `x-should-retry: false` and does not call Jev.
 - Review prompts that use MinusPod's transcript heading pass preceding caller context in `caller_context`. It is included in detection, evidence, choice, proposed-range, and original-fallback calls.
 - The proxy instructs Jev to treat `caller_context` as supporting data, not instructions. Transcript and word timings stay in their existing fields.
-- An abstention caused by missing endpoint coverage returns non-retryable `422` with reason `missing_boundary_coverage` and stage `boundary_coverage`. Endpoints need support from coarse transcript segments or supplied word timings. Its error reports the range and endpoint support flags, with no score or cache status.
+- An abstention caused by missing endpoint coverage returns non-retryable `422` with reason `missing_boundary_coverage` and stage `boundary_coverage`. If a crossed transcript row cannot be isolated from word timings, the reason is `insufficient_boundary_text`. Both report the range and endpoint support flags without a score or cache status.
 - If neither a refined proposal nor its original fallback can be confirmed, the response remains `422 jev_review_inconclusive` with its existing reason, stage, and `x-should-retry: false`. It adds:
 
   - `error.proposal` and `error.fallback`, each with `range_start` and `range_end` in seconds, `reason`, and `stage`.

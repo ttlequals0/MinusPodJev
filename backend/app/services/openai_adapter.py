@@ -89,7 +89,7 @@ def sanitize_review_range_diagnostic(value: dict[str, Any] | None) -> dict[str, 
         and math.isfinite(end)
     ):
         return None
-    if isinstance(reason, str) and isinstance(stage, str) and reason == "missing_boundary_coverage" and stage == "boundary_coverage":
+    if isinstance(reason, str) and isinstance(stage, str) and reason in {"missing_boundary_coverage", "insufficient_boundary_text"} and stage == "boundary_coverage":
         start_supported = value.get("start_supported")
         end_supported = value.get("end_supported")
         if isinstance(start_supported, bool) and isinstance(end_supported, bool):
@@ -104,7 +104,7 @@ def sanitize_review_range_diagnostic(value: dict[str, Any] | None) -> dict[str, 
     if (
         isinstance(reason, str)
         and isinstance(stage, str)
-        and reason in {"proposed_range_not_confirmed", "original_range_not_confirmed"}
+        and reason in {"proposed_range_not_confirmed", "original_range_not_confirmed", "edge_content_unconfirmed"}
         and stage == "focused_validation"
     ):
         score = value.get("score")
@@ -145,6 +145,7 @@ class ReviewInconclusiveError(ReviewUnavailableError):
             "proposed_range_not_confirmed",
             "original_range_not_confirmed",
             "missing_boundary_coverage",
+            "insufficient_boundary_text",
         }
     )
     _STAGES = frozenset(
@@ -762,84 +763,69 @@ def _review_state(
     return state
 
 
-def _boundary_anchor(
-    words: Sequence[dict[str, Any]],
-    segments: Sequence[dict[str, Any]],
-    current: float,
-    direction: str,
-) -> tuple[float | None, float | None]:
-    """Return the closest meaningful inward and outward timed boundary."""
-    coarse_edges = {
-        float(segment["start"] if direction == "start" else segment["end"])
-        for segment in segments
-    }
-    candidates: list[float] = []
-    for index, word in enumerate(words):
-        value = float(word["start"] if direction == "start" else word["end"])
-        sentence_break = (
-            direction == "end"
-            and re.search(r"[.!?][\"')\]]*$", str(word.get("text", "")).rstrip()) is not None
-        ) or (
-            direction == "start"
-            and index > 0
-            and re.search(r"[.!?][\"')\]]*$", str(words[index - 1].get("text", "")).rstrip()) is not None
-        )
-        if sentence_break or any(math.isclose(value, edge, rel_tol=0.0, abs_tol=1e-6) for edge in coarse_edges):
-            candidates.append(value)
-    inward = [value for value in candidates if (value > current if direction == "start" else value < current)]
-    outward = [value for value in candidates if (value < current if direction == "start" else value > current)]
-    def choose(values: list[float]) -> float | None:
-        return min(values, key=lambda value: (abs(value - current), value)) if values else None
-
-    return choose(inward), choose(outward)
-
-
 def _edge_reference(words: Sequence[dict[str, Any]], value: float, direction: str, current: float) -> str:
-    for index, word in enumerate(words):
-        timed = float(word["start"] if direction == "start" else word["end"])
-        if math.isclose(timed, value, rel_tol=0.0, abs_tol=1e-6):
-            if direction == "start" and index:
-                return f"before {word['text']!r} at {value:.2f}s, after {words[index - 1]['text']!r}"
-            return f"before {word['text']!r} at {value:.2f}s" if direction == "start" else f"after {word['text']!r} at {value:.2f}s"
-    if value == current:
-        return f"current candidate boundary at {value:.2f}s"
-    return f"at {value:.2f}s"
+    if not words:
+        return f"current candidate boundary at {value:.2f}s" if value == current else f"at {value:.2f}s"
+    index = min(range(len(words)), key=lambda i: abs(float(words[i]["start" if direction == "start" else "end"]) - value))
+    left = words[max(0, index - 8):index]
+    right = words[index:index + 8]
+    if direction == "end":
+        left = words[max(0, index - 7):index + 1]
+        right = words[index + 1:index + 9]
+    before = " ".join(str(item["text"]) for item in left)
+    after = " ".join(str(item["text"]) for item in right)
+    return f"{value:.2f}s: before {before!r}; after {after!r}"
 
 
 _BOUNDARY_SEARCH_SECONDS = 30.0
-_BOUNDARY_GRID_SECONDS = 2.0
+_BOUNDARY_MAX_OPTIONS = 16
+_BOUNDARY_WORD_OPTIONS = 32
+_BOUNDARY_WORD_SECONDS = 10.0
+_UTTERANCE_GAP_SECONDS = 1.0
 
 
-def _inward_grid_candidates(
+def _timed_transition_candidates(
     words: Sequence[dict[str, Any]],
+    segments: Sequence[dict[str, Any]],
     current: float,
     direction: str,
     context_start: float,
     context_end: float,
 ) -> list[float]:
-    """Snap each inward two-second target to a supplied word boundary."""
-    values = sorted(
-        {
-            float(word["start"] if direction == "start" else word["end"])
-            for word in words
-            if context_start
-            <= float(word["start"] if direction == "start" else word["end"])
-            <= context_end
-            and 0.0
-            <= (float(word["start"] if direction == "start" else word["end"]) - current)
-            * (1.0 if direction == "start" else -1.0)
-            <= _BOUNDARY_SEARCH_SECONDS
-        }
-    )
-    snapped: list[float] = []
-    for step in range(0, int(_BOUNDARY_SEARCH_SECONDS / _BOUNDARY_GRID_SECONDS) + 1):
-        target = current + (step * _BOUNDARY_GRID_SECONDS if direction == "start" else -step * _BOUNDARY_GRID_SECONDS)
-        if not values:
-            break
-        closest = min(values, key=lambda value: (abs(value - target), value))
-        if closest not in snapped:
-            snapped.append(closest)
-    return snapped
+    """Use observed sentence ends and pauses as candidate utterance edges."""
+    ordered = sorted(words, key=lambda word: (float(word["start"]), float(word["end"])))
+    values: set[float] = set()
+    for index, word in enumerate(ordered):
+        previous = ordered[index - 1] if index else None
+        following = ordered[index + 1] if index + 1 < len(ordered) else None
+        if direction == "start":
+            value = float(word["start"])
+            transition = previous is not None and re.search(r"[.!?][\"')\]]*$", str(previous["text"]).rstrip()) is not None
+            if previous is not None:
+                transition |= value - float(previous["end"]) >= _UTTERANCE_GAP_SECONDS
+            else:
+                prior_rows = [segment for segment in segments if float(segment["end"]) <= value]
+                if any(abs(float(segment["start"]) - value) <= 0.11 for segment in segments):
+                    transition = not prior_rows or value - max(float(segment["end"]) for segment in prior_rows) >= _UTTERANCE_GAP_SECONDS
+        else:
+            value = float(word["end"])
+            transition = re.search(r"[.!?][\"')\]]*$", str(word["text"]).rstrip()) is not None
+            if following is not None:
+                transition |= float(following["start"]) - value >= _UTTERANCE_GAP_SECONDS
+            elif not transition and any(abs(float(segment["end"]) - value) <= 0.1 for segment in segments):
+                following_rows = [segment for segment in segments if float(segment["start"]) >= value]
+                transition = bool(following_rows) and min(float(segment["start"]) for segment in following_rows) - value >= _UTTERANCE_GAP_SECONDS
+        if transition and context_start <= value <= context_end and abs(value - current) <= _BOUNDARY_SEARCH_SECONDS:
+            values.add(value)
+    meaningful = sorted(values, key=lambda value: (abs(value - current), value))[:_BOUNDARY_MAX_OPTIONS]
+    inner_words = ordered[1:] if direction == "start" else ordered[:-1]
+    exact = sorted(
+        {float(word["start" if direction == "start" else "end"])
+         for word in inner_words
+         if abs(float(word["start" if direction == "start" else "end"]) - current) <= _BOUNDARY_WORD_SECONDS},
+        key=lambda value: (abs(value - current), value),
+    )[:_BOUNDARY_WORD_OPTIONS]
+    return sorted(set(meaningful + exact))
 
 
 def _boundary_candidates(
@@ -847,20 +833,14 @@ def _boundary_candidates(
     word_edges: dict[str, list[dict[str, Any]]],
     cand: tuple[float, float],
 ) -> tuple[list[float], list[float]]:
-    """Return transcript-grounded inward candidates and the legacy outward anchor."""
-    start_in, start_out = _boundary_anchor(word_edges["start"], segments, cand[0], "start")
-    end_in, end_out = _boundary_anchor(word_edges["end"], segments, cand[1], "end")
+    """Return bounded word-timed utterance edges near the current cut."""
     context_start, context_end = _review_context_envelope(segments, word_edges)
-    starts = [cand[0], *_inward_grid_candidates(word_edges["start"], cand[0], "start", context_start, context_end)]
-    ends = [cand[1], *_inward_grid_candidates(word_edges["end"], cand[1], "end", context_start, context_end)]
-    if start_in is not None and abs(start_in - cand[0]) <= _BOUNDARY_SEARCH_SECONDS:
-        starts.append(start_in)
-    if end_in is not None and abs(end_in - cand[1]) <= _BOUNDARY_SEARCH_SECONDS:
-        ends.append(end_in)
-    if start_out is not None:
-        starts.append(start_out)
-    if end_out is not None:
-        ends.append(end_out)
+    starts = _timed_transition_candidates(word_edges["start"], segments, cand[0], "start", context_start, context_end)
+    ends = _timed_transition_candidates(word_edges["end"], segments, cand[1], "end", context_start, context_end)
+    if _covers_boundary(segments, cand[0]) or _covers_boundary(word_edges["start"], cand[0]):
+        starts.append(cand[0])
+    if _covers_boundary(segments, cand[1]) or _covers_boundary(word_edges["end"], cand[1]):
+        ends.append(cand[1])
 
     def valid(values: list[float]) -> list[float]:
         return sorted(
@@ -881,7 +861,7 @@ def _edge_criteria(
     direction: str,
     current: float,
 ) -> dict[str, str]:
-    criteria = {"unknown": "No proposed boundary is supported by the transcript."}
+    criteria = {"unknown": "Insufficient evidence to place this boundary at any listed option."}
     for index, value in enumerate(values):
         criteria[f"{key}_{index:02d}"] = _edge_reference(words, value, direction, current)
     return criteria
@@ -896,12 +876,12 @@ def _rank_questions(
         {
             "boundary_start": {
                 "type": "choice",
-                "instructions": "Choose the best start boundary for the advertising interval. Consult adjacent transcript words. Choose unknown when none is supported.",
+                "instructions": "Choose where complete advertising speech begins. Compare the speech before and after each option. Do not split an utterance. Choose unknown if none is supported.",
                 "criteria": start_criteria,
             },
             "boundary_end": {
                 "type": "choice",
-                "instructions": "Choose the best end boundary for the advertising interval. Consult adjacent transcript words. Choose unknown when none is supported.",
+                "instructions": "Choose where complete advertising speech ends. Compare the speech before and after each option. Do not split an utterance. Choose unknown if none is supported.",
                 "criteria": end_criteria,
             },
         },
@@ -910,24 +890,42 @@ def _rank_questions(
     )
 
 
-def _focused_range_question(
-    name: str, assessment_range: tuple[float, float], candidate: tuple[float, float]
-) -> dict[str, dict[str, Any]]:
-    start, end = assessment_range
+def _focused_range_question(name: str) -> dict[str, dict[str, Any]]:
     return {
         name: {
             "type": "noul",
-            "instructions": (
-                f"The reference candidate interval is {candidate[0]:.2f}s-{candidate[1]:.2f}s. "
-                f"Assess only assessment_range {start:.2f}s-{end:.2f}s. "
-                "Confirm only when its boundaries are supported, all observed speech within "
-                "the assessed interval is advertising under the supplied guidance, and it "
-                "excludes neighboring editorial content. Timestamp gaps alone do not establish "
-                "missing speech or editorial content: do not assume silence or invent content. "
-                "Abstain when missing evidence prevents judging the complete interval."
-            ),
+            "instructions": "The speech in `assessment_speech` is advertising content under `guidance`, not editorial discussion.",
         }
     }
+
+
+def _assessment_speech(
+    segments: Sequence[dict[str, Any]],
+    word_edges: dict[str, list[dict[str, Any]]],
+    assessment_range: tuple[float, float],
+) -> str | None:
+    """Present observed speech in the cut without including unaligned edge text."""
+    start, end = assessment_range
+    edge_words = sorted(
+        {(float(word["start"]), float(word["end"]), str(word["text"]))
+         for edge in ("start", "end") for word in word_edges[edge]}
+    )
+    lines: list[str] = []
+    for segment in segments:
+        seg_start, seg_end = float(segment["start"]), float(segment["end"])
+        if seg_end <= start or seg_start >= end:
+            continue
+        text = str(segment["text"]).strip()
+        if seg_start < start - 0.1 or seg_end > end + 0.1:
+            timed = [(lo, hi, word) for lo, hi, word in edge_words
+                     if lo >= seg_start - 0.1 and hi <= seg_end + 0.1]
+            if timed and re.findall(r"\w+", " ".join(word for _, _, word in timed).lower()) == re.findall(r"\w+", text.lower()):
+                text = " ".join(word for lo, hi, word in timed if hi > start and lo < end)
+            else:
+                return None
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
 
 
 def _valid_pairs(
@@ -1143,18 +1141,25 @@ def run_review(
         questions: dict[str, dict[str, Any]],
         stage: str,
         assessment_range: tuple[float, float] | None = None,
+        excluded_speech: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         nonlocal review_input_tokens, review_output_tokens
         started = time.monotonic()
         question_state = state
         if assessment_range is not None:
+            speech = _assessment_speech(segments, word_edges, assessment_range)
+            if not speech:
+                _review_unavailable(
+                    pool, "Jev cannot isolate the selected speech", review_request_id,
+                    reason="insufficient_boundary_text", stage="boundary_coverage",
+                )
             question_state = {
-                **state,
-                "assessment_range": {
-                    "start": assessment_range[0],
-                    "end": assessment_range[1],
-                },
+                "guidance": review_guidance,
+                "assessment_speech": speech,
             }
+            question_state.update(excluded_speech or {})
+            if caller_context:
+                question_state["caller_context"] = caller_context
         try:
             result = jev_review_questions(
                 state=question_state,
@@ -1296,57 +1301,106 @@ def run_review(
             ranked = review_questions(rank_questions, "choice_rank")
             start_answer = ranked["answers"]["boundary_start"]
             end_answer = ranked["answers"]["boundary_end"]
+            start_probs = start_answer["probabilities"]
+            end_probs = end_answer["probabilities"]
             logger.info(
-                "review request_id=%s stage=choice_rank start_choice=%s start_score=%s end_choice=%s end_score=%s threshold=%s cache_hit=%s",
+                "review request_id=%s stage=choice_rank start_choice=%s start_probability=%s start_confidence=%s end_choice=%s end_probability=%s end_confidence=%s probability_floor=0.5 cache_hit=%s",
                 review_request_id,
                 start_answer["choice"],
+                start_probs[start_answer["choice"]],
                 start_answer["confidence"],
                 end_answer["choice"],
+                end_probs[end_answer["choice"]],
                 end_answer["confidence"],
-                review_choice_enter,
                 ranked["cache_hit"],
             )
             proposed = (cand_start, cand_end)
-            if start_answer["choice"] != "unknown" and end_answer["choice"] != "unknown":
+            start_clear = start_answer["choice"] != "unknown" and start_probs[start_answer["choice"]] >= 0.5 and start_probs[start_answer["choice"]] > max(
+                value for key, value in start_probs.items() if key != start_answer["choice"]
+            )
+            end_clear = end_answer["choice"] != "unknown" and end_probs[end_answer["choice"]] >= 0.5 and end_probs[end_answer["choice"]] > max(
+                value for key, value in end_probs.items() if key != end_answer["choice"]
+            )
+            if start_clear and end_clear:
                 selected = (start_values[start_answer["choice"]], end_values[end_answer["choice"]])
                 if selected in candidate_pairs:
                     proposed = selected
             focused_name = "proposed_range" if proposed != cand else "original_range"
             focused = None
             focused_score = None
+            edge_score = 1.0
             proposal_diagnostic: dict[str, Any] | None = None
             proposed_start_supported, proposed_end_supported = _range_boundary_support(
                 coarse_segments, word_edges, proposed
             )
-            if proposed_start_supported and proposed_end_supported:
+            proposed_text_supported = bool(_assessment_speech(segments, word_edges, proposed))
+            edge_speech: dict[str, str] = {}
+            edge_text: str | None
+            if proposed[0] > cand_start:
+                edge_text = _assessment_speech(segments, word_edges, (cand_start, proposed[0]))
+                proposed_text_supported &= edge_text is not None
+                if edge_text:
+                    edge_speech["excluded_start_speech"] = edge_text
+            if proposed[1] < cand_end:
+                edge_text = _assessment_speech(segments, word_edges, (proposed[1], cand_end))
+                proposed_text_supported &= edge_text is not None
+                if edge_text:
+                    edge_speech["excluded_end_speech"] = edge_text
+            if proposed[0] < cand_start:
+                edge_text = _assessment_speech(segments, word_edges, (proposed[0], cand_start))
+                proposed_text_supported &= edge_text is not None
+                if edge_text:
+                    edge_speech["added_start_speech"] = edge_text
+            if proposed[1] > cand_end:
+                edge_text = _assessment_speech(segments, word_edges, (cand_end, proposed[1]))
+                proposed_text_supported &= edge_text is not None
+                if edge_text:
+                    edge_speech["added_end_speech"] = edge_text
+            if proposed_start_supported and proposed_end_supported and proposed_text_supported:
+                questions = _focused_range_question(focused_name)
+                for field in edge_speech:
+                    action = "kept in the episode" if field.startswith("excluded_") else "included in the advertising break"
+                    questions[field.removesuffix("_speech") + "_valid"] = {
+                        "type": "noul",
+                        "instructions": f"The speech in `{field}` should be {action}, considering `assessment_speech` and `guidance`.",
+                    }
                 focused = review_questions(
-                    _focused_range_question(focused_name, proposed, cand),
+                    questions,
                     "focused_validation",
                     proposed,
+                    edge_speech,
                 )
                 focused_score = float(focused["answers"][focused_name])
+                edge_score = min(
+                    (float(focused["answers"][field.removesuffix("_speech") + "_valid"])
+                     for field in edge_speech),
+                    default=1.0,
+                )
                 logger.info(
-                    "review request_id=%s stage=focused_validation range=%s score=%s threshold=%s cache_hit=%s",
+                    "review request_id=%s stage=focused_validation range=%s score=%s threshold=%s edge_score=%s cache_hit=%s",
                     review_request_id,
                     proposed,
                     focused_score,
                     review_choice_enter,
+                    edge_score,
                     focused["cache_hit"],
                 )
                 if proposed != cand:
                     proposal_diagnostic = {
-                        "reason": "proposed_range_not_confirmed",
+                        "reason": "edge_content_unconfirmed" if edge_score < review_choice_enter else "proposed_range_not_confirmed",
                         "stage": "focused_validation",
                         "range_start": proposed[0],
                         "range_end": proposed[1],
-                        "score": focused_score,
+                        "score": edge_score if edge_score < review_choice_enter else focused_score,
                         "threshold": review_choice_enter,
                         "cache_hit": bool(focused["cache_hit"]),
                     }
             else:
+                proposal_reason = "insufficient_boundary_text" if proposed_start_supported and proposed_end_supported else "missing_boundary_coverage"
                 logger.info(
-                    "review request_id=%s stage=boundary_coverage validation_skipped range_kind=%s range_start=%.3f range_end=%.3f start_supported=%s end_supported=%s",
+                    "review request_id=%s stage=boundary_coverage validation_skipped reason=%s range_kind=%s range_start=%.3f range_end=%.3f start_supported=%s end_supported=%s",
                     review_request_id,
+                    proposal_reason,
                     focused_name,
                     proposed[0],
                     proposed[1],
@@ -1355,14 +1409,14 @@ def run_review(
                 )
                 if proposed != cand:
                     proposal_diagnostic = {
-                        "reason": "missing_boundary_coverage",
+                        "reason": proposal_reason,
                         "stage": "boundary_coverage",
                         "range_start": proposed[0],
                         "range_end": proposed[1],
                         "start_supported": proposed_start_supported,
                         "end_supported": proposed_end_supported,
                     }
-            if focused_score is not None and focused_score >= review_choice_enter:
+            if focused_score is not None and focused_score >= review_choice_enter and edge_score >= review_choice_enter:
                 ad_start, ad_end = proposed
                 metrics.record_review_refinement(
                     "completed",
@@ -1379,9 +1433,10 @@ def run_review(
                 original_start_supported, original_end_supported = _range_boundary_support(
                     coarse_segments, word_edges, cand
                 )
-                if original_start_supported and original_end_supported:
+                original_text_supported = bool(_assessment_speech(segments, word_edges, cand))
+                if original_start_supported and original_end_supported and original_text_supported:
                     original = review_questions(
-                        _focused_range_question("original_range", cand, cand),
+                        _focused_range_question("original_range"),
                         "focused_validation",
                         cand,
                     )
@@ -1404,16 +1459,18 @@ def run_review(
                         "cache_hit": bool(original["cache_hit"]),
                     }
                 else:
+                    fallback_reason = "insufficient_boundary_text" if original_start_supported and original_end_supported else "missing_boundary_coverage"
                     logger.info(
-                        "review request_id=%s stage=boundary_coverage validation_skipped range_kind=original_range range_start=%.3f range_end=%.3f start_supported=%s end_supported=%s",
+                        "review request_id=%s stage=boundary_coverage validation_skipped reason=%s range_kind=original_range range_start=%.3f range_end=%.3f start_supported=%s end_supported=%s",
                         review_request_id,
+                        fallback_reason,
                         cand[0],
                         cand[1],
                         original_start_supported,
                         original_end_supported,
                     )
                     fallback_diagnostic = {
-                        "reason": "missing_boundary_coverage",
+                        "reason": fallback_reason,
                         "stage": "boundary_coverage",
                         "range_start": cand[0],
                         "range_end": cand[1],
@@ -1434,7 +1491,7 @@ def run_review(
                             pool,
                             "Jev cannot confirm the original complete range without observed boundaries",
                             review_request_id,
-                            reason="missing_boundary_coverage",
+                            reason=fallback_diagnostic["reason"],
                             stage="boundary_coverage",
                             range_start=cand[0],
                             range_end=cand[1],
@@ -1458,11 +1515,12 @@ def run_review(
             else:
                 metrics.record_review_refinement("inconclusive")
                 if focused_score is None:
+                    reason = "insufficient_boundary_text" if proposed_start_supported and proposed_end_supported else "missing_boundary_coverage"
                     _review_unavailable(
                         pool,
                         "Jev cannot confirm the original complete range without observed boundaries",
                         review_request_id,
-                        reason="missing_boundary_coverage",
+                        reason=reason,
                         stage="boundary_coverage",
                         range_start=proposed[0],
                         range_end=proposed[1],

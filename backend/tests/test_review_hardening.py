@@ -344,13 +344,13 @@ def test_pair_choice_keeps_all_supplied_words_in_shared_state():
     assert state["boundary_words"]["end"] == words
 
 
-def test_focused_range_question_labels_reference_and_assessment_range():
-    question = _focused_range_question("proposed_range", (10.0, 20.0), (8.0, 22.0))
+def test_focused_range_question_uses_selected_speech_only():
+    question = _focused_range_question("proposed_range")
 
     assert question["proposed_range"]["type"] == "noul"
-    assert "reference candidate interval is 8.00s-22.00s" in question["proposed_range"]["instructions"]
-    assert "Assess only assessment_range 10.00s-20.00s" in question["proposed_range"]["instructions"]
-    assert "Timestamp gaps alone do not establish missing speech" in question["proposed_range"]["instructions"]
+    assert question["proposed_range"]["instructions"] == (
+        "The speech in `assessment_speech` is advertising content under `guidance`, not editorial discussion."
+    )
 
 
 def _corpus_prompt(

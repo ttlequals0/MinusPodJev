@@ -213,6 +213,7 @@ _INCONCLUSIVE_REASONS = frozenset(
         "proposed_range_not_confirmed",
         "original_range_not_confirmed",
         "missing_boundary_coverage",
+        "insufficient_boundary_text",
     }
 )
 _INCONCLUSIVE_STAGES = frozenset(
@@ -227,6 +228,7 @@ _METRIC_REASONS = frozenset(
         "choice_inconclusive",
         "malformed_context",
         "missing_boundary_coverage",
+        "insufficient_boundary_text",
     }
 )
 
