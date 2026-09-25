@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.14 - 2026-09-25
+
+- Read only the transcript block in detection requests so timestamped show notes cannot override segment IDs.
+- Redact personal email addresses from benchmark artifacts.
+
 ## 0.1.13 - 2026-09-24
 
 - Forward the review prompt preamble as separate `caller_context` data through Jev review calls.

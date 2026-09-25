@@ -1,6 +1,6 @@
 [project]
 name = "jev-proxy"
-version = "0.1.13"
+version = "0.1.14"
 description = "Thin FastAPI proxy/client around the TypeSafe Jev System One endpoint"
 readme = "README.md"
 requires-python = ">=3.11"

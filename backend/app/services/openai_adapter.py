@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 _TS_LINE = re.compile(r"^\s*\[(\d+(?:\.\d+)?)s\s*-\s*(\d+(?:\.\d+)?)s\]\s?(.*)$")
 # segment_ids mode: [12] some text
 _ID_LINE = re.compile(r"^\s*\[(\d+)\]\s?(.*)$")
+_TRANSCRIPT_HEADING = re.compile(r"(?m)^Transcript:[ \t\r]*$")
 
 # Candidate markers: ad_reviewer._build_user_prompt wraps every review candidate in
 # these; detection never emits them, so they tell a review request from detection.
@@ -310,13 +311,25 @@ def extract_system_text(messages: Sequence[dict[str, Any]]) -> str:
 def parse_transcript(text: str) -> tuple[list[dict[str, Any]], str]:
     """Parse transcript lines into segments and the detected addressing mode.
 
-    Timestamps mode wins when any timestamped line is present; sid is assigned
-    by 0-based order. Otherwise segment_ids mode uses the bracket id. Non-line
-    text (header, rules, podcast/description) is ignored. Empty -> ([], "empty").
+    Ignore timestamped metadata outside a labeled transcript. For unlabeled
+    input, timestamps mode retains precedence over segment ids.
     """
     ts: list[dict[str, Any]] = []
     ids: list[dict[str, Any]] = []
-    for line in text.splitlines():
+    headings = list(_TRANSCRIPT_HEADING.finditer(text))
+    if headings:
+        rows: list[str] = []
+        for line in text[headings[-1].end() :].splitlines():
+            if not line.strip():
+                if rows:
+                    break
+                continue
+            if not (_TS_LINE.match(line) or _ID_LINE.match(line)):
+                break
+            rows.append(line)
+    else:
+        rows = text.splitlines()
+    for line in rows:
         m = _TS_LINE.match(line)
         if m:
             ts.append(

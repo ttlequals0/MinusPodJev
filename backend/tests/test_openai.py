@@ -76,7 +76,11 @@ TS_LINES = [
 
 
 def test_parse_transcript_timestamps_mode():
-    text = format_window_prompt("Pod", "Ep", "", TS_LINES, 0, 1, 0.0, 600.0)
+    text = format_window_prompt(
+        "Pod", "Ep", "[10.0s - 11.0s] show-note cue", TS_LINES,
+        0, 1, 0.0, 600.0,
+        audio_context="\n=== AUDIO SIGNALS ===\n[12.0s - 13.0s] cue",
+    )
     segments, mode = parse_transcript(text)
     assert mode == "timestamps"
     assert len(segments) == 8
@@ -88,7 +92,9 @@ def test_parse_transcript_timestamps_mode():
 def test_parse_transcript_segment_ids_mode():
     lines = ["[10] first line", "[11] second line", "[12] third line"]
     text = format_window_prompt(
-        "Pod", "Ep", "", lines, 0, 1, 0.0, 600.0, addressing_mode="segment_ids"
+        "Pod", "Ep", "[10.0s - 11.0s] show-note cue", lines, 0, 1, 0.0, 600.0,
+        audio_context="\n=== AUDIO SIGNALS ===\n[12.0s - 13.0s] cue",
+        addressing_mode="segment_ids",
     )
     segments, mode = parse_transcript(text)
     assert mode == "segment_ids"
@@ -102,6 +108,17 @@ def test_parse_transcript_junk_returns_empty():
     segments, mode = parse_transcript(text)
     assert segments == []
     assert mode == "empty"
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_parse_transcript_allows_blank_after_heading(newline):
+    text = newline.join([
+        "Transcript:", "", "[10] Host story.", "[11] Acme sponsor read.",
+        "", "AUDIO SIGNALS:", "[12.0s - 13.0s] cue",
+    ])
+    segments, mode = parse_transcript(text)
+    assert mode == "segment_ids"
+    assert [segment["sid"] for segment in segments] == [10, 11]
 
 
 def test_extract_user_text_last_user_message():
@@ -370,7 +387,8 @@ async def test_chat_completions_segment_ids_round_trip(jev_env, client, monkeypa
         "[14] Now back to our regular conversation.",
     ]
     prompt = format_window_prompt(
-        "My Podcast", "Ep 2", "", lines, 0, 1, 0.0, 600.0, addressing_mode="segment_ids"
+        "My Podcast", "Ep 2", "[10.0s - 11.0s] show-note cue", lines,
+        0, 1, 0.0, 600.0, addressing_mode="segment_ids",
     )
     body = {"model": "jev-latest", "messages": [{"role": "user", "content": prompt}]}
     resp = await client.post(
