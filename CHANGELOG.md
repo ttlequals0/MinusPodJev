@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.20 - 2026-09-26
+
+- Exclude reviewer cut boundaries that split a supplied word. Keep supported word and silence boundaries eligible.
+
 ## 0.1.19 - 2026-09-26
 
 - Rank observed utterance starts and refine the selected utterance to a word boundary. Keep the original cut available when the proposed start is uncertain.

@@ -215,7 +215,7 @@ def test_boundary_option_overflow_abstains_without_truncation(jev_env, tmp_path)
     ) + (
         "Boundary word timing, use these timestamps for corrections:\nStart edge:\n"
         + "".join(f"[{100.0 + index * 0.1:.2f}s-{100.05 + index * 0.1:.2f}s] word.\n" for index in range(255))
-        + "End edge:\n[119.0s-120.0s] sponsored\n"
+        + "End edge:\n[129.0s-130.0s] sponsored\n"
     )
     normal = make_text_fake()
     stages = []
@@ -298,6 +298,96 @@ def test_partial_coarse_row_requires_complete_word_alignment():
 
     assert _assessment_speech(segments, words, (105.0, 110.0)) is None
     assert _assessment_speech(segments, words, (110.0, 120.0)) == ""
+
+
+def test_boundary_inside_supplied_word_is_unsupported():
+    segments = [
+        {"start": 0.0, "end": 94.2, "text": "This episode is sponsored by Acme."},
+        {"start": 94.2, "end": 95.0, "text": "Welcome back."},
+    ]
+    words = {
+        "start": [{"start": 0.0, "end": 0.2, "text": "This"}],
+        "end": [
+            {"start": 93.9, "end": 94.2, "text": "Acme."},
+            {"start": 94.42, "end": 94.98, "text": "Welcome"},
+        ],
+    }
+
+    assert _range_boundary_support(segments, words, (0.0, 94.77)) == (True, False)
+    assert _range_boundary_support(segments, words, (94.55, 95.0)) == (False, True)
+    assert _range_boundary_support(segments, words, (0.0, 94.2)) == (True, True)
+    assert _assessment_speech(segments, words, (0.0, 94.2)) == segments[0]["text"]
+    assert 94.77 not in _boundary_candidates(segments, words, (0.0, 94.77))[1]
+    assert 94.55 not in _boundary_candidates(segments, words, (94.55, 95.0))[0]
+
+
+def test_boundary_at_coarse_gap_remains_supported():
+    segments = [
+        {"start": 0.0, "end": 94.3, "text": "This episode is sponsored by Acme."},
+        {"start": 94.42, "end": 95.0, "text": "Welcome back."},
+    ]
+    words = {
+        "start": [{"start": 0.0, "end": 0.2, "text": "This"}],
+        "end": [
+            {"start": 93.9, "end": 94.2, "text": "Acme."},
+            {"start": 94.42, "end": 94.98, "text": "Welcome"},
+        ],
+    }
+
+    assert _range_boundary_support(segments, words, (0.0, 94.3)) == (True, True)
+    assert _assessment_speech(segments, words, (0.0, 94.3)) == segments[0]["text"]
+
+
+def test_overlapping_words_leave_only_supported_rank_choices():
+    segments = [{"start": 100.0, "end": 120.0, "text": "A sponsor offer."}]
+    words = {
+        "start": [
+            {"start": 100.0, "end": 101.0, "text": "A"},
+            {"start": 100.5, "end": 101.5, "text": "sponsor"},
+            {"start": 102.0, "end": 103.0, "text": "offer"},
+        ],
+        "end": [
+            {"start": 118.0, "end": 119.0, "text": "visit"},
+            {"start": 118.5, "end": 119.5, "text": "Acme"},
+            {"start": 119.5, "end": 120.0, "text": "today"},
+        ],
+    }
+
+    starts, ends = _boundary_candidates(segments, words, (100.0, 120.0))
+    assert starts == [100.0, 102.0]
+    assert ends == [119.5, 120.0]
+
+
+def test_word_clipped_original_can_adjust_to_aligned_end(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        0.0, 94.8,
+        [],
+        [(0.0, 94.2, "This episode is sponsored by Acme."),
+         (94.2, 95.0, "Welcome back.")],
+        [(95.0, 100.0, "Now for the discussion.")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[0.00s-0.20s] This\n"
+        "End edge:\n[93.90s-94.20s] Acme.\n"
+        "[94.42s-94.70s] Welcome\n[94.70s-94.98s] back.\n"
+    )
+    ranked = _select_pair_fake(0.0, 94.2)
+
+    def fake(payload, **kwargs):
+        if "boundary_end" in payload["questions"]:
+            options = payload["questions"]["boundary_end"]["criteria"].values()
+            assert any(option.startswith("94.20s:") for option in options)
+            assert not any(option.startswith("94.80s:") for option in options)
+        result = ranked(payload, **kwargs)
+        if "interval_comparison" in payload["questions"]:
+            assert "original" not in payload["questions"]["interval_comparison"]["criteria"]
+            assert "Welcome back." in payload["state"]["excluded_end_speech"]
+            _set_choice_answer(result, payload, "interval_comparison", "adjusted")
+        return result
+
+    response = _run(prompt, fake, tmp_path, refine_boundaries=True)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+    assert (ad["start"], ad["end"]) == (0.0, 94.2)
 
 
 def test_unsupported_original_can_trim_to_word_supported_range(jev_env, tmp_path):
@@ -719,7 +809,7 @@ def test_lower_evidence_threshold_reuses_cached_review_answer(jev_env, tmp_path)
     assert len(calls) == 2
 
 
-def _with_word_edges(prompt, start=(99.5, 100.0, "This"), end=(119.5, 120.5, "BetterHelp")):
+def _with_word_edges(prompt, start=(99.5, 100.0, "This"), end=(119.5, 120.0, "BetterHelp")):
     return prompt + (
         "Boundary word timing, use these timestamps for corrections:\n"
         "Start edge:\n"

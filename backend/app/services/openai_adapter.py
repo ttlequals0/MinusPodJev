@@ -709,14 +709,21 @@ def _range_boundary_support(
     value: tuple[float, float],
 ) -> tuple[bool, bool]:
     """Report endpoint support without treating word timings as gap-filling transcript."""
-    timing_sources = [
-        *coarse_segments,
-        *word_edges["start"],
-        *word_edges["end"],
-    ]
     return (
-        _covers_boundary(timing_sources, value[0]),
-        _covers_boundary(timing_sources, value[1]),
+        _review_boundary_supported(coarse_segments, word_edges, value[0]),
+        _review_boundary_supported(coarse_segments, word_edges, value[1]),
+    )
+
+
+def _review_boundary_supported(
+    coarse_segments: Sequence[dict[str, Any]],
+    word_edges: dict[str, list[dict[str, Any]]],
+    boundary: float,
+) -> bool:
+    timing_sources = [*coarse_segments, *word_edges["start"], *word_edges["end"]]
+    return _covers_boundary(timing_sources, boundary) and not any(
+        float(word["start"]) < boundary < float(word["end"])
+        for edge in ("start", "end") for word in word_edges[edge]
     )
 
 
@@ -836,9 +843,10 @@ def _boundary_candidates(
               if abs(float(word["start"]) - cand[0]) <= _BOUNDARY_SEARCH_SECONDS]
     ends = [float(word["end"]) for word in word_edges["end"]
             if abs(float(word["end"]) - cand[1]) <= _BOUNDARY_SEARCH_SECONDS]
-    if _covers_boundary(segments, cand[0]) or _covers_boundary(word_edges["start"], cand[0]):
+    start_supported, end_supported = _range_boundary_support(segments, word_edges, cand)
+    if start_supported:
         starts.append(cand[0])
-    if _covers_boundary(segments, cand[1]) or _covers_boundary(word_edges["end"], cand[1]):
+    if end_supported:
         ends.append(cand[1])
 
     def valid(values: list[float]) -> list[float]:
@@ -847,6 +855,7 @@ def _boundary_candidates(
                 value
                 for value in values
                 if context_start <= value <= context_end
+                and _review_boundary_supported(segments, word_edges, value)
             }
         )
 
