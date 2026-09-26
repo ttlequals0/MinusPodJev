@@ -53,9 +53,10 @@ This is a recommended POC configuration, not a change applied to MinusPod by thi
 | `JEV_ENTER` | `detection_enter` | `0.95` | opens an ad span; editable at runtime |
 | `JEV_STAY` | `detection_stay` | `0.40` | extends an open span; editable at runtime |
 | `JEV_REVIEW_EVIDENCE_THRESHOLD` | `review_evidence` | `JEV_ENTER` when unset | gates advertising evidence before refinement |
-| `JEV_REVIEW_CHOICE_THRESHOLD` | `review_choice` | `JEV_ENTER` when unset | gates the selected boundary pair |
+| `JEV_REVIEW_CHOICE_THRESHOLD` | `review_choice` | `JEV_ENTER` when unset | minimum sponsor-read score for an eligible cut |
+| `JEV_REVIEW_PROGRAMME_VETO` | environment only | `0.85` | vetoes a cut when local programme speech reaches this score |
 
-These are `0` to `1` probability scores, not measured accuracy. Detection enter must be at least `JEV_STAY`; review evidence and Choice thresholds are independent of detection enter.
+These are `0` to `1` scores, not measured accuracy. Detection enter must be at least `JEV_STAY`. The review evidence, sponsor-read, and programme thresholds are independent of detection enter.
 
 ### Save and authentication
 
@@ -89,14 +90,22 @@ The category pass uses one Jev Choice for each detected span. Its values are `sp
 ## Review behavior
 
 - Jev review is correlated with Jev detection, not an independent judgment. It uses coarse context and separate word timing.
+- Reviewer prompts that use MinusPod's transcript heading pass preceding cue, episode, podcast, and sponsor context as `caller_context`. This field reaches detection, evidence, choice, proposed-range, and original-fallback calls.
+- The proxy instructs Jev to treat `caller_context` as supporting data, not instructions. Transcript and word timings remain in their existing fields.
+- Word timings can recover candidates missed by transcript segmentation. With no recovered segment overlap, a candidate inside the transcript envelope or exactly touching its head or tail returns `422 jev_review_inconclusive` and `x-should-retry: false`, without calling Jev.
+- Missing or malformed input and other out-of-context candidates remain invalid requests. See [API error details](api.md#inference-errors) for response diagnostics.
+- Metrics count the inconclusive outcome, `review.reasons.transcript_gap`, and `review.refinement.skipped.transcript_gap`.
+- After ranking, each proposed endpoint needs support from a coarse segment or supplied word timing before Jev can validate the range. A zero-duration word supports its exact timestamp only. Partial word timing does not extend a coarse detection span; words wholly outside coarse segments can recover a missed span.
+- An uncovered original boundary does not block a correction with supported endpoints. The final Choice can select the original only when both endpoints are covered and its speech can be isolated. See [API error details](api.md#inference-errors).
 - The evidence NouL adds an upstream call unless cached.
-- `JEV_REVIEW_REFINE_BOUNDARIES=false` disables boundary-pair refinement by default. Set it to `true` to select one complete range from supplied word timings.
-- A pair can retain the original boundary or use the closest meaningful timed boundary: a sentence break or a coarse segment edge with an exact word timestamp. It must overlap both the candidate and Jev's corroborated span.
-- The Choice contains up to 9 valid combinations of keep, trim, or extend boundaries, plus unknown.
-- `GET /api/status` reports effective enabled state, model, evidence threshold, and Choice threshold. Enabled does not guarantee refinement: word timings, sufficient evidence, and a confident pair selection are required.
-- This local candidate set can miss further or intrasentence corrections. It does not claim an efficacy improvement.
-- Review logs include request ID, stage, evidence score and threshold, word counts, Choice confidence, and skip or failure reason.
-- An unknown or low-confidence pair selection returns 422 with `x-should-retry: false` and does not confirm or move the candidate.
+- `JEV_REVIEW_REFINE_BOUNDARIES=false` disables boundary refinement by default. Set it to `true` to offer Jev observed start and end timestamps near the current cut.
+- The start Choice offers observed utterance starts within 30 seconds, with the original start retained. A second Choice can refine the selected utterance to an observed word start. The end Choice offers observed word ends within 30 seconds. Each question includes an `unknown` option. The start and end choices propose a pair; their probabilities do not prove that it is safe. A question with more than 255 options including `unknown` abstains. If word refinement exceeds that limit, the utterance start remains selected.
+- A comparison Choice considers the proposed and original cuts and can choose neither. It sees speech in both intervals and nearby context. Each eligible interval then needs a sponsor-read score at or above `JEV_REVIEW_CHOICE_THRESHOLD`. Programme checks veto the interval if they reach `JEV_REVIEW_PROGRAMME_VETO`, which defaults to 0.85. When both intervals pass, the comparison decides whether to adjust or keep the original.
+- The proxy assembles selected speech from whole transcript rows and aligned edge words. It abstains with `insufficient_boundary_text` if it cannot isolate a row crossed by a selected boundary. Timestamp gaps alone do not prove missing speech.
+- Refinement still needs both word edges, sufficient evidence, context coverage and overlap, and the shared request deadline. Cache hits and retries follow the same policy as other Jev calls. Boundary refinement is experimental; its accuracy has not been measured.
+- `GET /api/status` reports effective enabled state, model, evidence threshold, and boundary validation threshold. Enabled does not guarantee refinement: word timings, sufficient evidence, and valid boundary choices are required.
+- Review-abstention and API-error logs include the existing `X-Request-ID`. Inconclusive response details include reason and stage, plus allowlisted numeric or boolean diagnostics. Coverage skips report the requested range and endpoint support flags, without a score or cache status. These diagnostics do not include request text. Final Choice diagnostics report comparative option probabilities, not an absolute ad probability. Logs include selected boundaries, option probabilities, and skip or failure reason. Upstream review errors log the failed stage, request sizes, question counts, and allowlisted error codes without prompt text. Attempt counts cover actual boundary selections, not empty candidate sets. `no_valid_pairs` before ranking is a skip.
+- Changed counts are recommendations, not confirmed applied cuts. MinusPod may clamp or reject them to protect DAI cores.
 - MinusPod's local breaker still counts non-rate errors. Review preserves upstream `4xx` responses, including `429`. A valid `Retry-After` header is forwarded for upstream `408`, `429`, and `5xx` responses. Timeouts return `504`; transport and upstream `5xx` failures return `503`. Invalid review responses return `503`.
 
 ## Sponsor naming
@@ -104,7 +113,8 @@ The category pass uses one Jev Choice for each detected span. Its values are `sp
 - Set `MINUSPOD_BASE_URL` and `MINUSPOD_PASSWORD`; the proxy logs into MinusPod (cached session) to read `GET /api/v1/sponsors`.
 - It emits `sponsor_name` only for one known sponsor with local ad evidence, using the `jev-` namespace, for example `jev-ButcherBox`.
 - The prefix identifies a proxy-generated learned record and the suffix is the matched canonical brand. An unmatched span leaves the field absent, preventing false sponsor evidence.
-- Its `Based on transcript:` rationale quotes source evidence rather than synthetic ad wording, and the compatibility parser recognizes it as rationale.
+- For a confirmed local sponsor match, the rationale uses the raw transcript excerpt instead of a `Based on transcript:` wrapper that MinusPod can reject as generated text.
+- Unmatched spans keep the wrapper and omit an explicit sponsor name. This preserves MinusPod's guard against minting unprefixed regex sponsors. Other learning guards still apply.
 - Unset `MINUSPOD_BASE_URL` falls back to the gazetteer.
 
 ## Runtime ownership

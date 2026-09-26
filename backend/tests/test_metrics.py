@@ -5,7 +5,9 @@ from typing import Any
 
 import httpx
 import pytest
+from app.api.openai import _inconclusive_diagnostics, _metric_inconclusive_reason
 from app.services.jev import call_payload, jev_ask
+from app.services.openai_adapter import ReviewInconclusiveError
 from app.utils.metrics import metrics
 
 ANSWER: dict[str, Any] = {
@@ -126,7 +128,18 @@ def test_review_metrics_use_fixed_safe_values_and_reset():
     assert snapshot["review"]["reasons"] == {
         "ambiguous_spans": 0,
         "insufficient_evidence": 1,
+        "no_valid_pairs": 0,
+        "transcript_gap": 0,
         "choice_inconclusive": 0,
+        "neither_complete": 0,
+        "ad_content_unconfirmed": 0,
+        "programme_content_detected": 0,
+        "too_many_boundary_options": 0,
+        "missing_boundary_coverage": 0,
+        "insufficient_boundary_text": 0,
+        "edge_content_unconfirmed": 0,
+        "adjacent_message_continues": 0,
+        "unrelated_editorial": 0,
         "malformed_context": 0,
         "invalid_choice": 0,
         "upstream_failure": 0,
@@ -138,6 +151,39 @@ def test_review_metrics_use_fixed_safe_values_and_reset():
     assert snapshot["review"]["latency_ms"]["average"] == pytest.approx(10.0)
     metrics.reset()
     assert metrics.snapshot()["review"]["count"] == 0
+
+
+def test_no_valid_pairs_reason_and_refinement_skip_are_reported():
+    pairs_error = ReviewInconclusiveError(
+        "not used for classification", reason="no_valid_pairs", stage="choice_rank"
+    )
+    gap_error = ReviewInconclusiveError(
+        "not used for classification", reason="transcript_gap", stage="context"
+    )
+    coverage_error = ReviewInconclusiveError(
+        "not used for classification",
+        reason="missing_boundary_coverage",
+        stage="boundary_coverage",
+    )
+    pairs = _inconclusive_diagnostics(pairs_error)
+    gap = _inconclusive_diagnostics(gap_error)
+    coverage = _inconclusive_diagnostics(coverage_error)
+    assert pairs["reason"] == "no_valid_pairs"
+    assert gap["reason"] == "transcript_gap"
+    assert _metric_inconclusive_reason(pairs) == "no_valid_pairs"
+    assert _metric_inconclusive_reason(gap) == "transcript_gap"
+    assert _metric_inconclusive_reason(coverage) == "missing_boundary_coverage"
+    metrics.record_review("inconclusive", 5.0, "no_valid_pairs")
+    metrics.record_review_refinement("skipped", skip_reason="no_valid_pairs")
+    metrics.record_review("inconclusive", 5.0, "transcript_gap")
+    metrics.record_review_refinement("skipped", skip_reason="transcript_gap")
+    metrics.record_review("inconclusive", 5.0, _metric_inconclusive_reason(coverage))
+    snapshot = metrics.snapshot()["review"]
+    assert snapshot["reasons"]["no_valid_pairs"] == 1
+    assert snapshot["refinement"]["skipped"]["no_valid_pairs"] == 1
+    assert snapshot["reasons"]["transcript_gap"] == 1
+    assert snapshot["refinement"]["skipped"]["transcript_gap"] == 1
+    assert snapshot["reasons"]["missing_boundary_coverage"] == 1
 
 
 async def test_stats_schema_and_inference_path_scope(client):
@@ -177,7 +223,18 @@ async def test_stats_schema_and_inference_path_scope(client):
     assert set(snapshot["review"]["reasons"]) == {
         "ambiguous_spans",
         "insufficient_evidence",
+        "no_valid_pairs",
+        "transcript_gap",
         "choice_inconclusive",
+        "neither_complete",
+        "ad_content_unconfirmed",
+        "programme_content_detected",
+        "too_many_boundary_options",
+        "missing_boundary_coverage",
+        "insufficient_boundary_text",
+        "edge_content_unconfirmed",
+        "adjacent_message_continues",
+        "unrelated_editorial",
         "malformed_context",
         "invalid_choice",
         "upstream_failure",
@@ -199,6 +256,8 @@ async def test_stats_schema_and_inference_path_scope(client):
             "insufficient_evidence": 0,
             "ambiguous_spans": 0,
             "no_overlapping_span": 0,
+            "no_valid_pairs": 0,
+            "transcript_gap": 0,
         },
     }
     assert set(snapshot["proxy_requests"]["latency_ms"]) == {

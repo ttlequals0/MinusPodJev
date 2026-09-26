@@ -1,13 +1,14 @@
 """Regression coverage for typed review calls and review route accounting."""
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
 from app.config import settings
 from app.services.jev import jev_review_questions
-from app.services.openai_adapter import _pair_questions, _review_state
+from app.services.openai_adapter import _comparison_question, _review_state
 from app.utils.cache import hash_payload
 from app.utils.metrics import metrics
 
@@ -111,7 +112,26 @@ def test_review_helper_rejects_cache_entry_with_missing_usage(tmp_path):
     assert calls == 1
 
 
-async def test_review_gap_is_rejected_before_upstream(jev_env, client, monkeypatch):
+def test_review_helper_accepts_focused_noul_and_validates_its_cache(tmp_path):
+    questions = {
+        "proposed_range": {
+            "type": "noul",
+            "instructions": "The proposed complete range is advertising.",
+        }
+    }
+
+    def fetcher(_payload, **_kwargs):
+        return {"answers": {"proposed_range": {"noul": 0.99}}, "usage": {"input_tokens": 3, "output_tokens": 2}}
+
+    result = _review_call(tmp_path, fetcher, questions)
+
+    assert result["answers"]["proposed_range"] == 0.99
+
+
+@pytest.mark.parametrize("pool", ["accepted", "resurrection"])
+async def test_review_gap_is_inconclusive_before_upstream(
+    jev_env, client, monkeypatch, caplog, pool
+):
     import app.services.jev as jev
 
     called = False
@@ -123,14 +143,174 @@ async def test_review_gap_is_rejected_before_upstream(jev_env, client, monkeypat
 
     monkeypatch.setattr(jev, "call_payload", fetcher)
     rows = _segments("ep-oxide-and-friends-ce789ff5b62e")
-    prompt = _corpus_prompt(8.0, 9.0, rows[:1], [], rows[1:2])
+    prompt = _corpus_prompt(8.0, 9.0, rows[:1], [], rows[1:2], pool=pool)
+    with caplog.at_level(logging.INFO):
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": prompt}]},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status_code == 422
+    assert response.headers["x-should-retry"] == "false"
+    request_id = response.headers["x-request-id"]
+    assert response.json()["error"]["code"] == "jev_review_inconclusive"
+    error = response.json()["error"]
+    assert error["candidate_start"] == 8.0
+    assert error["candidate_end"] == 9.0
+    assert error["context_start"] == float(rows[0]["start"])
+    assert error["context_end"] == float(rows[1]["end"])
+    assert called is False
+    review_metrics = metrics.snapshot()["review"]
+    assert review_metrics["outcomes"]["inconclusive"] == 1
+    assert review_metrics["outcomes"]["invalid_request"] == 0
+    assert review_metrics["outcomes"]["rejected"] == 0
+    refinement = review_metrics["refinement"]
+    assert refinement["attempted"] == 0
+    assert refinement["skipped"]["transcript_gap"] == 1
+    assert review_metrics["reasons"]["transcript_gap"] == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        f"request_id={request_id} unavailable reason=candidate lies in a transcript gap" in message
+        for message in messages
+    )
+    assert any(
+        f"request_id={request_id} status=422 error_code=jev_review_inconclusive reason=transcript_gap"
+        in message
+        for message in messages
+    )
+    assert any(
+        f"request_id={request_id} outcome=inconclusive reason=transcript_gap" in message
+        for message in messages
+    )
+
+
+@pytest.mark.parametrize(
+    "position",
+    ["tail", "head"],
+)
+async def test_review_adjacent_empty_candidate_abstains_before_upstream(
+    jev_env, client, monkeypatch, position
+):
+    import app.services.jev as jev
+
+    called = False
+
+    def fetcher(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("an adjacent empty candidate must not call Jev")
+
+    monkeypatch.setattr(jev, "call_payload", fetcher)
+    rows = _segments("ep-oxide-and-friends-ce789ff5b62e")
+    tail_word = rows[0]["words"][-1]
+    head_word = rows[1]["words"][0]
+    candidate = (float(tail_word["end"]), float(head_word["start"]))
+    edge = tail_word if position == "tail" else head_word
+    edge_name = "End" if position == "tail" else "Start"
+    prompt = build_review_prompt(*candidate, [], [], []) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        f"{edge_name} edge:\n"
+        f"[{edge['start']}s-{edge['end']}s] {edge['word']}\n"
+    )
     response = await client.post(
         "/v1/chat/completions",
         json={"messages": [{"role": "user", "content": prompt}]},
         headers={"Authorization": "Bearer test-key"},
     )
+
     assert response.status_code == 422
-    assert response.json()["error"]["code"] == "jev_review_invalid_request"
+    assert response.headers["x-should-retry"] == "false"
+    assert response.headers["x-request-id"]
+    error = response.json()["error"]
+    assert error["code"] == "jev_review_inconclusive"
+    assert error["reason"] == "transcript_gap"
+    assert error["stage"] == "context"
+    assert error["candidate_start"] == candidate[0]
+    assert error["candidate_end"] == candidate[1]
+    assert called is False
+    review_metrics = metrics.snapshot()["review"]
+    assert review_metrics["outcomes"]["inconclusive"] == 1
+    assert review_metrics["refinement"]["skipped"]["transcript_gap"] == 1
+
+
+async def test_review_incident_tail_word_endpoint_abstains_before_upstream(
+    jev_env, client, monkeypatch
+):
+    import app.services.jev as jev
+
+    def fetcher(*_args, **_kwargs):
+        raise AssertionError("an adjacent empty candidate must not call Jev")
+
+    monkeypatch.setattr(jev, "call_payload", fetcher)
+    prompt = build_review_prompt(8746.15, 8759.95, [], [], []) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "End edge:\n"
+        "[8746.13s-8746.15s] you.\n"
+    )
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": prompt}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == 422
+    assert response.headers["x-should-retry"] == "false"
+    error = response.json()["error"]
+    assert error["code"] == "jev_review_inconclusive"
+    assert error["reason"] == "transcript_gap"
+    assert error["stage"] == "context"
+    assert error["candidate_start"] == 8746.15
+    assert error["context_end"] == 8746.15
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["before", "after", "zero_width", "negative"],
+)
+async def test_review_outside_or_invalid_bounds_remain_invalid_request(
+    jev_env, client, monkeypatch, case
+):
+    import app.services.jev as jev
+
+    called = False
+
+    def fetcher(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("invalid review input must not call Jev")
+
+    monkeypatch.setattr(jev, "call_payload", fetcher)
+    rows = _segments("ep-oxide-and-friends-ce789ff5b62e")
+    context_start = float(rows[0]["start"])
+    context_end = float(rows[1]["end"])
+    candidates = {
+        "before": (context_start - 2.0, context_start - 1.0),
+        "after": (context_end + 1.0, context_end + 2.0),
+        "zero_width": (context_start, context_start),
+        "negative": (-1.0, 1.0),
+    }
+    prompt = _corpus_prompt(*candidates[case], rows[:1], [], rows[1:2])
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": prompt}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == 422
+    assert response.headers["x-should-retry"] == "false"
+    assert response.headers["x-request-id"]
+    error = response.json()["error"]
+    assert error["code"] == "jev_review_invalid_request"
+    assert error["reason"] == (
+        "outside_context" if case == "after" else "invalid_bounds"
+    )
+    assert error["stage"] == "context"
+    if case == "after":
+        assert error["candidate_start"] == candidates[case][0]
+        assert error["candidate_end"] == candidates[case][1]
+    assert error["context_start"] == context_start
+    assert error["context_end"] == context_end
     assert called is False
 
 
@@ -164,28 +344,37 @@ def test_pair_choice_keeps_all_supplied_words_in_shared_state():
     assert state["boundary_words"]["end"] == words
 
 
-def test_pair_choice_has_unknown_and_a_concrete_keep_candidate():
-    words = [
-        {"start": word["start"], "end": word["end"], "text": word["word"].strip()}
-        for word in _segments("ep-daily-tech-news-show-c1904b8605f7")[0]["words"][:1]
-    ]
+def test_comparison_question_requires_complete_cut_and_neither_option():
+    questions = _comparison_question(True, True)
+    question = questions["interval_comparison"]
 
-    segments = [{"start": words[0]["start"], "end": words[0]["end"], "text": "context"}]
-    questions, pairs = _pair_questions(
-        segments,
-        {"start": words, "end": words},
-        (words[0]["start"], words[0]["end"]),
-        (words[0]["start"], words[0]["end"]),
-    )
-    assert "unknown" in questions["boundary_pair"]["criteria"]
-    assert pairs
+    assert question["type"] == "choice"
+    assert set(question["criteria"]) == {"adjusted", "original", "neither"}
+    assert "advertising or promotional content in this break" in question["instructions"]
+    assert set(questions) == {"interval_comparison"}
+    assert set(_comparison_question(False, True)["interval_comparison"]["criteria"]) == {"original", "neither"}
 
 
-def _corpus_prompt(start: float, end: float, before: list[dict], candidate: list[dict], after: list[dict]) -> str:
+def _corpus_prompt(
+    start: float,
+    end: float,
+    before: list[dict],
+    candidate: list[dict],
+    after: list[dict],
+    *,
+    pool: str = "accepted",
+) -> str:
     def as_rows(rows):
         return [(row["start"], row["end"], row["text"]) for row in rows]
 
-    return build_review_prompt(start, end, as_rows(before), as_rows(candidate), as_rows(after))
+    return build_review_prompt(
+        start,
+        end,
+        as_rows(before),
+        as_rows(candidate),
+        as_rows(after),
+        pool=pool,
+    )
 
 
 async def test_review_api_metrics_and_request_ids(jev_env, client, monkeypatch, tmp_path):

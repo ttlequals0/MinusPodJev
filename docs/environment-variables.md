@@ -18,7 +18,7 @@
 The proxy reads these settings from the process environment. A direct source run also reads a
 `.env` file in its working directory. Docker Compose uses `.env` for interpolation, but only
 variables listed under `environment:` are passed into the container. The Compose file currently
-passes the MinusPod settings, all four threshold settings, review flags, fallback flag, and settings
+passes the MinusPod settings, all four editable thresholds, the programme veto, review flags, fallback flag, and settings
 path. It does not pass every variable in this reference; for example, `TYPESAFE_API_KEY` is not
 passed by the provided Compose file.
 
@@ -61,7 +61,8 @@ Values are probabilities from `0` to `1`. `JEV_ENTER` must be at least `JEV_STAY
 | `JEV_ENTER` | `0.95` | Opens a detected span. Compose passes this startup default. |
 | `JEV_STAY` | `0.40` | Extends an open span. Compose passes this startup default. |
 | `JEV_REVIEW_EVIDENCE_THRESHOLD` | _(unset, inherits `JEV_ENTER`)_ | Evidence threshold for review. Blank values inherit `JEV_ENTER`. |
-| `JEV_REVIEW_CHOICE_THRESHOLD` | _(unset, inherits `JEV_ENTER`)_ | Choice threshold for review. Blank values inherit `JEV_ENTER`. |
+| `JEV_REVIEW_CHOICE_THRESHOLD` | _(unset, inherits `JEV_ENTER`)_ | Minimum sponsor-read score for an eligible review cut. Blank values inherit `JEV_ENTER`. |
+| `JEV_REVIEW_PROGRAMME_VETO` | `0.85` | Reject an eligible cut when a programme-speech check reaches this probability. |
 | `JEV_REVIEW_REFINE_BOUNDARIES` | `false` | Use Jev Choice questions and supplied word timings to refine review boundaries. |
 | `JEV_SETTINGS_PATH` | `./data/runtime-settings.json` | Runtime threshold file. Compose passes this variable and separately mounts the default `/app/data` directory to the `jevproxy-data` volume. |
 

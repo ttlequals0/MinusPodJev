@@ -19,7 +19,18 @@ _REVIEW_OUTCOMES = (
 _REVIEW_REASON_CODES = (
     "ambiguous_spans",
     "insufficient_evidence",
+    "no_valid_pairs",
+    "too_many_boundary_options",
+    "transcript_gap",
     "choice_inconclusive",
+    "neither_complete",
+    "ad_content_unconfirmed",
+    "programme_content_detected",
+    "missing_boundary_coverage",
+    "insufficient_boundary_text",
+    "edge_content_unconfirmed",
+    "adjacent_message_continues",
+    "unrelated_editorial",
     "malformed_context",
     "invalid_choice",
     "upstream_failure",
@@ -34,6 +45,8 @@ _REFINEMENT_SKIP_REASONS = (
     "insufficient_evidence",
     "ambiguous_spans",
     "no_overlapping_span",
+    "no_valid_pairs",
+    "transcript_gap",
 )
 
 

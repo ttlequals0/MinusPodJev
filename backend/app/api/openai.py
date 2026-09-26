@@ -32,6 +32,7 @@ from app.services.openai_adapter import (
     is_review_request,
     parse_candidate_bounds,
     run_chat_completion,
+    sanitize_review_range_diagnostic,
 )
 from app.services.runtime_settings import RuntimeSettingsError, effective_from_settings
 from app.utils.metrics import metrics
@@ -120,6 +121,7 @@ def chat_completions(
                 stay=thresholds.detection_stay,
                 review_evidence_enter=thresholds.review_evidence,
                 review_choice_enter=thresholds.review_choice,
+                review_programme_veto=settings.JEV_REVIEW_PROGRAMME_VETO,
                 category_pass=settings.JEV_CATEGORY_PASS,
                 category_context=settings.JEV_CATEGORY_CONTEXT,
                 default_category=settings.JEV_DEFAULT_CATEGORY,
@@ -134,18 +136,47 @@ def chat_completions(
                 outcome = _review_outcome(response, extract_user_text(messages))
                 return JSONResponse(content=response, headers={"X-Request-ID": request_id or ""})
             return response
-        except ReviewInvalidRequestError:
+        except ReviewInvalidRequestError as exc:
             outcome, reason_code = "invalid_request", "invalid_request"
-            return _review_error(422, "jev_review_invalid_request", "Review request is invalid", request_id)
+            diagnostics = _invalid_request_diagnostics(exc)
+            return _review_error(
+                422,
+                "jev_review_invalid_request",
+                "Review request is invalid",
+                request_id,
+                diagnostics["reason"],
+                diagnostics,
+            )
         except ReviewInconclusiveError as exc:
-            outcome, reason_code = "inconclusive", _inconclusive_reason(str(exc))
-            return _review_error(422, "jev_review_inconclusive", "Review is inconclusive", request_id)
+            diagnostics = _inconclusive_diagnostics(exc)
+            outcome = "inconclusive"
+            reason_code = _metric_inconclusive_reason(diagnostics)
+            return _review_error(
+                422,
+                "jev_review_inconclusive",
+                _inconclusive_message(diagnostics),
+                request_id,
+                diagnostics["reason"],
+                diagnostics,
+            )
         except ReviewUpstreamInvalidResponseError:
             outcome, reason_code = "upstream_error", "upstream_invalid_response"
-            return _review_error(503, "jev_review_upstream_invalid_response", "Review unavailable", request_id)
+            return _review_error(
+                503,
+                "jev_review_upstream_invalid_response",
+                "Review unavailable",
+                request_id,
+                reason_code,
+            )
         except ReviewUnavailableError:
             outcome, reason_code = "upstream_error", "upstream_failure"
-            return _review_error(503, "jev_review_upstream_failure", "Review unavailable", request_id)
+            return _review_error(
+                503,
+                "jev_review_upstream_failure",
+                "Review unavailable",
+                request_id,
+                reason_code,
+            )
         except JevCategoryValidationError as exc:
             logger.warning(
                 "category validation_failed rule=%s details=%s",
@@ -172,26 +203,220 @@ def chat_completions(
             logger.info("review request_id=%s outcome=%s reason=%s bounds=%s elapsed_ms=%.0f", request_id, outcome or "internal_error", reason_code or "unknown", parse_candidate_bounds(extract_user_text(messages)), (time.monotonic() - started) * 1000)
 
 
-def _inconclusive_reason(message: str) -> str:
-    lowered = message.lower()
-    if "unambiguous" in lowered:
-        return "ambiguous_spans"
-    if "evidence" in lowered:
-        return "insufficient_evidence"
-    if "choice" in lowered:
-        return "choice_inconclusive"
-    return "malformed_context"
+_INCONCLUSIVE_REASONS = frozenset(
+    {
+        "transcript_gap",
+        "ambiguous_spans",
+        "insufficient_evidence",
+        "no_valid_pairs",
+        "too_many_boundary_options",
+        "choice_inconclusive",
+        "neither_complete",
+        "ad_content_unconfirmed",
+        "programme_content_detected",
+        "invalid_pair",
+        "proposed_range_not_confirmed",
+        "original_range_not_confirmed",
+        "edge_content_unconfirmed",
+        "adjacent_message_continues",
+        "unrelated_editorial",
+        "missing_boundary_coverage",
+        "insufficient_boundary_text",
+    }
+)
+_INCONCLUSIVE_STAGES = frozenset(
+    {"context", "evidence", "choice_rank", "focused_validation", "boundary_coverage"}
+)
+_METRIC_REASONS = frozenset(
+    {
+        "ambiguous_spans",
+        "insufficient_evidence",
+        "no_valid_pairs",
+        "too_many_boundary_options",
+        "transcript_gap",
+        "choice_inconclusive",
+        "neither_complete",
+        "ad_content_unconfirmed",
+        "programme_content_detected",
+        "malformed_context",
+        "missing_boundary_coverage",
+        "insufficient_boundary_text",
+        "edge_content_unconfirmed",
+        "adjacent_message_continues",
+        "unrelated_editorial",
+    }
+)
 
 
-def _review_error(status: int, code: str, message: str, request_id: str | None) -> JSONResponse:
+def _finite_number(value: Any) -> float | int | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return value
+    return None
+
+
+def _context_diagnostics_from_dict(value: dict[str, Any]) -> dict[str, float | int]:
+    details: dict[str, float | int] = {}
+    for key in ("candidate_start", "candidate_end", "context_start", "context_end"):
+        number = _finite_number(value.get(key))
+        if number is not None:
+            details[key] = number
+    return details
+
+
+def _inconclusive_diagnostics(exc: ReviewInconclusiveError) -> dict[str, Any]:
+    return _inconclusive_diagnostics_from_dict(
+        {
+            key: getattr(exc, key, None)
+            for key in (
+                "reason",
+                "stage",
+                "score",
+                "threshold",
+                "cache_hit",
+                "range_start",
+                "range_end",
+                "start_supported",
+                "end_supported",
+                "proposal",
+                "fallback",
+                "candidate_start",
+                "candidate_end",
+                "context_start",
+                "context_end",
+            )
+        }
+    )
+
+
+def _inconclusive_diagnostics_from_dict(value: dict[str, Any] | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    reason = value.get("reason")
+    stage = value.get("stage")
+    details: dict[str, Any] = {
+        "reason": reason if isinstance(reason, str) and reason in _INCONCLUSIVE_REASONS else "malformed_context",
+        "stage": stage if isinstance(stage, str) and stage in _INCONCLUSIVE_STAGES else "context",
+    }
+    for key in ("score", "threshold", "range_start", "range_end"):
+        number = _finite_number(value.get(key))
+        if number is not None:
+            details[key] = number
+    details.update(_context_diagnostics_from_dict(value))
+    for key in ("cache_hit", "start_supported", "end_supported"):
+        flag = value.get(key)
+        if isinstance(flag, bool):
+            details[key] = flag
+    for key in ("proposal", "fallback"):
+        diagnostic = sanitize_review_range_diagnostic(value.get(key))
+        if diagnostic is not None:
+            details[key] = diagnostic
+    return details
+
+
+def _invalid_request_diagnostics(exc: ReviewInvalidRequestError) -> dict[str, Any]:
+    return _invalid_request_diagnostics_from_dict(
+        {
+            "reason": getattr(exc, "reason", None),
+            "candidate_start": getattr(exc, "candidate_start", None),
+            "candidate_end": getattr(exc, "candidate_end", None),
+            "context_start": getattr(exc, "context_start", None),
+            "context_end": getattr(exc, "context_end", None),
+        }
+    )
+
+
+def _invalid_request_diagnostics_from_dict(value: dict[str, Any] | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    reason = value.get("reason")
+    details: dict[str, Any] = {
+        "reason": reason
+        if isinstance(reason, str) and reason in {"malformed_context", "invalid_bounds", "outside_context"}
+        else "malformed_context",
+        "stage": "context",
+    }
+    details.update(_context_diagnostics_from_dict(value))
+    return details
+
+
+def _inconclusive_message(diagnostics: dict[str, Any]) -> str:
+    parts = [f"reason={diagnostics['reason']}", f"stage={diagnostics['stage']}"]
+    parts.extend(
+        f"{key}={diagnostics[key]}"
+        for key in (
+            "score", "threshold", "cache_hit", "range_start", "range_end",
+            "start_supported", "end_supported",
+        )
+        if key in diagnostics
+    )
+    for name in ("proposal", "fallback"):
+        diagnostic = sanitize_review_range_diagnostic(diagnostics.get(name))
+        if diagnostic is not None:
+            parts.append(
+                name + "=" + ";".join(f"{key}={value}" for key, value in diagnostic.items())
+            )
+    return "Review is inconclusive (" + ", ".join(parts) + ")"
+
+
+def _metric_inconclusive_reason(diagnostics: dict[str, Any]) -> str:
+    detail = diagnostics.get(
+        "proposal" if diagnostics["reason"] == "proposed_range_not_confirmed" else "fallback"
+    )
+    if isinstance(detail, dict) and detail.get("reason") == "programme_content_detected":
+        return "programme_content_detected"
+    reason = str(diagnostics["reason"])
+    if reason in _METRIC_REASONS:
+        return reason
+    if diagnostics["stage"] == "context":
+        return "malformed_context"
+    return "choice_inconclusive"
+
+
+def _review_error(
+    status: int,
+    code: str,
+    message: str,
+    request_id: str | None,
+    reason: str | None = None,
+    diagnostics: dict[str, Any] | None = None,
+) -> JSONResponse:
+    safe_diagnostics = (
+        _invalid_request_diagnostics_from_dict(diagnostics)
+        if code == "jev_review_invalid_request"
+        else _inconclusive_diagnostics_from_dict(diagnostics)
+    )
     headers: dict[str, str] = {}
     if status == 422:
         headers["x-should-retry"] = "false"
     if request_id is not None:
         headers["X-Request-ID"] = request_id
+        logger.warning(
+            "review request_id=%s status=%d error_code=%s reason=%s stage=%s candidate_start=%s candidate_end=%s context_start=%s context_end=%s score=%s threshold=%s cache_hit=%s proposal=%s fallback=%s",
+            request_id,
+            status,
+            code,
+            reason or "unknown",
+            safe_diagnostics.get("stage", "unknown"),
+            safe_diagnostics.get("candidate_start", "unknown"),
+            safe_diagnostics.get("candidate_end", "unknown"),
+            safe_diagnostics.get("context_start", "unknown"),
+            safe_diagnostics.get("context_end", "unknown"),
+            safe_diagnostics.get("score", "unknown"),
+            safe_diagnostics.get("threshold", "unknown"),
+            safe_diagnostics.get("cache_hit", "unknown"),
+            safe_diagnostics.get("proposal", "unknown"),
+            safe_diagnostics.get("fallback", "unknown"),
+        )
+    error: dict[str, Any] = {
+        "message": message,
+        "type": "invalid_request_error" if status == 422 else "api_error",
+        "code": code,
+    }
+    if safe_diagnostics:
+        error.update(safe_diagnostics)
     return JSONResponse(
         status_code=status,
-        content={"error": {"message": message, "type": "invalid_request_error" if status == 422 else "api_error", "code": code}},
+        content={"error": error},
         headers=headers,
     )
 
