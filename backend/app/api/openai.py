@@ -212,6 +212,9 @@ _INCONCLUSIVE_REASONS = frozenset(
         "invalid_pair",
         "proposed_range_not_confirmed",
         "original_range_not_confirmed",
+        "edge_content_unconfirmed",
+        "adjacent_message_continues",
+        "unrelated_editorial",
         "missing_boundary_coverage",
         "insufficient_boundary_text",
     }
@@ -229,6 +232,9 @@ _METRIC_REASONS = frozenset(
         "malformed_context",
         "missing_boundary_coverage",
         "insufficient_boundary_text",
+        "edge_content_unconfirmed",
+        "adjacent_message_continues",
+        "unrelated_editorial",
     }
 )
 

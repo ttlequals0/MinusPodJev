@@ -104,7 +104,10 @@ def sanitize_review_range_diagnostic(value: dict[str, Any] | None) -> dict[str, 
     if (
         isinstance(reason, str)
         and isinstance(stage, str)
-        and reason in {"proposed_range_not_confirmed", "original_range_not_confirmed", "edge_content_unconfirmed"}
+        and reason in {
+            "proposed_range_not_confirmed", "original_range_not_confirmed", "edge_content_unconfirmed",
+            "adjacent_message_continues", "unrelated_editorial",
+        }
         and stage == "focused_validation"
     ):
         score = value.get("score")
@@ -144,6 +147,9 @@ class ReviewInconclusiveError(ReviewUnavailableError):
             "invalid_pair",
             "proposed_range_not_confirmed",
             "original_range_not_confirmed",
+            "edge_content_unconfirmed",
+            "adjacent_message_continues",
+            "unrelated_editorial",
             "missing_boundary_coverage",
             "insufficient_boundary_text",
         }
@@ -763,6 +769,37 @@ def _review_state(
     return state
 
 
+def _choice_state(
+    segments: Sequence[dict[str, Any]],
+    cand: tuple[float, float],
+    guidance: str,
+    caller_context: str,
+) -> dict[str, Any]:
+    def nearby(value: float) -> str:
+        nearby_rows = [segment for segment in segments
+                       if float(segment["end"]) >= value - _BOUNDARY_SEARCH_SECONDS
+                       and float(segment["start"]) <= value + _BOUNDARY_SEARCH_SECONDS]
+        before = [segment for segment in nearby_rows if float(segment["end"]) <= value][-16:]
+        crossing = [segment for segment in nearby_rows
+                    if float(segment["start"]) < value < float(segment["end"])]
+        after = [segment for segment in nearby_rows if float(segment["start"]) >= value][:16]
+        rows = before + crossing + after
+        return "\n".join(
+            f"[{float(segment['start']):.2f}s-{float(segment['end']):.2f}s] {segment['text']}"
+            for segment in sorted(rows, key=lambda segment: float(segment["start"]))
+        )
+
+    state: dict[str, Any] = {
+        "guidance": guidance,
+        "candidate": {"start": cand[0], "end": cand[1]},
+        "start_context": nearby(cand[0]),
+        "end_context": nearby(cand[1]),
+    }
+    if caller_context:
+        state["caller_context"] = caller_context
+    return state
+
+
 def _edge_reference(words: Sequence[dict[str, Any]], value: float, direction: str, current: float) -> str:
     if not words:
         return f"current candidate boundary at {value:.2f}s" if value == current else f"at {value:.2f}s"
@@ -876,12 +913,12 @@ def _rank_questions(
         {
             "boundary_start": {
                 "type": "choice",
-                "instructions": "Choose where complete advertising speech begins. Compare the speech before and after each option. Do not split an utterance. Choose unknown if none is supported.",
+                "instructions": "Choose the start of the advertising or promotional break. Include its full introduction. Use `start_context` and the speech around each timestamp; leave unrelated show speech before the cut. Choose unknown if none fits.",
                 "criteria": start_criteria,
             },
             "boundary_end": {
                 "type": "choice",
-                "instructions": "Choose where complete advertising speech ends. Compare the speech before and after each option. Do not split an utterance. Choose unknown if none is supported.",
+                "instructions": "Choose the end of the advertising or promotional break. Include its final offer, URL, and sign-off. Use `end_context` and the speech around each timestamp; leave unrelated show speech after the cut. Choose unknown if none fits.",
                 "criteria": end_criteria,
             },
         },
@@ -894,8 +931,12 @@ def _focused_range_question(name: str) -> dict[str, dict[str, Any]]:
     return {
         name: {
             "type": "noul",
-            "instructions": "The speech in `assessment_speech` is advertising content under `guidance`, not editorial discussion.",
-        }
+            "instructions": "Is `assessment_speech` an uninterrupted advertising or promotional break under `guidance`? Host demonstrations, discussion of the promoted product, offers, and sign-offs belong to the break.",
+        },
+        "unrelated_editorial": {
+            "type": "noul",
+            "instructions": "Does `assessment_speech` include show discussion unrelated to the advertising or promotional break? Sponsor demonstrations and sign-offs are part of the break.",
+        },
     }
 
 
@@ -926,6 +967,47 @@ def _assessment_speech(
         if text:
             lines.append(text)
     return "\n".join(lines)
+
+
+def _neighbor_speech(
+    words: Sequence[dict[str, Any]], boundary: float, direction: str
+) -> tuple[str, str]:
+    observed = sorted(
+        {(float(word["start"]), float(word["end"]), str(word["text"])) for word in words}
+    )
+    if direction == "before":
+        nearby = [word for word in observed if word[1] <= boundary]
+        if not nearby or boundary - nearby[-1][1] > 5.0:
+            return "", ""
+        nearby = nearby[-16:]
+        return " ".join(word[2] for word in nearby[-8:]), " ".join(word[2] for word in nearby[:-8])
+    nearby = [word for word in observed if word[0] >= boundary]
+    if not nearby or nearby[0][0] - boundary > 5.0:
+        return "", ""
+    nearby = nearby[:16]
+    return " ".join(word[2] for word in nearby[:8]), " ".join(word[2] for word in nearby[8:])
+
+
+def _continuation_questions(
+    word_edges: dict[str, list[dict[str, Any]]], bounds: tuple[float, float]
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    questions: dict[str, dict[str, Any]] = {}
+    speech: dict[str, str] = {}
+    for edge, direction, selected in (
+        ("start", "before", "selected_start_speech"),
+        ("end", "after", "selected_end_speech"),
+    ):
+        neighbor, context = _neighbor_speech(word_edges[edge], bounds[0 if edge == "start" else 1], direction)
+        if not neighbor:
+            continue
+        field = f"{direction}_edge_speech"
+        speech[field] = neighbor
+        speech[f"{direction}_edge_context"] = context
+        questions[f"{direction}_continuation"] = {
+            "type": "noul",
+            "instructions": f"Does the same advertising message as `{selected}` continue across the cut? Read `{field}` and `{direction}_edge_context` in time order. Neutral connective speech followed by its offer or URL can continue the message. Answer yes for any contiguous continuation next to the cut before a show return. A separate advertisement or break bumper is not the same message.",
+        }
+    return questions, speech
 
 
 def _valid_pairs(
@@ -1141,11 +1223,12 @@ def run_review(
         questions: dict[str, dict[str, Any]],
         stage: str,
         assessment_range: tuple[float, float] | None = None,
-        excluded_speech: dict[str, str] | None = None,
+        extra_state: dict[str, str] | None = None,
+        question_state_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         nonlocal review_input_tokens, review_output_tokens
         started = time.monotonic()
-        question_state = state
+        question_state = question_state_override if question_state_override is not None else state
         if assessment_range is not None:
             speech = _assessment_speech(segments, word_edges, assessment_range)
             if not speech:
@@ -1156,8 +1239,10 @@ def run_review(
             question_state = {
                 "guidance": review_guidance,
                 "assessment_speech": speech,
+                "selected_start_speech": " ".join(speech.split()[:16]),
+                "selected_end_speech": " ".join(speech.split()[-16:]),
             }
-            question_state.update(excluded_speech or {})
+            question_state.update(extra_state or {})
             if caller_context:
                 question_state["caller_context"] = caller_context
         try:
@@ -1197,7 +1282,36 @@ def run_review(
                 stage,
             )
             raise ReviewUpstreamInvalidResponseError("Jev review response was invalid") from exc
-        except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.TransportError):
+        except httpx.HTTPStatusError as exc:
+            try:
+                upstream = exc.response.json()
+            except ValueError:
+                upstream = None
+            error = upstream.get("error") if isinstance(upstream, dict) else None
+            error = error if isinstance(error, dict) else {}
+
+            def safe_code(value: Any) -> str | None:
+                allowed = {
+                    "invalid_request_error", "validation_error", "bad_request", "malformed_request",
+                    "invalid_input", "context_length_exceeded", "payload_too_large", "too_many_tokens",
+                }
+                return value if isinstance(value, str) and value in allowed else None
+
+            logger.warning(
+                "review request_id=%s stage=%s upstream_status=%s state_bytes=%d questions_bytes=%d question_count=%d criteria_counts=%s response_bytes=%d upstream_type=%s upstream_code=%s",
+                review_request_id,
+                stage,
+                exc.response.status_code,
+                len(json.dumps(question_state).encode()),
+                len(json.dumps(questions).encode()),
+                len(questions),
+                {key: len(question.get("criteria", {})) for key, question in questions.items()},
+                len(exc.response.content),
+                safe_code(error.get("type")),
+                safe_code(error.get("code")),
+            )
+            raise
+        except (httpx.TimeoutException, httpx.TransportError):
             raise
         except Exception as exc:  # noqa: BLE001
             raise ReviewUnavailableError("Jev review request failed") from exc
@@ -1298,18 +1412,24 @@ def run_review(
         )
         try:
             rank_questions, start_values, end_values = _rank_questions(word_edges, cand, starts, ends)
-            ranked = review_questions(rank_questions, "choice_rank")
+            ranked = review_questions(
+                rank_questions,
+                "choice_rank",
+                question_state_override=_choice_state(coarse_segments, cand, review_guidance, caller_context),
+            )
             start_answer = ranked["answers"]["boundary_start"]
             end_answer = ranked["answers"]["boundary_end"]
             start_probs = start_answer["probabilities"]
             end_probs = end_answer["probabilities"]
             logger.info(
-                "review request_id=%s stage=choice_rank start_choice=%s start_probability=%s start_confidence=%s end_choice=%s end_probability=%s end_confidence=%s probability_floor=0.5 cache_hit=%s",
+                "review request_id=%s stage=choice_rank start_choice=%s start_time=%s start_probability=%s start_confidence=%s end_choice=%s end_time=%s end_probability=%s end_confidence=%s probability_floor=0.5 cache_hit=%s",
                 review_request_id,
                 start_answer["choice"],
+                start_values.get(start_answer["choice"]),
                 start_probs[start_answer["choice"]],
                 start_answer["confidence"],
                 end_answer["choice"],
+                end_values.get(end_answer["choice"]),
                 end_probs[end_answer["choice"]],
                 end_answer["confidence"],
                 ranked["cache_hit"],
@@ -1358,6 +1478,8 @@ def run_review(
                     edge_speech["added_end_speech"] = edge_text
             if proposed_start_supported and proposed_end_supported and proposed_text_supported:
                 questions = _focused_range_question(focused_name)
+                continuation_questions, neighbor_speech = _continuation_questions(word_edges, proposed)
+                questions.update(continuation_questions)
                 for field in edge_speech:
                     action = "kept in the episode" if field.startswith("excluded_") else "included in the advertising break"
                     questions[field.removesuffix("_speech") + "_valid"] = {
@@ -1368,30 +1490,45 @@ def run_review(
                     questions,
                     "focused_validation",
                     proposed,
-                    edge_speech,
+                    {**edge_speech, **neighbor_speech},
                 )
-                focused_score = float(focused["answers"][focused_name])
+                ad_score = float(focused["answers"][focused_name])
+                editorial_score = float(focused["answers"]["unrelated_editorial"])
+                continuation_score = max(
+                    (float(focused["answers"][name]) for name in continuation_questions),
+                    default=0.0,
+                )
                 edge_score = min(
                     (float(focused["answers"][field.removesuffix("_speech") + "_valid"])
                      for field in edge_speech),
                     default=1.0,
                 )
+                focused_score = min(ad_score, 1.0 - editorial_score, 1.0 - continuation_score, edge_score)
+                focused_reason = min(
+                    (ad_score, "proposed_range_not_confirmed"),
+                    (1.0 - editorial_score, "unrelated_editorial"),
+                    (1.0 - continuation_score, "adjacent_message_continues"),
+                    (edge_score, "edge_content_unconfirmed"),
+                )[1]
                 logger.info(
-                    "review request_id=%s stage=focused_validation range=%s score=%s threshold=%s edge_score=%s cache_hit=%s",
+                    "review request_id=%s stage=focused_validation range=%s score=%s threshold=%s ad_score=%s editorial_score=%s continuation_score=%s edge_score=%s cache_hit=%s",
                     review_request_id,
                     proposed,
                     focused_score,
                     review_choice_enter,
+                    ad_score,
+                    editorial_score,
+                    continuation_score,
                     edge_score,
                     focused["cache_hit"],
                 )
                 if proposed != cand:
                     proposal_diagnostic = {
-                        "reason": "edge_content_unconfirmed" if edge_score < review_choice_enter else "proposed_range_not_confirmed",
+                        "reason": focused_reason,
                         "stage": "focused_validation",
                         "range_start": proposed[0],
                         "range_end": proposed[1],
-                        "score": edge_score if edge_score < review_choice_enter else focused_score,
+                        "score": focused_score,
                         "threshold": review_choice_enter,
                         "cache_hit": bool(focused["cache_hit"]),
                     }
@@ -1416,7 +1553,7 @@ def run_review(
                         "start_supported": proposed_start_supported,
                         "end_supported": proposed_end_supported,
                     }
-            if focused_score is not None and focused_score >= review_choice_enter and edge_score >= review_choice_enter:
+            if focused_score is not None and focused_score >= review_choice_enter:
                 ad_start, ad_end = proposed
                 metrics.record_review_refinement(
                     "completed",
@@ -1435,22 +1572,42 @@ def run_review(
                 )
                 original_text_supported = bool(_assessment_speech(segments, word_edges, cand))
                 if original_start_supported and original_end_supported and original_text_supported:
+                    original_questions = _focused_range_question("original_range")
+                    continuation_questions, neighbor_speech = _continuation_questions(word_edges, cand)
+                    original_questions.update(continuation_questions)
                     original = review_questions(
-                        _focused_range_question("original_range"),
+                        original_questions,
                         "focused_validation",
                         cand,
+                        neighbor_speech,
                     )
-                    original_score = float(original["answers"]["original_range"])
+                    original_ad_score = float(original["answers"]["original_range"])
+                    original_editorial_score = float(original["answers"]["unrelated_editorial"])
+                    original_continuation_score = max(
+                        (float(original["answers"][name]) for name in continuation_questions),
+                        default=0.0,
+                    )
+                    original_score = min(
+                        original_ad_score, 1.0 - original_editorial_score, 1.0 - original_continuation_score
+                    )
+                    original_reason = min(
+                        (original_ad_score, "original_range_not_confirmed"),
+                        (1.0 - original_editorial_score, "unrelated_editorial"),
+                        (1.0 - original_continuation_score, "adjacent_message_continues"),
+                    )[1]
                     logger.info(
-                        "review request_id=%s stage=focused_validation range=%s score=%s threshold=%s cache_hit=%s",
+                        "review request_id=%s stage=focused_validation range=%s score=%s threshold=%s ad_score=%s editorial_score=%s continuation_score=%s cache_hit=%s",
                         review_request_id,
                         cand,
                         original_score,
                         review_choice_enter,
+                        original_ad_score,
+                        original_editorial_score,
+                        original_continuation_score,
                         original["cache_hit"],
                     )
                     fallback_diagnostic = {
-                        "reason": "original_range_not_confirmed",
+                        "reason": original_reason,
                         "stage": "focused_validation",
                         "range_start": cand[0],
                         "range_end": cand[1],
@@ -1504,7 +1661,7 @@ def run_review(
                         pool,
                         "Jev did not confirm the proposed or original complete range",
                         review_request_id,
-                        reason="original_range_not_confirmed",
+                        reason=fallback_diagnostic["reason"],
                         stage="focused_validation",
                         score=original_score,
                         threshold=review_choice_enter,
@@ -1531,7 +1688,7 @@ def run_review(
                     pool,
                     "Jev did not confirm the original complete range",
                     review_request_id,
-                    reason="original_range_not_confirmed",
+                    reason=focused_reason,
                     stage="focused_validation",
                     score=focused_score,
                     threshold=review_choice_enter,

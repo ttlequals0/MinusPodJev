@@ -18,6 +18,8 @@ from app.services.openai_adapter import (
     ReviewUnavailableError,
     _assessment_speech,
     _boundary_candidates,
+    _choice_state,
+    _continuation_questions,
     _range_boundary_support,
     _recover_review_segments,
     _review_prompt_parts,
@@ -173,6 +175,41 @@ def test_word_transition_options_include_unpunctuated_return_after_many_words():
     assert len(ends) <= 49
 
 
+def test_choice_context_keeps_earlier_ad_lead_in_beyond_nearest_rows():
+    rows = [
+        {"start": 2800.0, "end": 2801.0, "text": "Break handoff."},
+        {"start": 2802.0, "end": 2803.0, "text": "Ad lead-in begins."},
+    ] + [
+        {"start": 2804.0 + index * 1.5, "end": 2805.0 + index * 1.5, "text": f"Ad sentence {index}."}
+        for index in range(10)
+    ] + [{"start": 2820.0, "end": 2822.0, "text": "Brand mentioned."}]
+
+    state = _choice_state(rows, (2820.0, 2840.0), "guidance", "")
+
+    assert "Break handoff." in state["start_context"]
+    assert "Ad lead-in begins." in state["start_context"]
+    assert "Brand mentioned." in state["start_context"]
+    assert "boundary_words" not in state
+
+
+def test_neighbor_question_separates_immediate_ad_tail_from_later_show_context():
+    end_words = [
+        {"start": 120.0 + index * 0.2, "end": 120.2 + index * 0.2, "text": word}
+        for index, word in enumerate(
+            "Now I am impressed with what they do acme .com all right back to the show".split()
+        )
+    ]
+    questions, state = _continuation_questions(
+        {"start": [], "end": end_words}, (100.0, 120.0)
+    )
+
+    assert state["after_edge_speech"] == "Now I am impressed with what they do"
+    assert state["after_edge_context"].startswith("acme .com all right back")
+    assert "same advertising message" in questions["after_continuation"]["instructions"]
+    assert "offer or URL" in questions["after_continuation"]["instructions"]
+    assert "after_edge_context" in questions["after_continuation"]["instructions"]
+
+
 def test_truncated_word_window_does_not_create_utterance_edge():
     segments = [{"start": 100.0, "end": 120.0, "text": "continuous sponsor speech"}]
     words = {
@@ -221,7 +258,7 @@ def test_unsupported_original_can_trim_to_word_supported_range(jev_env, tmp_path
     ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
     assert (ad["start"], ad["end"]) == (94.0, 100.0)
     assert focused_ranges == [
-        "The speech in `assessment_speech` is advertising content under `guidance`, not editorial discussion."
+        "Is `assessment_speech` an uninterrupted advertising or promotional break under `guidance`? Host demonstrations, discussion of the promoted product, offers, and sign-offs belong to the break."
     ]
     refinement = metrics.snapshot()["review"]["refinement"]
     assert refinement["attempted"] == 1
@@ -280,7 +317,7 @@ def test_zero_duration_word_supports_selected_endpoint_outside_coarse_context(
     assert len(focused_payloads) == 1
     focused = focused_payloads[0]
     assert focused["questions"]["proposed_range"]["instructions"] == (
-        "The speech in `assessment_speech` is advertising content under `guidance`, not editorial discussion."
+        "Is `assessment_speech` an uninterrupted advertising or promotional break under `guidance`? Host demonstrations, discussion of the promoted product, offers, and sign-offs belong to the break."
     )
     assert focused["state"]["assessment_speech"] == "This episode is sponsored by BetterHelp"
     assert "transcript" not in focused["state"]
@@ -357,12 +394,17 @@ def make_text_fake(*, keywords=_AD_KW, input_tokens=1200, output_tokens=6, raise
         sid_text: dict[str, str] = {}
         if "assessment_speech" in payload["state"]:
             sid_text["s0"] = payload["state"]["assessment_speech"].lower()
-        else:
+        elif "transcript" in payload["state"]:
             for line in payload["state"]["transcript"].splitlines():
                 tag, _, body = line.partition("| ")
                 sid_text[f"s{int(tag[1:])}"] = body.lower()
+        else:
+            sid_text["s0"] = (payload["state"]["start_context"] + payload["state"]["end_context"]).lower()
         answers: dict[str, Any] = {}
         for key in payload["questions"]:
+            if key in {"unrelated_editorial", "before_continuation", "after_continuation"}:
+                answers[key] = {"noul": 0.02}
+                continue
             if key.startswith(("excluded_", "added_")) and key.endswith("_valid"):
                 field = key.removesuffix("_valid") + "_speech"
                 speech = payload["state"].get(field, "").lower()
@@ -1059,6 +1101,120 @@ def test_weak_choice_winner_keeps_supported_original(jev_env, tmp_path):
     assert (ad["start"], ad["end"]) == (100.0, 120.0)
 
 
+def test_weak_choice_cannot_confirm_original_with_same_ad_after_end(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        100.0, 118.0,
+        [(94.0, 100.0, "Discussion ends.")],
+        [(100.0, 118.0, "This portion is sponsored by Acme."),
+         (118.0, 120.0, "Use the Acme offer at acme.com.")],
+        [(120.0, 130.0, "Back to the discussion.")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] This\n"
+        "End edge:\n[117.0s-118.0s] Acme.\n[118.0s-119.0s] Use\n"
+        "[119.0s-120.0s] acme.com.\n"
+    )
+    normal = make_text_fake()
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if "boundary_end" in payload["questions"]:
+            answer = result["answers"]["boundary_end"]
+            alternatives = [key for key in answer["probabilities"] if key != answer["choice"]]
+            answer["probabilities"] = {
+                key: 0.4 if key == answer["choice"] else 0.35 if key == alternatives[0] else 0.25 / (len(alternatives) - 1)
+                for key in answer["probabilities"]
+            }
+        if "after_continuation" in payload["questions"]:
+            assert "Use" in payload["state"]["after_edge_speech"]
+            result["answers"]["after_continuation"] = {"noul": 0.98}
+        return result
+
+    with pytest.raises(ReviewInconclusiveError, match="original complete range"):
+        _run(prompt, fake, tmp_path, refine_boundaries=True)
+
+
+def test_separate_neighboring_ad_does_not_block_complete_cut(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(94.0, 100.0, "Discussion ends.")],
+        [(100.0, 120.0, "Acme sponsor offer and sign-off.")],
+        [(120.0, 130.0, "A separate Beacon sponsor offer.")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] Acme\n"
+        "End edge:\n[119.0s-120.0s] sign-off.\n[120.0s-121.0s] A\n"
+        "[121.0s-122.0s] separate\n"
+    )
+    normal = make_text_fake()
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if "after_continuation" in payload["questions"]:
+            assert "same advertising message" in payload["questions"]["after_continuation"]["instructions"]
+            assert "separate" in payload["state"]["after_edge_speech"]
+            result["answers"]["after_continuation"] = {"noul": 0.02}
+        return result
+
+    response = _run(prompt, fake, tmp_path, refine_boundaries=True)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+    assert (ad["start"], ad["end"]) == (100.0, 120.0)
+
+
+def test_unrelated_editorial_vetoes_ad_present_in_mixed_cut(jev_env, tmp_path):
+    normal = make_text_fake()
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if "unrelated_editorial" in payload["questions"]:
+            result["answers"]["unrelated_editorial"] = {"noul": 0.98}
+        return result
+
+    with pytest.raises(ReviewInconclusiveError, match="original complete range"):
+        _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+
+
+def test_rank_state_uses_nearby_context_without_duplicate_word_arrays(jev_env, tmp_path):
+    normal = make_text_fake()
+
+    def fake(payload, **kwargs):
+        if "boundary_start" in payload["questions"]:
+            state = payload["state"]
+            assert "Editorial before" in state["start_context"]
+            assert "Sponsor continues" in state["end_context"]
+            assert "transcript" not in state
+            assert "boundary_words" not in state
+            assert "timeline" not in state
+        return normal(payload, **kwargs)
+
+    _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+
+
+def test_rank_upstream_error_logs_only_safe_metadata(jev_env, tmp_path, caplog):
+    normal = make_text_fake()
+    secret = "sensitive-prompt-and-credential"
+
+    def fake(payload, **kwargs):
+        if "boundary_start" in payload["questions"]:
+            request = httpx.Request("POST", "https://api.example/v1/systemone")
+            response = httpx.Response(
+                400, request=request,
+                json={"error": {"type": secret, "code": secret, "message": secret}},
+            )
+            raise httpx.HTTPStatusError("upstream failure", request=request, response=response)
+        return normal(payload, **kwargs)
+
+    with caplog.at_level("WARNING", logger="app.services.openai_adapter"):
+        with pytest.raises(httpx.HTTPStatusError):
+            _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+
+    assert "stage=choice_rank upstream_status=400" in caplog.text
+    assert "state_bytes=" in caplog.text
+    assert "criteria_counts=" in caplog.text
+    assert "upstream_type=None upstream_code=None" in caplog.text
+    assert secret not in caplog.text
+
+
 def test_ambiguous_intro_fragment_cannot_be_trimmed(jev_env, tmp_path):
     prompt = build_review_prompt(
         100.0, 120.0,
@@ -1531,6 +1687,39 @@ async def test_review_api_reports_unaligned_boundary_text_as_inconclusive(jev_en
     assert response.status_code == 422
     assert response.json()["error"]["reason"] == "insufficient_boundary_text"
     assert metrics.snapshot()["review"]["reasons"]["insufficient_boundary_text"] == 1
+
+
+@pytest.mark.parametrize(
+    ("failed_question", "reason"),
+    [("unrelated_editorial", "unrelated_editorial"),
+     ("after_continuation", "adjacent_message_continues")],
+)
+async def test_review_api_preserves_specific_focus_failure_reason(
+    jev_env, client, monkeypatch, failed_question, reason
+):
+    monkeypatch.setattr(settings, "JEV_REVIEW_REFINE_BOUNDARIES", True)
+    normal = make_text_fake()
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if failed_question in payload["questions"]:
+            result["answers"][failed_question] = {"noul": 0.98}
+        return result
+
+    monkeypatch.setattr(jev, "call_payload", fake)
+    prompt = _meaningful_pair_prompt()
+    if failed_question == "after_continuation":
+        prompt += "[120.0s-121.0s] continuation\n"
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": prompt}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["reason"] == reason
+    assert response.json()["error"]["stage"] == "focused_validation"
+    assert metrics.snapshot()["review"]["reasons"][reason] == 1
 
 
 async def test_focused_validation_upstream_failure_preserves_503(

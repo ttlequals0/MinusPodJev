@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.16 - 2026-09-25
+
+- Use bounded transcript context for boundary choices instead of repeating full word arrays. Log selected timestamps and safe request sizes on upstream review errors.
+- Check the selected cut for unrelated show speech and whether adjacent words continue the same promotional message. Apply these checks to the original-cut fallback as well as changed boundaries.
+- Keep review thresholds and detection behavior unchanged. Boundary refinement remains experimental and needs live accuracy testing.
+
 ## 0.1.15 - 2026-09-25
 
 - Offer Jev word-timed boundary choices with nearby speech and include unpunctuated word edges close to the current cut.

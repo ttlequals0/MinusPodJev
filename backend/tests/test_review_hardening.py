@@ -349,8 +349,9 @@ def test_focused_range_question_uses_selected_speech_only():
 
     assert question["proposed_range"]["type"] == "noul"
     assert question["proposed_range"]["instructions"] == (
-        "The speech in `assessment_speech` is advertising content under `guidance`, not editorial discussion."
+        "Is `assessment_speech` an uninterrupted advertising or promotional break under `guidance`? Host demonstrations, discussion of the promoted product, offers, and sign-offs belong to the break."
     )
+    assert question["unrelated_editorial"]["type"] == "noul"
 
 
 def _corpus_prompt(
