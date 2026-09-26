@@ -146,6 +146,7 @@ class ReviewInconclusiveError(ReviewUnavailableError):
             "too_many_boundary_options",
             "choice_inconclusive",
             "neither_complete",
+            "ad_content_unconfirmed",
             "invalid_pair",
             "proposed_range_not_confirmed",
             "original_range_not_confirmed",
@@ -887,17 +888,24 @@ def _rank_questions(
 def _comparison_question(has_adjustment: bool, original_supported: bool) -> dict[str, dict[str, Any]]:
     criteria = {}
     if has_adjustment:
-        criteria["adjusted"] = "The proposed interval is a complete, safe cut of this one advertising or promotional message and is better than the original."
+        criteria["adjusted"] = "The proposed interval is better than the original at capturing the advertising or promotional content in this break."
     if original_supported:
-        criteria["original"] = "The original interval is a complete, safe cut, and the proposed interval is not better. Prefer original if both are equally complete."
-    criteria["neither"] = "Neither eligible interval is a complete, safe cut, or the transcript does not settle the choice."
-    return {
+        criteria["original"] = "The original interval captures the advertising or promotional content in this break at least as well as the proposed interval."
+    criteria["neither"] = "Neither interval is preferable, or the transcript does not settle the comparison."
+    questions = {
         "interval_comparison": {
             "type": "choice",
-            "instructions": "Which eligible interval best captures the entire same advertising or promotional message, including its introduction, offer, URL, and sign-off, while leaving unrelated show speech outside? Inspect both interval transcripts, adjacent speech, and speech added or excluded by the adjustment. An interval that drops advertising words or cuts show discussion is not safe. Choose neither when no eligible interval is complete or the evidence is unclear.",
+            "instructions": "Which eligible interval better captures the advertising or promotional content in this break, including introductions, offers, URLs, and sign-offs? Inspect both interval transcripts, adjacent speech, and speech added or excluded by the adjustment. Prefer the original if the cuts are equally good. Choose neither when neither is preferable or the evidence is unclear.",
             "criteria": criteria,
         }
     }
+    for label, eligible in (("proposed", has_adjustment), ("original", original_supported)):
+        if eligible:
+            questions[f"{label}_ad_only"] = {
+                "type": "noul",
+                "instructions": f"All speech inside `{label}_speech` is advertising or promotional content in this break under `guidance`, including sponsor introductions, product anecdotes, offers, and sign-offs. Unrelated show teases, discussion, or returns are not advertising. Judge only speech inside the interval; omitted advertising words affect the comparison, not this safety answer.",
+            }
+    return questions
 
 
 def _assessment_speech(
@@ -1463,22 +1471,26 @@ def run_review(
                 (float(value) for key, value in answer["probabilities"].items() if key != selected_choice),
                 default=0.0,
             )
+            proposed_safety = float(compared["answers"]["proposed_ad_only"]) if proposed_supported else None
+            original_safety = float(compared["answers"]["original_ad_only"]) if original_supported else None
+            proposed_safe = proposed_safety is not None and proposed_safety >= review_choice_enter
+            original_safe = original_safety is not None and original_safety >= review_choice_enter
             logger.info(
-                "review request_id=%s stage=interval_comparison choice=%s probability=%s runner_up=%s threshold=%s adjusted_probability=%s original_probability=%s neither_probability=%s original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f original_supported=%s proposed_supported=%s cache_hit=%s",
+                "review request_id=%s stage=interval_comparison choice=%s probability=%s runner_up=%s safety_threshold=%s proposed_safety=%s original_safety=%s adjusted_probability=%s original_probability=%s neither_probability=%s original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f original_supported=%s proposed_supported=%s cache_hit=%s",
                 review_request_id, selected_choice, selected_probability, runner_up,
-                review_choice_enter,
+                review_choice_enter, proposed_safety, original_safety,
                 answer["probabilities"].get("adjusted"), answer["probabilities"].get("original"),
                 answer["probabilities"]["neither"],
                 cand_start, cand_end, proposed[0], proposed[1],
                 original_supported, proposed_supported, compared["cache_hit"],
             )
-            clear = selected_probability >= review_choice_enter and selected_probability > runner_up
-            if clear and selected_choice == "adjusted" and proposed_supported:
+            prefer_adjusted = selected_choice == "adjusted" and selected_probability > runner_up
+            if proposed_safe and (not original_safe or prefer_adjusted):
                 ad_start, ad_end = proposed
                 metrics.record_review_refinement(
                     "completed", changed=abs(proposed[0] - cand_start) > 0.1 or abs(proposed[1] - cand_end) > 0.1,
                 )
-            elif clear and selected_choice == "original" and original_supported:
+            elif original_safe:
                 ad_start, ad_end = cand
                 metrics.record_review_refinement("completed", changed=False)
             else:
@@ -1489,7 +1501,7 @@ def run_review(
                         {
                             "reason": "proposed_range_not_confirmed", "stage": "focused_validation",
                             "range_start": proposed[0], "range_end": proposed[1],
-                            "score": answer["probabilities"]["adjusted"], "threshold": review_choice_enter,
+                            "score": proposed_safety, "threshold": review_choice_enter,
                             "cache_hit": bool(compared["cache_hit"]),
                         }
                         if proposed_supported else {
@@ -1502,7 +1514,7 @@ def run_review(
                     {
                         "reason": "original_range_not_confirmed", "stage": "focused_validation",
                         "range_start": cand_start, "range_end": cand_end,
-                        "score": answer["probabilities"]["original"], "threshold": review_choice_enter,
+                        "score": original_safety, "threshold": review_choice_enter,
                         "cache_hit": bool(compared["cache_hit"]),
                     }
                     if original_supported else {
@@ -1511,15 +1523,12 @@ def run_review(
                         "start_supported": original_start_supported, "end_supported": original_end_supported,
                     }
                 )
-                alternative_score = max(
-                    (float(value) for key, value in answer["probabilities"].items() if key != "neither"),
-                    default=0.0,
-                )
+                alternative_score = max((score for score in (proposed_safety, original_safety) if score is not None), default=0.0)
                 _review_unavailable(
-                    pool, "Jev could not choose a complete safe interval", review_request_id,
-                    reason="neither_complete" if selected_choice == "neither" and clear else "choice_inconclusive",
+                    pool, "Jev could not confirm ad-only speech in either eligible interval", review_request_id,
+                    reason="ad_content_unconfirmed",
                     stage="focused_validation",
-                    score=alternative_score if selected_choice == "neither" else selected_probability,
+                    score=alternative_score,
                     threshold=review_choice_enter, cache_hit=bool(compared["cache_hit"]),
                     proposal=proposal_diagnostic, fallback=fallback_diagnostic,
                 )

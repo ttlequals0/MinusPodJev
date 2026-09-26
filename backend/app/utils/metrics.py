@@ -24,6 +24,7 @@ _REVIEW_REASON_CODES = (
     "transcript_gap",
     "choice_inconclusive",
     "neither_complete",
+    "ad_content_unconfirmed",
     "missing_boundary_coverage",
     "insufficient_boundary_text",
     "edge_content_unconfirmed",

@@ -338,6 +338,7 @@ def test_zero_duration_word_supports_selected_endpoint_outside_coarse_context(
                 }
         if "interval_comparison" in payload["questions"]:
             focused_payloads.append(payload)
+            result["answers"]["proposed_ad_only"] = {"noul": focused_score}
             _set_choice_answer(
                 result, payload, "interval_comparison",
                 "adjusted" if approved else "neither", 0.98,
@@ -351,12 +352,12 @@ def test_zero_duration_word_supports_selected_endpoint_outside_coarse_context(
     else:
         with pytest.raises(ReviewInconclusiveError) as raised:
             _run(prompt, fake, tmp_path, refine_boundaries=True)
-        assert raised.value.reason == "neither_complete"
+        assert raised.value.reason == "ad_content_unconfirmed"
         assert raised.value.stage == "focused_validation"
 
     assert len(focused_payloads) == 1
     focused = focused_payloads[0]
-    assert "entire same advertising" in focused["questions"]["interval_comparison"]["instructions"]
+    assert "inside `proposed_speech`" in focused["questions"]["proposed_ad_only"]["instructions"]
     assert focused["state"]["proposed_speech"] == "This episode is sponsored by BetterHelp"
     assert "transcript" not in focused["state"]
     coarse = [{"start": 80.0, "end": 89.9}, {"start": 94.0, "end": 100.0}]
@@ -628,7 +629,7 @@ def test_review_choice_threshold_is_independent(jev_env, tmp_path):
             _set_choice_answer(result, payload, "interval_comparison", choice, 0.98)
         return result
 
-    with pytest.raises(ReviewInconclusiveError, match="complete safe interval"):
+    with pytest.raises(ReviewInconclusiveError, match="ad-only speech in either eligible interval"):
         _run(
             _with_word_edges(prompt),
             fake,
@@ -1191,9 +1192,10 @@ def test_weak_choice_cannot_confirm_original_with_same_ad_after_end(jev_env, tmp
         if "interval_comparison" in payload["questions"]:
             assert "Use" in payload["state"]["original_after_speech"]
             _set_choice_answer(result, payload, "interval_comparison", "neither")
+            result["answers"]["original_ad_only"] = {"noul": 0.4}
         return result
 
-    with pytest.raises(ReviewInconclusiveError, match="complete safe interval"):
+    with pytest.raises(ReviewInconclusiveError, match="ad-only speech in either eligible interval"):
         _run(prompt, fake, tmp_path, refine_boundaries=True)
 
 
@@ -1232,9 +1234,10 @@ def test_unrelated_editorial_vetoes_ad_present_in_mixed_cut(jev_env, tmp_path):
         if "interval_comparison" in payload["questions"]:
             assert "Editorial transition" in payload["state"]["original_speech"]
             _set_choice_answer(result, payload, "interval_comparison", "neither")
+            result["answers"]["original_ad_only"] = {"noul": 0.2}
         return result
 
-    with pytest.raises(ReviewInconclusiveError, match="complete safe interval"):
+    with pytest.raises(ReviewInconclusiveError, match="ad-only speech in either eligible interval"):
         _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
 
 
@@ -1304,6 +1307,37 @@ def test_ambiguous_intro_fragment_cannot_be_trimmed(jev_env, tmp_path):
     ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
 
     assert (ad["start"], ad["end"]) == (100.0, 120.0)
+
+
+def test_ad_only_cut_can_omit_ad_intro_when_original_is_unsafe(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(94.0, 100.0, "Editorial before.")],
+        [(100.0, 106.0, "This sponsor message begins with Acme."),
+         (106.0, 120.0, "Use the Acme offer at acme.com.")],
+        [(120.0, 126.0, "Editorial return.")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] This\n[101.0s-102.0s] sponsor\n"
+        "[102.0s-103.0s] message\n[103.0s-104.0s] begins\n"
+        "[104.0s-105.0s] with\n[105.0s-106.0s] Acme.\n"
+        "[106.0s-107.0s] Use\n"
+        "End edge:\n[119.0s-120.0s] acme.com.\n"
+    )
+    select = _select_pair_fake(105.0, 120.0)
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        if "interval_comparison" in payload["questions"]:
+            assert "sponsor message begins" in payload["state"]["excluded_start_speech"]
+            _set_choice_answer(result, payload, "interval_comparison", "neither", 0.9)
+            result["answers"]["proposed_ad_only"] = {"noul": 0.96}
+            result["answers"]["original_ad_only"] = {"noul": 0.4}
+        return result
+
+    response = _run(prompt, fake, tmp_path, refine_boundaries=True, review_choice_enter=0.85)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+    assert (ad["start"], ad["end"]) == (105.0, 120.0)
 
 
 def test_outward_sponsor_tail_requires_edge_confirmation(jev_env, tmp_path):
@@ -1531,9 +1565,10 @@ def test_unknown_rank_cannot_confirm_without_original_comparison(jev_env, tmp_pa
             }
         if "interval_comparison" in payload["questions"]:
             _set_choice_answer(result, payload, "interval_comparison", "neither")
+            result["answers"]["original_ad_only"] = {"noul": 0.4}
         return result
 
-    with pytest.raises(ReviewInconclusiveError, match="complete safe interval"):
+    with pytest.raises(ReviewInconclusiveError, match="ad-only speech in either eligible interval"):
         _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
 
 
@@ -1553,6 +1588,41 @@ def test_comparison_can_keep_complete_original(jev_env, tmp_path):
     assert metrics.snapshot()["review"]["refinement"]["unchanged"] == 1
 
 
+@pytest.mark.parametrize(
+    "proposed_safety, original_safety, preference, preference_score, expected",
+    [
+        (0.96, 0.96, "neither", 0.54, (100.0, 120.0)),
+        (0.96, 0.3, "original", 0.9, (106.0, 120.0)),
+        (0.3, 0.96, "adjusted", 0.9, (100.0, 120.0)),
+        (0.96, 0.96, "adjusted", 0.54, (106.0, 120.0)),
+        (0.3, 0.3, "adjusted", 0.99, None),
+    ],
+)
+def test_interval_safety_is_independent_of_relative_preference(
+    jev_env, tmp_path, proposed_safety, original_safety, preference, preference_score, expected
+):
+    select = _select_pair_fake(106.0, 120.0)
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        if "interval_comparison" in payload["questions"]:
+            _set_choice_answer(result, payload, "interval_comparison", preference, preference_score)
+            result["answers"]["proposed_ad_only"] = {"noul": proposed_safety}
+            result["answers"]["original_ad_only"] = {"noul": original_safety}
+        return result
+
+    if expected is None:
+        with pytest.raises(ReviewInconclusiveError) as raised:
+            _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True, review_choice_enter=0.85)
+        assert raised.value.reason == "ad_content_unconfirmed"
+        assert raised.value.proposal["score"] == proposed_safety
+        assert raised.value.fallback["score"] == original_safety
+    else:
+        response = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True, review_choice_enter=0.85)
+        ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+        assert (ad["start"], ad["end"]) == expected
+
+
 def test_comparison_neither_reports_both_alternatives(jev_env, tmp_path):
     select = _select_pair_fake(106.0, 120.0)
     states = {}
@@ -1564,17 +1634,19 @@ def test_comparison_neither_reports_both_alternatives(jev_env, tmp_path):
                 states[key] = payload["state"]
         if "interval_comparison" in payload["questions"]:
             _set_choice_answer(result, payload, "interval_comparison", "neither")
+            result["answers"]["proposed_ad_only"] = {"noul": 0.4}
+            result["answers"]["original_ad_only"] = {"noul": 0.4}
         return result
 
-    with pytest.raises(ReviewInconclusiveError, match="complete safe interval") as raised:
+    with pytest.raises(ReviewInconclusiveError, match="ad-only speech in either eligible interval") as raised:
         _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
 
-    assert raised.value.reason == "neither_complete"
-    assert raised.value.score == pytest.approx(0.005)
+    assert raised.value.reason == "ad_content_unconfirmed"
+    assert raised.value.score == pytest.approx(0.4)
     assert raised.value.proposal["range_start"] == 106.0
-    assert raised.value.proposal["score"] == pytest.approx(0.005)
+    assert raised.value.proposal["score"] == pytest.approx(0.4)
     assert raised.value.fallback["range_start"] == 100.0
-    assert raised.value.fallback["score"] == pytest.approx(0.005)
+    assert raised.value.fallback["score"] == pytest.approx(0.4)
     assert states["evidence"]["candidate"] == {"start": 100.0, "end": 120.0}
     assert states["boundary_start"]["candidate"] == {"start": 100.0, "end": 120.0}
     assert "assessment_range" not in states["evidence"]
@@ -1632,13 +1704,14 @@ def test_neither_choice_logs_unsupported_original_fallback(
         if "interval_comparison" in payload["questions"]:
             focused_requests.append("interval_comparison")
             _set_choice_answer(result, payload, "interval_comparison", "neither")
+            result["answers"]["proposed_ad_only"] = {"noul": 0.4}
         return result
 
     with caplog.at_level(logging.INFO, logger="app.services.openai_adapter"):
         with pytest.raises(ReviewInconclusiveError) as raised:
             _run(prompt, fake, tmp_path, refine_boundaries=True)
 
-    assert raised.value.reason == "neither_complete"
+    assert raised.value.reason == "ad_content_unconfirmed"
     assert raised.value.stage == "focused_validation"
     assert raised.value.fallback["reason"] == "missing_boundary_coverage"
     assert focused_requests == ["interval_comparison"]
@@ -1669,6 +1742,7 @@ async def test_review_api_reports_proposal_and_coverage_fallback_diagnostics(
                 }
         if "interval_comparison" in payload["questions"]:
             _set_choice_answer(result, payload, "interval_comparison", "neither")
+            result["answers"]["proposed_ad_only"] = {"noul": 0.4}
         return result
 
     monkeypatch.setattr(jev, "call_payload", fake)
@@ -1683,13 +1757,13 @@ async def test_review_api_reports_proposal_and_coverage_fallback_diagnostics(
     assert response.status_code == 422
     assert response.headers["x-should-retry"] == "false"
     assert response.headers["x-request-id"]
-    assert error["reason"] == "neither_complete"
+    assert error["reason"] == "ad_content_unconfirmed"
     assert error["proposal"] == {
         "reason": "proposed_range_not_confirmed",
         "stage": "focused_validation",
         "range_start": 94.0,
         "range_end": 100.0,
-        "score": pytest.approx(0.01),
+        "score": pytest.approx(0.4),
         "threshold": 0.95,
         "cache_hit": False,
     }
@@ -1702,7 +1776,7 @@ async def test_review_api_reports_proposal_and_coverage_fallback_diagnostics(
         "end_supported": True,
     }
     assert "score" not in error["fallback"]
-    assert error["score"] == pytest.approx(0.01)
+    assert error["score"] == pytest.approx(0.4)
     assert "proposal=reason=proposed_range_not_confirmed" in error["message"]
     assert "fallback=reason=missing_boundary_coverage" in error["message"]
     review = metrics.snapshot()["review"]
@@ -1736,13 +1810,9 @@ async def test_review_api_reports_unaligned_boundary_text_as_inconclusive(jev_en
     assert metrics.snapshot()["review"]["reasons"]["insufficient_boundary_text"] == 1
 
 
-@pytest.mark.parametrize(
-    ("choice", "probability", "reason"),
-    [("neither", 0.99, "neither_complete"),
-     ("original", 0.6, "choice_inconclusive")],
-)
+@pytest.mark.parametrize("choice, probability", [("neither", 0.99), ("original", 0.6)])
 async def test_review_api_reports_pair_comparison_abstention(
-    jev_env, client, monkeypatch, choice, probability, reason
+    jev_env, client, monkeypatch, choice, probability
 ):
     monkeypatch.setattr(settings, "JEV_REVIEW_REFINE_BOUNDARIES", True)
     normal = make_text_fake()
@@ -1751,6 +1821,7 @@ async def test_review_api_reports_pair_comparison_abstention(
         result = normal(payload, **kwargs)
         if "interval_comparison" in payload["questions"]:
             _set_choice_answer(result, payload, "interval_comparison", choice, probability)
+            result["answers"]["original_ad_only"] = {"noul": 0.4}
         return result
 
     monkeypatch.setattr(jev, "call_payload", fake)
@@ -1761,9 +1832,9 @@ async def test_review_api_reports_pair_comparison_abstention(
     )
 
     assert response.status_code == 422
-    assert response.json()["error"]["reason"] == reason
+    assert response.json()["error"]["reason"] == "ad_content_unconfirmed"
     assert response.json()["error"]["stage"] == "focused_validation"
-    assert metrics.snapshot()["review"]["reasons"][reason] == 1
+    assert metrics.snapshot()["review"]["reasons"]["ad_content_unconfirmed"] == 1
 
 
 async def test_focused_validation_upstream_failure_preserves_503(

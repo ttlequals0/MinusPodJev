@@ -345,11 +345,14 @@ def test_pair_choice_keeps_all_supplied_words_in_shared_state():
 
 
 def test_comparison_question_requires_complete_cut_and_neither_option():
-    question = _comparison_question(True, True)["interval_comparison"]
+    questions = _comparison_question(True, True)
+    question = questions["interval_comparison"]
 
     assert question["type"] == "choice"
     assert set(question["criteria"]) == {"adjusted", "original", "neither"}
-    assert "entire same advertising" in question["instructions"]
+    assert "advertising or promotional content in this break" in question["instructions"]
+    assert {"proposed_ad_only", "original_ad_only"} <= set(questions)
+    assert "omitted advertising words affect the comparison" in questions["proposed_ad_only"]["instructions"]
     assert set(_comparison_question(False, True)["interval_comparison"]["criteria"]) == {"original", "neither"}
 
 

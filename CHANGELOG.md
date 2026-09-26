@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.18 - 2026-09-25
+
+- Check each eligible review cut for ad-only speech independently. Use the configured review threshold for that check, then compare two safe cuts to choose the boundary.
+- Keep a supported ad-only cut when the other cut lacks transcript coverage or contains show speech. Report ad-content uncertainty separately from relative boundary preference.
+
 ## 0.1.17 - 2026-09-25
 
 - Offer every supplied word-timed start and end within 30 seconds as separate boundary choices. Abstain if either choice would exceed Jev's option limit.
