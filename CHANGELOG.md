@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.17 - 2026-09-25
+
+- Offer every supplied word-timed start and end within 30 seconds as separate boundary choices. Abstain if either choice would exceed Jev's option limit.
+- Compare the proposed complete cut with the original in one final Choice that can reject both. Keep the configured review threshold and transcript coverage checks.
+- Omit duplicate word arrays from the advertising-evidence request while retaining line timestamps. Detection behavior is unchanged.
+
 ## 0.1.16 - 2026-09-25
 
 - Use bounded transcript context for boundary choices instead of repeating full word arrays. Log selected timestamps and safe request sizes on upstream review errors.

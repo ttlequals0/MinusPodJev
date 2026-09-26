@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     # Application
     APP_NAME: str = Field(default="Jev Proxy", description="Application name")
-    APP_VERSION: str = Field(default="0.1.16", description="Application version")
+    APP_VERSION: str = Field(default="0.1.17", description="Application version")
     APP_DESCRIPTION: str = Field(
         default="Thin HTTP proxy around the TypeSafe Jev System One endpoint",
         description="Application description",
@@ -106,7 +106,7 @@ class Settings(BaseSettings):
     )
     JEV_REVIEW_REFINE_BOUNDARIES: bool = Field(
         default=False,
-        description="Rank timed boundary choices, then validate the proposed cut with a focused NouL",
+        description="Rank timed start and end choices, then compare the proposed and original cuts",
     )
     JEV_CATEGORY_PASS: bool = Field(
         default=True, description="Run the per-span category second pass"

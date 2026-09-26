@@ -143,7 +143,9 @@ class ReviewInconclusiveError(ReviewUnavailableError):
             "ambiguous_spans",
             "insufficient_evidence",
             "no_valid_pairs",
+            "too_many_boundary_options",
             "choice_inconclusive",
+            "neither_complete",
             "invalid_pair",
             "proposed_range_not_confirmed",
             "original_range_not_confirmed",
@@ -815,54 +817,7 @@ def _edge_reference(words: Sequence[dict[str, Any]], value: float, direction: st
 
 
 _BOUNDARY_SEARCH_SECONDS = 30.0
-_BOUNDARY_MAX_OPTIONS = 16
-_BOUNDARY_WORD_OPTIONS = 32
-_BOUNDARY_WORD_SECONDS = 10.0
-_UTTERANCE_GAP_SECONDS = 1.0
-
-
-def _timed_transition_candidates(
-    words: Sequence[dict[str, Any]],
-    segments: Sequence[dict[str, Any]],
-    current: float,
-    direction: str,
-    context_start: float,
-    context_end: float,
-) -> list[float]:
-    """Use observed sentence ends and pauses as candidate utterance edges."""
-    ordered = sorted(words, key=lambda word: (float(word["start"]), float(word["end"])))
-    values: set[float] = set()
-    for index, word in enumerate(ordered):
-        previous = ordered[index - 1] if index else None
-        following = ordered[index + 1] if index + 1 < len(ordered) else None
-        if direction == "start":
-            value = float(word["start"])
-            transition = previous is not None and re.search(r"[.!?][\"')\]]*$", str(previous["text"]).rstrip()) is not None
-            if previous is not None:
-                transition |= value - float(previous["end"]) >= _UTTERANCE_GAP_SECONDS
-            else:
-                prior_rows = [segment for segment in segments if float(segment["end"]) <= value]
-                if any(abs(float(segment["start"]) - value) <= 0.11 for segment in segments):
-                    transition = not prior_rows or value - max(float(segment["end"]) for segment in prior_rows) >= _UTTERANCE_GAP_SECONDS
-        else:
-            value = float(word["end"])
-            transition = re.search(r"[.!?][\"')\]]*$", str(word["text"]).rstrip()) is not None
-            if following is not None:
-                transition |= float(following["start"]) - value >= _UTTERANCE_GAP_SECONDS
-            elif not transition and any(abs(float(segment["end"]) - value) <= 0.1 for segment in segments):
-                following_rows = [segment for segment in segments if float(segment["start"]) >= value]
-                transition = bool(following_rows) and min(float(segment["start"]) for segment in following_rows) - value >= _UTTERANCE_GAP_SECONDS
-        if transition and context_start <= value <= context_end and abs(value - current) <= _BOUNDARY_SEARCH_SECONDS:
-            values.add(value)
-    meaningful = sorted(values, key=lambda value: (abs(value - current), value))[:_BOUNDARY_MAX_OPTIONS]
-    inner_words = ordered[1:] if direction == "start" else ordered[:-1]
-    exact = sorted(
-        {float(word["start" if direction == "start" else "end"])
-         for word in inner_words
-         if abs(float(word["start" if direction == "start" else "end"]) - current) <= _BOUNDARY_WORD_SECONDS},
-        key=lambda value: (abs(value - current), value),
-    )[:_BOUNDARY_WORD_OPTIONS]
-    return sorted(set(meaningful + exact))
+_BOUNDARY_CHOICE_LIMIT = 254
 
 
 def _boundary_candidates(
@@ -870,10 +825,12 @@ def _boundary_candidates(
     word_edges: dict[str, list[dict[str, Any]]],
     cand: tuple[float, float],
 ) -> tuple[list[float], list[float]]:
-    """Return bounded word-timed utterance edges near the current cut."""
+    """Return every observed word edge near the current cut."""
     context_start, context_end = _review_context_envelope(segments, word_edges)
-    starts = _timed_transition_candidates(word_edges["start"], segments, cand[0], "start", context_start, context_end)
-    ends = _timed_transition_candidates(word_edges["end"], segments, cand[1], "end", context_start, context_end)
+    starts = [float(word["start"]) for word in word_edges["start"]
+              if abs(float(word["start"]) - cand[0]) <= _BOUNDARY_SEARCH_SECONDS]
+    ends = [float(word["end"]) for word in word_edges["end"]
+            if abs(float(word["end"]) - cand[1]) <= _BOUNDARY_SEARCH_SECONDS]
     if _covers_boundary(segments, cand[0]) or _covers_boundary(word_edges["start"], cand[0]):
         starts.append(cand[0])
     if _covers_boundary(segments, cand[1]) or _covers_boundary(word_edges["end"], cand[1]):
@@ -927,16 +884,19 @@ def _rank_questions(
     )
 
 
-def _focused_range_question(name: str) -> dict[str, dict[str, Any]]:
+def _comparison_question(has_adjustment: bool, original_supported: bool) -> dict[str, dict[str, Any]]:
+    criteria = {}
+    if has_adjustment:
+        criteria["adjusted"] = "The proposed interval is a complete, safe cut of this one advertising or promotional message and is better than the original."
+    if original_supported:
+        criteria["original"] = "The original interval is a complete, safe cut, and the proposed interval is not better. Prefer original if both are equally complete."
+    criteria["neither"] = "Neither eligible interval is a complete, safe cut, or the transcript does not settle the choice."
     return {
-        name: {
-            "type": "noul",
-            "instructions": "Is `assessment_speech` an uninterrupted advertising or promotional break under `guidance`? Host demonstrations, discussion of the promoted product, offers, and sign-offs belong to the break.",
-        },
-        "unrelated_editorial": {
-            "type": "noul",
-            "instructions": "Does `assessment_speech` include show discussion unrelated to the advertising or promotional break? Sponsor demonstrations and sign-offs are part of the break.",
-        },
+        "interval_comparison": {
+            "type": "choice",
+            "instructions": "Which eligible interval best captures the entire same advertising or promotional message, including its introduction, offer, URL, and sign-off, while leaving unrelated show speech outside? Inspect both interval transcripts, adjacent speech, and speech added or excluded by the adjustment. An interval that drops advertising words or cuts show discussion is not safe. Choose neither when no eligible interval is complete or the evidence is unclear.",
+            "criteria": criteria,
+        }
     }
 
 
@@ -988,48 +948,20 @@ def _neighbor_speech(
     return " ".join(word[2] for word in nearby[:8]), " ".join(word[2] for word in nearby[8:])
 
 
-def _continuation_questions(
-    word_edges: dict[str, list[dict[str, Any]]], bounds: tuple[float, float]
-) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
-    questions: dict[str, dict[str, Any]] = {}
-    speech: dict[str, str] = {}
-    for edge, direction, selected in (
-        ("start", "before", "selected_start_speech"),
-        ("end", "after", "selected_end_speech"),
-    ):
-        neighbor, context = _neighbor_speech(word_edges[edge], bounds[0 if edge == "start" else 1], direction)
-        if not neighbor:
-            continue
-        field = f"{direction}_edge_speech"
-        speech[field] = neighbor
-        speech[f"{direction}_edge_context"] = context
-        questions[f"{direction}_continuation"] = {
-            "type": "noul",
-            "instructions": f"Does the same advertising message as `{selected}` continue across the cut? Read `{field}` and `{direction}_edge_context` in time order. Neutral connective speech followed by its offer or URL can continue the message. Answer yes for any contiguous continuation next to the cut before a show return. A separate advertisement or break bumper is not the same message.",
-        }
-    return questions, speech
-
-
-def _valid_pairs(
-    starts: Sequence[float],
-    ends: Sequence[float],
+def _valid_pair(
+    start: float,
+    end: float,
     cand: tuple[float, float],
     corroborated: tuple[float, float],
     context_start: float,
     context_end: float,
-) -> list[tuple[float, float]]:
-    pairs: list[tuple[float, float]] = []
-    for start in starts:
-        for end in ends:
-            if (
-                end > start
-                and context_start <= start < end <= context_end
-                and min(end, cand[1]) > max(start, cand[0])
-                and min(end, corroborated[1]) > max(start, corroborated[0])
-                and (start, end) not in pairs
-            ):
-                pairs.append((start, end))
-    return pairs
+) -> bool:
+    return (
+        end > start
+        and context_start <= start < end <= context_end
+        and min(end, cand[1]) > max(start, cand[0])
+        and min(end, corroborated[1]) > max(start, corroborated[0])
+    )
 
 
 def run_review(
@@ -1322,7 +1254,16 @@ def run_review(
                 "type": "noul",
                 "instructions": "The candidate interval contains transcript-grounded advertising or promotional content covered by the supplied guidance, not merely editorial discussion or a brand mention.",
             }
-        }, "evidence"
+        }, "evidence", question_state_override={
+            "guidance": review_guidance,
+            "transcript": build_state(segments),
+            "candidate": {"start": cand_start, "end": cand_end},
+            "timeline": [
+                {"line": f"L{int(segment['sid']):04d}", "start": float(segment["start"]), "end": float(segment["end"])}
+                for segment in segments
+            ],
+            **({"caller_context": caller_context} if caller_context else {}),
+        }
     )
     evidence_score = float(evidence["answers"]["evidence"])
     logger.info(
@@ -1372,15 +1313,10 @@ def run_review(
             word_edges,
             cand,
         )
-        candidate_pairs = _valid_pairs(
-            starts,
-            ends,
-            cand,
-            (ad_start, ad_end),
-            boundary_context_start,
-            boundary_context_end,
-        )
-        if not candidate_pairs:
+        if not any(
+            _valid_pair(start, end, cand, (ad_start, ad_end), boundary_context_start, boundary_context_end)
+            for start in starts for end in ends
+        ):
             metrics.record_review_refinement("skipped", skip_reason="no_valid_pairs")
             logger.info(
                 "review request_id=%s refinement=skipped reason=no_valid_pairs original_start=%.3f original_end=%.3f context_start=%.3f context_end=%.3f corroborated_start=%.3f corroborated_end=%.3f start_candidates=%d end_candidates=%d",
@@ -1401,8 +1337,15 @@ def run_review(
                 reason="no_valid_pairs",
                 stage="choice_rank",
             )
-        starts = sorted({start for start, _ in candidate_pairs})
-        ends = sorted({end for _, end in candidate_pairs})
+        if len(starts) > _BOUNDARY_CHOICE_LIMIT or len(ends) > _BOUNDARY_CHOICE_LIMIT:
+            logger.info(
+                "review request_id=%s refinement=skipped reason=too_many_boundary_options start_candidates=%d end_candidates=%d limit=%d",
+                review_request_id, len(starts), len(ends), _BOUNDARY_CHOICE_LIMIT,
+            )
+            _review_unavailable(
+                pool, "Jev boundary search exceeded the Choice option limit", review_request_id,
+                reason="too_many_boundary_options", stage="choice_rank",
+            )
         metrics.record_review_refinement("attempted")
         logger.info(
             "review request_id=%s refinement=attempted original_start=%.3f original_end=%.3f",
@@ -1422,7 +1365,7 @@ def run_review(
             start_probs = start_answer["probabilities"]
             end_probs = end_answer["probabilities"]
             logger.info(
-                "review request_id=%s stage=choice_rank start_choice=%s start_time=%s start_probability=%s start_confidence=%s end_choice=%s end_time=%s end_probability=%s end_confidence=%s probability_floor=0.5 cache_hit=%s",
+                "review request_id=%s stage=choice_rank start_choice=%s start_time=%s start_probability=%s start_confidence=%s end_choice=%s end_time=%s end_probability=%s end_confidence=%s cache_hit=%s",
                 review_request_id,
                 start_answer["choice"],
                 start_values.get(start_answer["choice"]),
@@ -1434,266 +1377,156 @@ def run_review(
                 end_answer["confidence"],
                 ranked["cache_hit"],
             )
-            proposed = (cand_start, cand_end)
-            start_clear = start_answer["choice"] != "unknown" and start_probs[start_answer["choice"]] >= 0.5 and start_probs[start_answer["choice"]] > max(
-                value for key, value in start_probs.items() if key != start_answer["choice"]
-            )
-            end_clear = end_answer["choice"] != "unknown" and end_probs[end_answer["choice"]] >= 0.5 and end_probs[end_answer["choice"]] > max(
-                value for key, value in end_probs.items() if key != end_answer["choice"]
-            )
-            if start_clear and end_clear:
-                selected = (start_values[start_answer["choice"]], end_values[end_answer["choice"]])
-                if selected in candidate_pairs:
+            proposed = cand
+            start_choice = start_answer["choice"]
+            end_choice = end_answer["choice"]
+            if start_choice != "unknown" and end_choice != "unknown":
+                selected = (start_values[start_choice], end_values[end_choice])
+                if _valid_pair(
+                    selected[0], selected[1], cand, (ad_start, ad_end),
+                    boundary_context_start, boundary_context_end,
+                ):
                     proposed = selected
-            focused_name = "proposed_range" if proposed != cand else "original_range"
-            focused = None
-            focused_score = None
-            edge_score = 1.0
-            proposal_diagnostic: dict[str, Any] | None = None
+            original_start_supported, original_end_supported = _range_boundary_support(
+                coarse_segments, word_edges, cand
+            )
+            original_speech = _assessment_speech(segments, word_edges, cand)
+            original_supported = original_start_supported and original_end_supported and bool(original_speech)
             proposed_start_supported, proposed_end_supported = _range_boundary_support(
                 coarse_segments, word_edges, proposed
             )
-            proposed_text_supported = bool(_assessment_speech(segments, word_edges, proposed))
+            proposed_speech = _assessment_speech(segments, word_edges, proposed)
+            proposed_text_supported = bool(proposed_speech)
             edge_speech: dict[str, str] = {}
-            edge_text: str | None
-            if proposed[0] > cand_start:
-                edge_text = _assessment_speech(segments, word_edges, (cand_start, proposed[0]))
-                proposed_text_supported &= edge_text is not None
-                if edge_text:
-                    edge_speech["excluded_start_speech"] = edge_text
-            if proposed[1] < cand_end:
-                edge_text = _assessment_speech(segments, word_edges, (proposed[1], cand_end))
-                proposed_text_supported &= edge_text is not None
-                if edge_text:
-                    edge_speech["excluded_end_speech"] = edge_text
-            if proposed[0] < cand_start:
-                edge_text = _assessment_speech(segments, word_edges, (proposed[0], cand_start))
-                proposed_text_supported &= edge_text is not None
-                if edge_text:
-                    edge_speech["added_start_speech"] = edge_text
-            if proposed[1] > cand_end:
-                edge_text = _assessment_speech(segments, word_edges, (cand_end, proposed[1]))
-                proposed_text_supported &= edge_text is not None
-                if edge_text:
-                    edge_speech["added_end_speech"] = edge_text
-            if proposed_start_supported and proposed_end_supported and proposed_text_supported:
-                questions = _focused_range_question(focused_name)
-                continuation_questions, neighbor_speech = _continuation_questions(word_edges, proposed)
-                questions.update(continuation_questions)
-                for field in edge_speech:
-                    action = "kept in the episode" if field.startswith("excluded_") else "included in the advertising break"
-                    questions[field.removesuffix("_speech") + "_valid"] = {
-                        "type": "noul",
-                        "instructions": f"The speech in `{field}` should be {action}, considering `assessment_speech` and `guidance`.",
-                    }
-                focused = review_questions(
-                    questions,
-                    "focused_validation",
-                    proposed,
-                    {**edge_speech, **neighbor_speech},
+            if proposed != cand:
+                for field, bounds in (
+                    ("excluded_start_speech", (cand_start, proposed[0])) if proposed[0] > cand_start else
+                    ("added_start_speech", (proposed[0], cand_start)),
+                    ("excluded_end_speech", (proposed[1], cand_end)) if proposed[1] < cand_end else
+                    ("added_end_speech", (cand_end, proposed[1])),
+                ):
+                    if bounds[1] <= bounds[0]:
+                        continue
+                    edge_text = _assessment_speech(segments, word_edges, bounds)
+                    proposed_text_supported &= edge_text is not None
+                    if edge_text:
+                        edge_speech[field] = edge_text
+            proposed_supported = (
+                proposed != cand and proposed_start_supported and proposed_end_supported
+                and proposed_text_supported
+            )
+            if not proposed_supported and not original_supported:
+                metrics.record_review_refinement("inconclusive")
+                start_supported = proposed_start_supported if proposed != cand else original_start_supported
+                end_supported = proposed_end_supported if proposed != cand else original_end_supported
+                reason = "insufficient_boundary_text" if start_supported and end_supported else "missing_boundary_coverage"
+                _review_unavailable(
+                    pool, "Jev cannot isolate either complete interval", review_request_id,
+                    reason=reason, stage="boundary_coverage",
+                    range_start=proposed[0], range_end=proposed[1],
+                    start_supported=start_supported, end_supported=end_supported,
                 )
-                ad_score = float(focused["answers"][focused_name])
-                editorial_score = float(focused["answers"]["unrelated_editorial"])
-                continuation_score = max(
-                    (float(focused["answers"][name]) for name in continuation_questions),
-                    default=0.0,
-                )
-                edge_score = min(
-                    (float(focused["answers"][field.removesuffix("_speech") + "_valid"])
-                     for field in edge_speech),
-                    default=1.0,
-                )
-                focused_score = min(ad_score, 1.0 - editorial_score, 1.0 - continuation_score, edge_score)
-                focused_reason = min(
-                    (ad_score, "proposed_range_not_confirmed"),
-                    (1.0 - editorial_score, "unrelated_editorial"),
-                    (1.0 - continuation_score, "adjacent_message_continues"),
-                    (edge_score, "edge_content_unconfirmed"),
-                )[1]
-                logger.info(
-                    "review request_id=%s stage=focused_validation range=%s score=%s threshold=%s ad_score=%s editorial_score=%s continuation_score=%s edge_score=%s cache_hit=%s",
-                    review_request_id,
-                    proposed,
-                    focused_score,
-                    review_choice_enter,
-                    ad_score,
-                    editorial_score,
-                    continuation_score,
-                    edge_score,
-                    focused["cache_hit"],
-                )
-                if proposed != cand:
-                    proposal_diagnostic = {
-                        "reason": focused_reason,
-                        "stage": "focused_validation",
-                        "range_start": proposed[0],
-                        "range_end": proposed[1],
-                        "score": focused_score,
-                        "threshold": review_choice_enter,
-                        "cache_hit": bool(focused["cache_hit"]),
-                    }
-            else:
-                proposal_reason = "insufficient_boundary_text" if proposed_start_supported and proposed_end_supported else "missing_boundary_coverage"
-                logger.info(
-                    "review request_id=%s stage=boundary_coverage validation_skipped reason=%s range_kind=%s range_start=%.3f range_end=%.3f start_supported=%s end_supported=%s",
-                    review_request_id,
-                    proposal_reason,
-                    focused_name,
-                    proposed[0],
-                    proposed[1],
-                    proposed_start_supported,
-                    proposed_end_supported,
-                )
-                if proposed != cand:
-                    proposal_diagnostic = {
-                        "reason": proposal_reason,
-                        "stage": "boundary_coverage",
-                        "range_start": proposed[0],
-                        "range_end": proposed[1],
-                        "start_supported": proposed_start_supported,
-                        "end_supported": proposed_end_supported,
-                    }
-            if focused_score is not None and focused_score >= review_choice_enter:
+            context = _choice_state(coarse_segments, cand, review_guidance, caller_context)
+            comparison_state: dict[str, Any] = {
+                "guidance": review_guidance,
+                "original_interval": {"start": cand_start, "end": cand_end},
+                "original_speech": original_speech or "",
+                "original_eligible": original_supported,
+                "proposed_interval": {"start": proposed[0], "end": proposed[1]},
+                "proposed_speech": proposed_speech or "",
+                "proposed_eligible": proposed_supported,
+                "start_context": context["start_context"],
+                "end_context": context["end_context"],
+                **edge_speech,
+            }
+            if caller_context:
+                comparison_state["caller_context"] = caller_context
+            for label, bounds in (("original", cand), ("proposed", proposed)):
+                if label == "proposed" and proposed == cand:
+                    continue
+                for edge, direction, value in (
+                    ("start", "before", bounds[0]), ("end", "after", bounds[1]),
+                ):
+                    neighbor, farther = _neighbor_speech(word_edges[edge], value, direction)
+                    if neighbor:
+                        comparison_state[f"{label}_{direction}_speech"] = neighbor
+                        comparison_state[f"{label}_{direction}_context"] = farther
+            compared = review_questions(
+                _comparison_question(proposed_supported, original_supported),
+                "focused_validation",
+                question_state_override=comparison_state,
+            )
+            answer = compared["answers"]["interval_comparison"]
+            selected_choice = answer["choice"]
+            selected_probability = float(answer["probabilities"][selected_choice])
+            runner_up = max(
+                (float(value) for key, value in answer["probabilities"].items() if key != selected_choice),
+                default=0.0,
+            )
+            logger.info(
+                "review request_id=%s stage=interval_comparison choice=%s probability=%s runner_up=%s threshold=%s adjusted_probability=%s original_probability=%s neither_probability=%s original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f original_supported=%s proposed_supported=%s cache_hit=%s",
+                review_request_id, selected_choice, selected_probability, runner_up,
+                review_choice_enter,
+                answer["probabilities"].get("adjusted"), answer["probabilities"].get("original"),
+                answer["probabilities"]["neither"],
+                cand_start, cand_end, proposed[0], proposed[1],
+                original_supported, proposed_supported, compared["cache_hit"],
+            )
+            clear = selected_probability >= review_choice_enter and selected_probability > runner_up
+            if clear and selected_choice == "adjusted" and proposed_supported:
                 ad_start, ad_end = proposed
                 metrics.record_review_refinement(
-                    "completed",
-                    changed=abs(proposed[0] - cand_start) > 0.1 or abs(proposed[1] - cand_end) > 0.1,
+                    "completed", changed=abs(proposed[0] - cand_start) > 0.1 or abs(proposed[1] - cand_end) > 0.1,
                 )
-                logger.info(
-                    "review request_id=%s refinement=completed original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f",
-                    review_request_id, cand_start, cand_end, ad_start, ad_end,
-                )
-            elif proposed != cand:
-                original = None
-                original_score = None
-                fallback_diagnostic: dict[str, Any] | None = None
-                original_start_supported, original_end_supported = _range_boundary_support(
-                    coarse_segments, word_edges, cand
-                )
-                original_text_supported = bool(_assessment_speech(segments, word_edges, cand))
-                if original_start_supported and original_end_supported and original_text_supported:
-                    original_questions = _focused_range_question("original_range")
-                    continuation_questions, neighbor_speech = _continuation_questions(word_edges, cand)
-                    original_questions.update(continuation_questions)
-                    original = review_questions(
-                        original_questions,
-                        "focused_validation",
-                        cand,
-                        neighbor_speech,
-                    )
-                    original_ad_score = float(original["answers"]["original_range"])
-                    original_editorial_score = float(original["answers"]["unrelated_editorial"])
-                    original_continuation_score = max(
-                        (float(original["answers"][name]) for name in continuation_questions),
-                        default=0.0,
-                    )
-                    original_score = min(
-                        original_ad_score, 1.0 - original_editorial_score, 1.0 - original_continuation_score
-                    )
-                    original_reason = min(
-                        (original_ad_score, "original_range_not_confirmed"),
-                        (1.0 - original_editorial_score, "unrelated_editorial"),
-                        (1.0 - original_continuation_score, "adjacent_message_continues"),
-                    )[1]
-                    logger.info(
-                        "review request_id=%s stage=focused_validation range=%s score=%s threshold=%s ad_score=%s editorial_score=%s continuation_score=%s cache_hit=%s",
-                        review_request_id,
-                        cand,
-                        original_score,
-                        review_choice_enter,
-                        original_ad_score,
-                        original_editorial_score,
-                        original_continuation_score,
-                        original["cache_hit"],
-                    )
-                    fallback_diagnostic = {
-                        "reason": original_reason,
-                        "stage": "focused_validation",
-                        "range_start": cand[0],
-                        "range_end": cand[1],
-                        "score": original_score,
-                        "threshold": review_choice_enter,
-                        "cache_hit": bool(original["cache_hit"]),
-                    }
-                else:
-                    fallback_reason = "insufficient_boundary_text" if original_start_supported and original_end_supported else "missing_boundary_coverage"
-                    logger.info(
-                        "review request_id=%s stage=boundary_coverage validation_skipped reason=%s range_kind=original_range range_start=%.3f range_end=%.3f start_supported=%s end_supported=%s",
-                        review_request_id,
-                        fallback_reason,
-                        cand[0],
-                        cand[1],
-                        original_start_supported,
-                        original_end_supported,
-                    )
-                    fallback_diagnostic = {
-                        "reason": fallback_reason,
-                        "stage": "boundary_coverage",
-                        "range_start": cand[0],
-                        "range_end": cand[1],
-                        "start_supported": original_start_supported,
-                        "end_supported": original_end_supported,
-                    }
-                if original_score is not None and original_score >= review_choice_enter:
-                    ad_start, ad_end = cand
-                    metrics.record_review_refinement("completed", changed=False)
-                    logger.info(
-                        "review request_id=%s refinement=completed original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f",
-                        review_request_id, cand_start, cand_end, ad_start, ad_end,
-                    )
-                else:
-                    metrics.record_review_refinement("inconclusive")
-                    if original_score is None:
-                        _review_unavailable(
-                            pool,
-                            "Jev cannot confirm the original complete range without observed boundaries",
-                            review_request_id,
-                            reason=fallback_diagnostic["reason"],
-                            stage="boundary_coverage",
-                            range_start=cand[0],
-                            range_end=cand[1],
-                            start_supported=original_start_supported,
-                            end_supported=original_end_supported,
-                            proposal=proposal_diagnostic,
-                            fallback=fallback_diagnostic,
-                        )
-                    _review_unavailable(
-                        pool,
-                        "Jev did not confirm the proposed or original complete range",
-                        review_request_id,
-                        reason=fallback_diagnostic["reason"],
-                        stage="focused_validation",
-                        score=original_score,
-                        threshold=review_choice_enter,
-                        cache_hit=bool(original["cache_hit"]) if original is not None else None,
-                        proposal=proposal_diagnostic,
-                        fallback=fallback_diagnostic,
-                    )
+            elif clear and selected_choice == "original" and original_supported:
+                ad_start, ad_end = cand
+                metrics.record_review_refinement("completed", changed=False)
             else:
                 metrics.record_review_refinement("inconclusive")
-                if focused_score is None:
-                    reason = "insufficient_boundary_text" if proposed_start_supported and proposed_end_supported else "missing_boundary_coverage"
-                    _review_unavailable(
-                        pool,
-                        "Jev cannot confirm the original complete range without observed boundaries",
-                        review_request_id,
-                        reason=reason,
-                        stage="boundary_coverage",
-                        range_start=proposed[0],
-                        range_end=proposed[1],
-                        start_supported=proposed_start_supported,
-                        end_supported=proposed_end_supported,
+                proposal_diagnostic = None
+                if proposed != cand:
+                    proposal_diagnostic = (
+                        {
+                            "reason": "proposed_range_not_confirmed", "stage": "focused_validation",
+                            "range_start": proposed[0], "range_end": proposed[1],
+                            "score": answer["probabilities"]["adjusted"], "threshold": review_choice_enter,
+                            "cache_hit": bool(compared["cache_hit"]),
+                        }
+                        if proposed_supported else {
+                            "reason": "insufficient_boundary_text" if proposed_start_supported and proposed_end_supported else "missing_boundary_coverage",
+                            "stage": "boundary_coverage", "range_start": proposed[0], "range_end": proposed[1],
+                            "start_supported": proposed_start_supported, "end_supported": proposed_end_supported,
+                        }
                     )
-                _review_unavailable(
-                    pool,
-                    "Jev did not confirm the original complete range",
-                    review_request_id,
-                    reason=focused_reason,
-                    stage="focused_validation",
-                    score=focused_score,
-                    threshold=review_choice_enter,
-                    cache_hit=bool(focused["cache_hit"]) if focused is not None else None,
+                fallback_diagnostic = (
+                    {
+                        "reason": "original_range_not_confirmed", "stage": "focused_validation",
+                        "range_start": cand_start, "range_end": cand_end,
+                        "score": answer["probabilities"]["original"], "threshold": review_choice_enter,
+                        "cache_hit": bool(compared["cache_hit"]),
+                    }
+                    if original_supported else {
+                        "reason": "insufficient_boundary_text" if original_start_supported and original_end_supported else "missing_boundary_coverage",
+                        "stage": "boundary_coverage", "range_start": cand_start, "range_end": cand_end,
+                        "start_supported": original_start_supported, "end_supported": original_end_supported,
+                    }
                 )
+                alternative_score = max(
+                    (float(value) for key, value in answer["probabilities"].items() if key != "neither"),
+                    default=0.0,
+                )
+                _review_unavailable(
+                    pool, "Jev could not choose a complete safe interval", review_request_id,
+                    reason="neither_complete" if selected_choice == "neither" and clear else "choice_inconclusive",
+                    stage="focused_validation",
+                    score=alternative_score if selected_choice == "neither" else selected_probability,
+                    threshold=review_choice_enter, cache_hit=bool(compared["cache_hit"]),
+                    proposal=proposal_diagnostic, fallback=fallback_diagnostic,
+                )
+            logger.info(
+                "review request_id=%s refinement=completed original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f",
+                review_request_id, cand_start, cand_end, ad_start, ad_end,
+            )
         except ReviewInconclusiveError:
             raise
         except (ReviewUnavailableError, httpx.HTTPStatusError, httpx.TimeoutException, httpx.TransportError):

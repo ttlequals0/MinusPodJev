@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from app.config import settings
 from app.services.jev import jev_review_questions
-from app.services.openai_adapter import _focused_range_question, _review_state
+from app.services.openai_adapter import _comparison_question, _review_state
 from app.utils.cache import hash_payload
 from app.utils.metrics import metrics
 
@@ -344,14 +344,13 @@ def test_pair_choice_keeps_all_supplied_words_in_shared_state():
     assert state["boundary_words"]["end"] == words
 
 
-def test_focused_range_question_uses_selected_speech_only():
-    question = _focused_range_question("proposed_range")
+def test_comparison_question_requires_complete_cut_and_neither_option():
+    question = _comparison_question(True, True)["interval_comparison"]
 
-    assert question["proposed_range"]["type"] == "noul"
-    assert question["proposed_range"]["instructions"] == (
-        "Is `assessment_speech` an uninterrupted advertising or promotional break under `guidance`? Host demonstrations, discussion of the promoted product, offers, and sign-offs belong to the break."
-    )
-    assert question["unrelated_editorial"]["type"] == "noul"
+    assert question["type"] == "choice"
+    assert set(question["criteria"]) == {"adjusted", "original", "neither"}
+    assert "entire same advertising" in question["instructions"]
+    assert set(_comparison_question(False, True)["interval_comparison"]["criteria"]) == {"original", "neither"}
 
 
 def _corpus_prompt(
