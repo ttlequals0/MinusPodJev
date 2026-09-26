@@ -121,6 +121,7 @@ def chat_completions(
                 stay=thresholds.detection_stay,
                 review_evidence_enter=thresholds.review_evidence,
                 review_choice_enter=thresholds.review_choice,
+                review_programme_veto=settings.JEV_REVIEW_PROGRAMME_VETO,
                 category_pass=settings.JEV_CATEGORY_PASS,
                 category_context=settings.JEV_CATEGORY_CONTEXT,
                 default_category=settings.JEV_DEFAULT_CATEGORY,
@@ -212,6 +213,7 @@ _INCONCLUSIVE_REASONS = frozenset(
         "choice_inconclusive",
         "neither_complete",
         "ad_content_unconfirmed",
+        "programme_content_detected",
         "invalid_pair",
         "proposed_range_not_confirmed",
         "original_range_not_confirmed",
@@ -235,6 +237,7 @@ _METRIC_REASONS = frozenset(
         "choice_inconclusive",
         "neither_complete",
         "ad_content_unconfirmed",
+        "programme_content_detected",
         "malformed_context",
         "missing_boundary_coverage",
         "insufficient_boundary_text",
@@ -356,6 +359,11 @@ def _inconclusive_message(diagnostics: dict[str, Any]) -> str:
 
 
 def _metric_inconclusive_reason(diagnostics: dict[str, Any]) -> str:
+    detail = diagnostics.get(
+        "proposal" if diagnostics["reason"] == "proposed_range_not_confirmed" else "fallback"
+    )
+    if isinstance(detail, dict) and detail.get("reason") == "programme_content_detected":
+        return "programme_content_detected"
     reason = str(diagnostics["reason"])
     if reason in _METRIC_REASONS:
         return reason

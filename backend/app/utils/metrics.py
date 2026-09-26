@@ -25,6 +25,7 @@ _REVIEW_REASON_CODES = (
     "choice_inconclusive",
     "neither_complete",
     "ad_content_unconfirmed",
+    "programme_content_detected",
     "missing_boundary_coverage",
     "insufficient_boundary_text",
     "edge_content_unconfirmed",

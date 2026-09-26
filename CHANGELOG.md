@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.19 - 2026-09-26
+
+- Rank observed utterance starts and refine the selected utterance to a word boundary. Keep the original cut available when the proposed start is uncertain.
+- Confirm sponsor speech and check for programme speech in each eligible interval. The programme veto uses a separate `JEV_REVIEW_PROGRAMME_VETO` threshold, defaulting to 0.85.
+- Add an opt-in probe for archived reviewer inputs.
+
 ## 0.1.18 - 2026-09-25
 
 - Check each eligible review cut for ad-only speech independently. Use the configured review threshold for that check, then compare two safe cuts to choose the boundary.

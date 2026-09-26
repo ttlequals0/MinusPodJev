@@ -53,9 +53,10 @@ This is a recommended POC configuration, not a change applied to MinusPod by thi
 | `JEV_ENTER` | `detection_enter` | `0.95` | opens an ad span; editable at runtime |
 | `JEV_STAY` | `detection_stay` | `0.40` | extends an open span; editable at runtime |
 | `JEV_REVIEW_EVIDENCE_THRESHOLD` | `review_evidence` | `JEV_ENTER` when unset | gates advertising evidence before refinement |
-| `JEV_REVIEW_CHOICE_THRESHOLD` | `review_choice` | `JEV_ENTER` when unset | gates the final interval Choice |
+| `JEV_REVIEW_CHOICE_THRESHOLD` | `review_choice` | `JEV_ENTER` when unset | minimum sponsor-read score for an eligible cut |
+| `JEV_REVIEW_PROGRAMME_VETO` | environment only | `0.85` | vetoes a cut when local programme speech reaches this score |
 
-These are `0` to `1` scores, not measured accuracy. Detection enter must be at least `JEV_STAY`; review evidence and interval Choice thresholds are independent of detection enter.
+These are `0` to `1` scores, not measured accuracy. Detection enter must be at least `JEV_STAY`. The review evidence, sponsor-read, and programme thresholds are independent of detection enter.
 
 ### Save and authentication
 
@@ -98,8 +99,8 @@ The category pass uses one Jev Choice for each detected span. Its values are `sp
 - An uncovered original boundary does not block a correction with supported endpoints. The final Choice can select the original only when both endpoints are covered and its speech can be isolated. See [API error details](api.md#inference-errors).
 - The evidence NouL adds an upstream call unless cached.
 - `JEV_REVIEW_REFINE_BOUNDARIES=false` disables boundary refinement by default. Set it to `true` to offer Jev observed start and end timestamps near the current cut.
-- The proxy offers every supplied word-timed start and end within 30 seconds in two independent Choice questions. Each option shows speech before and after its timestamp. An `unknown` option lets Jev abstain. These choices propose a pair; their probabilities are not used as proof that the pair is a safe cut. If either question would exceed 255 options including `unknown`, review abstains without discarding candidates.
-- A third Choice compares the proposed cut with the original and can choose neither. It sees the speech in each interval, nearby words, and speech added to or excluded from the original. It should choose an interval only when it is a complete cut of the same promotional message without unrelated show speech. When both are equally complete, its instructions prefer the original. An exact probability tie or weak result abstains. The selected option must meet `JEV_REVIEW_CHOICE_THRESHOLD` and strictly lead the other options.
+- The start Choice offers observed utterance starts within 30 seconds, with the original start retained. A second Choice can refine the selected utterance to an observed word start. The end Choice offers observed word ends within 30 seconds. Each question includes an `unknown` option. The start and end choices propose a pair; their probabilities do not prove that it is safe. A question with more than 255 options including `unknown` abstains. If word refinement exceeds that limit, the utterance start remains selected.
+- A comparison Choice considers the proposed and original cuts and can choose neither. It sees speech in both intervals and nearby context. Each eligible interval then needs a sponsor-read score at or above `JEV_REVIEW_CHOICE_THRESHOLD`. Programme checks veto the interval if they reach `JEV_REVIEW_PROGRAMME_VETO`, which defaults to 0.85. When both intervals pass, the comparison decides whether to adjust or keep the original.
 - The proxy assembles selected speech from whole transcript rows and aligned edge words. It abstains with `insufficient_boundary_text` if it cannot isolate a row crossed by a selected boundary. Timestamp gaps alone do not prove missing speech.
 - Refinement still needs both word edges, sufficient evidence, context coverage and overlap, and the shared request deadline. Cache hits and retries follow the same policy as other Jev calls. Boundary refinement is experimental; its accuracy has not been measured.
 - `GET /api/status` reports effective enabled state, model, evidence threshold, and boundary validation threshold. Enabled does not guarantee refinement: word timings, sufficient evidence, and valid boundary choices are required.

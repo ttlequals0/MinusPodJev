@@ -67,6 +67,7 @@ _REVIEW_SYSTEM_SIGNATURES = (
     "taking a second look at a segment that the validator already rejected",
 )
 _EVIDENCE_MAX_CHARS = 400
+_PROGRAMME_VETO = 0.85
 
 
 class ReviewUnavailableError(RuntimeError):
@@ -106,7 +107,7 @@ def sanitize_review_range_diagnostic(value: dict[str, Any] | None) -> dict[str, 
         and isinstance(stage, str)
         and reason in {
             "proposed_range_not_confirmed", "original_range_not_confirmed", "edge_content_unconfirmed",
-            "adjacent_message_continues", "unrelated_editorial",
+            "adjacent_message_continues", "unrelated_editorial", "programme_content_detected",
         }
         and stage == "focused_validation"
     ):
@@ -147,6 +148,7 @@ class ReviewInconclusiveError(ReviewUnavailableError):
             "choice_inconclusive",
             "neither_complete",
             "ad_content_unconfirmed",
+            "programme_content_detected",
             "invalid_pair",
             "proposed_range_not_confirmed",
             "original_range_not_confirmed",
@@ -413,6 +415,7 @@ def run_chat_completion(
     refine_boundaries: bool = False,
     review_evidence_enter: float | None = None,
     review_choice_enter: float | None = None,
+    review_programme_veto: float = _PROGRAMME_VETO,
     review_request_id: str | None = None,
     fetcher: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -438,6 +441,7 @@ def run_chat_completion(
             stay=stay,
             review_evidence_enter=review_evidence_enter,
             review_choice_enter=review_choice_enter,
+            review_programme_veto=review_programme_veto,
             uid=uid,
             max_retries=max_retries,
             retry_after_max=retry_after_max,
@@ -885,6 +889,73 @@ def _rank_questions(
     )
 
 
+def _unit_start_question(
+    segments: Sequence[dict[str, Any]],
+    words: Sequence[dict[str, Any]],
+    starts: Sequence[float],
+    original: float,
+) -> tuple[dict[str, Any], dict[str, float]]:
+    units = _word_units(words, segments)
+    by_start = {float(unit[0]["start"]): unit for unit in units}
+    values = [value for value in starts if value in by_start or value == original]
+    criteria = {"unknown": "Insufficient evidence to place this boundary at any listed option."}
+    mapping: dict[str, float] = {}
+    for index, value in enumerate(values):
+        key = f"start_{index:02d}"
+        unit = by_start.get(value)
+        if unit is None:
+            unit = next(
+                (item for item in units if float(item[0]["start"]) <= value < float(item[-1]["end"])),
+                None,
+            )
+        if unit is None:
+            criteria[key] = _edge_reference(words, value, "start", original)
+        else:
+            suffix = [word for word in unit if float(word["start"]) >= value]
+            criteria[key] = (
+                "The sponsor message begins with: "
+                + " ".join(str(word["text"]).strip() for word in suffix)
+                if suffix else _edge_reference(words, value, "start", original)
+            )
+        mapping[key] = value
+    return {
+        "type": "choice",
+        "instructions": "Which quoted utterance first delivers the separate commercial message or its ad-specific problem setup? Read the speech in chronological order. A personal problem paid off by the sponsor product belongs inside the commercial before the brand is named. Do not move the start back into an independent conversation or a generic segue from an earlier topic merely because later speech compares it with the sponsor. A break announcement is context, not automatically part of the cut. Choose unknown if unsupported.",
+        "criteria": criteria,
+    }, mapping
+
+
+def _word_start_question(
+    segments: Sequence[dict[str, Any]],
+    words: Sequence[dict[str, Any]],
+    starts: Sequence[float],
+    selected: float,
+) -> tuple[dict[str, Any] | None, dict[str, float]]:
+    unit = next(
+        (item for item in _word_units(words, segments)
+         if float(item[0]["start"]) <= selected < float(item[-1]["end"])),
+        None,
+    )
+    if unit is None:
+        return None, {}
+    values = sorted({float(word["start"]) for word in unit if float(word["start"]) in starts})
+    if len(values) < 2:
+        return None, {}
+    criteria = {"unknown": "Insufficient evidence to place the word boundary at a listed option."}
+    mapping: dict[str, float] = {}
+    for index, value in enumerate(values):
+        key = f"word_{index:02d}"
+        criteria[key] = "The sponsor message begins with: " + " ".join(
+            str(word["text"]).strip() for word in unit if float(word["start"]) >= value
+        )
+        mapping[key] = value
+    return {
+        "type": "choice",
+        "instructions": "Within this utterance, which quoted word begins the separate commercial message or its ad-specific problem setup? Choose the first word if the whole utterance is commercial. Choose unknown only if the available speech cannot place the boundary.",
+        "criteria": criteria,
+    }, mapping
+
+
 def _comparison_question(has_adjustment: bool, original_supported: bool) -> dict[str, dict[str, Any]]:
     criteria = {}
     if has_adjustment:
@@ -899,12 +970,154 @@ def _comparison_question(has_adjustment: bool, original_supported: bool) -> dict
             "criteria": criteria,
         }
     }
-    for label, eligible in (("proposed", has_adjustment), ("original", original_supported)):
-        if eligible:
-            questions[f"{label}_ad_only"] = {
-                "type": "noul",
-                "instructions": f"All speech inside `{label}_speech` is advertising or promotional content in this break under `guidance`, including sponsor introductions, product anecdotes, offers, and sign-offs. Unrelated show teases, discussion, or returns are not advertising. Judge only speech inside the interval; omitted advertising words affect the comparison, not this safety answer.",
-            }
+    return questions
+
+
+_PROGRAMME_CRITERIA = {
+    "true": "The target contains host or guest story, reporting, interview, or conversation serving the episode rather than the sponsor read. This includes discussion about a sponsor-related subject once the speaker is no longer presenting the promotion. Resolve pronouns from preceding speech. A brief remark about a sponsor and its relationship to the hosts remains sponsor sign-off even if conversational. Judge target words only.",
+    "false": "The target contains only the sponsor or promotional read, including narrative setup, personal story used to lead into the product, sponsor-related conversational thanks, offer, URL, or disclaimer. A pronoun referring to the sponsor in a brief relationship remark continues the sign-off. Brief break navigation without episode discussion is separate.",
+}
+_CONTINUITY_CRITERIA = {
+    "true": "The target has moved away from a commercial message into independent episode conversation, reporting, interview, or news. It is programme speech even if it discusses the same broad topic as an earlier sponsor. Judge only the target using the words before and after to locate the change in function.",
+    "false": "The target continues the commercial message. Product explanation, a hands-on demonstration of the named sponsor product, a sponsor-related personal aside, an offer, URL, or thanks remains promotional while that sponsor presentation continues. Conversational delivery or technical subject matter alone does not make it programme speech.",
+}
+
+
+def _focused_guidance(guidance: str) -> str:
+    return guidance.replace(
+        "Each line of `transcript` is one segment of a podcast episode, prefixed with its line id. A line is ADVERTISING when it is",
+        "The following speech is from a podcast episode. Speech is ADVERTISING when it is",
+    ).replace("A line is EDITORIAL CONTENT when it is", "Speech is EDITORIAL CONTENT when it is")
+
+
+def _programme_question(before: str, target: str, after: str) -> dict[str, Any]:
+    return {
+        "type": "noul",
+        "instructions": {
+            "question": "Does target_speech contain programme speech that should remain outside an advertising cut?",
+            "speech_before": before,
+            "target_speech": target,
+            "speech_after": after,
+        },
+        "criteria": _PROGRAMME_CRITERIA,
+    }
+
+
+def _continuity_question(before: str, target: str, after: str, *, whole: bool = False) -> dict[str, Any]:
+    return {
+        "type": "noul",
+        "instructions": {
+            "question": (
+                "Does any speech in target_speech move away from a commercial message into independent programme speech?"
+                if whole else
+                "Has target_speech moved away from the commercial message into independent programme speech?"
+            ),
+            "speech_before": before,
+            "target_speech": target,
+            "speech_after": after,
+        },
+        "criteria": _CONTINUITY_CRITERIA,
+    }
+
+
+def _interior_questions(
+    segments: Sequence[dict[str, Any]],
+    word_edges: dict[str, list[dict[str, Any]]],
+    bounds: tuple[float, float],
+) -> dict[str, dict[str, Any]] | None:
+    units: list[str] = []
+    for segment in segments:
+        if float(segment["end"]) <= bounds[0] or float(segment["start"]) >= bounds[1]:
+            continue
+        text = _assessment_speech([segment], word_edges, bounds)
+        if text is None:
+            return None
+        if text:
+            units.append(text)
+    questions: dict[str, dict[str, Any]] = {}
+    for index in range(max(1, len(units) - 1)) if units else ():
+        target = " ".join(units[index:index + 2])
+        before = " ".join(" ".join(units[:index]).split()[-64:])
+        after = " ".join(" ".join(units[index + 2:]).split()[:64])
+        questions[f"interior_{index}"] = _continuity_question(before, target, after)
+    return questions
+
+
+def _promotion_question(speech: str) -> dict[str, Any]:
+    return {
+        "type": "noul",
+        "instructions": {
+            "question": "Is this passage a sponsor read or an inserted promotional advertisement?",
+            "speech": speech,
+        },
+        "criteria": {
+            "true": "The passage is a sponsor or promotional read. Conversational setup, product demonstration, a personal anecdote used in the pitch, disclaimers, offers, URLs, thanks, and multiple consecutive sponsors belong to the read.",
+            "false": "The passage is programme reporting or discussion that merely mentions a brand, or it combines advertising with substantive show discussion.",
+        },
+    }
+
+
+def _word_units(
+    words: Sequence[dict[str, Any]], segments: Sequence[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    ordered = sorted(words, key=lambda word: (float(word["start"]), float(word["end"])))
+    units: list[list[dict[str, Any]]] = []
+    previous_segment: int | None = None
+    for word in ordered:
+        segment_id = next(
+            (index for index, segment in enumerate(segments)
+             if float(segment["start"]) - 0.1 <= float(word["start"])
+             and float(word["end"]) <= float(segment["end"]) + 0.1),
+            None,
+        )
+        prior = units[-1][-1] if units else None
+        split = (
+            prior is None
+            or previous_segment != segment_id
+            or re.search(r"[.!?][\"']?$", str(prior["text"]).strip()) is not None
+            or float(word["start"]) - float(prior["end"]) >= 0.6
+        )
+        if split:
+            units.append([])
+        units[-1].append(word)
+        previous_segment = segment_id
+    return units
+
+
+def _programme_checks(
+    segments: Sequence[dict[str, Any]],
+    word_edges: dict[str, list[dict[str, Any]]],
+    bounds: tuple[float, float],
+    additions: Sequence[tuple[str, float, float]],
+) -> dict[str, dict[str, Any]]:
+    questions: dict[str, dict[str, Any]] = {}
+
+    def add_question(name: str, side: str, target: list[dict[str, Any]]) -> None:
+        words = word_edges[side]
+        first, last = words.index(target[0]), words.index(target[-1])
+        before = words[max(0, first - (16 if side == "start" else 64)):first]
+        after = words[last + 1:last + 1 + (64 if side == "start" else 16)]
+        questions[name] = _programme_question(
+            " ".join(str(word["text"]).strip() for word in before),
+            " ".join(str(word["text"]).strip() for word in target),
+            " ".join(str(word["text"]).strip() for word in after),
+        )
+
+    for side in ("start", "end"):
+        words = word_edges[side]
+        inside = [word for word in words if float(word["end"]) > bounds[0] and float(word["start"]) < bounds[1]]
+        units = _word_units(inside, segments)
+        if not units:
+            continue
+        target = units[0] if side == "start" else [word for unit in units[-2:] for word in unit]
+        add_question(f"{side}_speech", side, target)
+    for edge, (side, start, end) in enumerate(additions):
+        words = word_edges[side]
+        added = [word for word in words if float(word["end"]) > start and float(word["start"]) < end]
+        units = _word_units(added, segments)
+        for index in range(max(1, len(units) - 1)) if units else ():
+            target = [word for unit in units[index:index + 2] for word in unit]
+            add_question(f"added_{edge}_{index}", side, target)
     return questions
 
 
@@ -992,6 +1205,7 @@ def run_review(
     refine_boundaries: bool = False,
     review_evidence_enter: float | None = None,
     review_choice_enter: float | None = None,
+    review_programme_veto: float = _PROGRAMME_VETO,
     review_request_id: str | None = None,
     guidance: str = GUIDANCE,
     fetcher: Callable[..., dict[str, Any]] | None = None,
@@ -1000,6 +1214,8 @@ def run_review(
     echo_model = request_model or model
     review_evidence_enter = enter if review_evidence_enter is None else review_evidence_enter
     review_choice_enter = enter if review_choice_enter is None else review_choice_enter
+    if not math.isfinite(review_programme_veto) or not 0.0 <= review_programme_veto <= 1.0:
+        raise ValueError("review programme veto must be between 0 and 1")
     end = deadline_at if deadline_at is not None else time.monotonic() + request_deadline
     text = extract_user_text(messages)
     caller_context, transcript_text = _review_prompt_parts(text)
@@ -1345,10 +1561,13 @@ def run_review(
                 reason="no_valid_pairs",
                 stage="choice_rank",
             )
-        if len(starts) > _BOUNDARY_CHOICE_LIMIT or len(ends) > _BOUNDARY_CHOICE_LIMIT:
+        start_question, start_values = _unit_start_question(
+            coarse_segments, word_edges["start"], starts, cand_start,
+        )
+        if len(start_values) > _BOUNDARY_CHOICE_LIMIT or len(ends) > _BOUNDARY_CHOICE_LIMIT:
             logger.info(
                 "review request_id=%s refinement=skipped reason=too_many_boundary_options start_candidates=%d end_candidates=%d limit=%d",
-                review_request_id, len(starts), len(ends), _BOUNDARY_CHOICE_LIMIT,
+                review_request_id, len(start_values), len(ends), _BOUNDARY_CHOICE_LIMIT,
             )
             _review_unavailable(
                 pool, "Jev boundary search exceeded the Choice option limit", review_request_id,
@@ -1362,16 +1581,45 @@ def run_review(
             cand_end,
         )
         try:
-            rank_questions, start_values, end_values = _rank_questions(word_edges, cand, starts, ends)
-            ranked = review_questions(
-                rank_questions,
-                "choice_rank",
-                question_state_override=_choice_state(coarse_segments, cand, review_guidance, caller_context),
+            rank_questions, _, end_values = _rank_questions(word_edges, cand, starts, ends)
+            rank_state = _choice_state(coarse_segments, cand, review_guidance, caller_context)
+            start_ranked = review_questions(
+                {"boundary_start": start_question},
+                "choice_rank_start",
+                question_state_override={"start_context": rank_state["start_context"]},
             )
-            start_answer = ranked["answers"]["boundary_start"]
-            end_answer = ranked["answers"]["boundary_end"]
+            end_ranked = review_questions(
+                {"boundary_end": rank_questions["boundary_end"]},
+                "choice_rank_end",
+                question_state_override=rank_state,
+            )
+            start_answer = start_ranked["answers"]["boundary_start"]
+            end_answer = end_ranked["answers"]["boundary_end"]
             start_probs = start_answer["probabilities"]
             end_probs = end_answer["probabilities"]
+            fine_start = None
+            if start_answer["choice"] != "unknown":
+                fine_question, fine_values = _word_start_question(
+                    coarse_segments, word_edges["start"], starts,
+                    start_values[start_answer["choice"]],
+                )
+                if fine_question is not None and len(fine_values) <= _BOUNDARY_CHOICE_LIMIT:
+                    fine_ranked = review_questions(
+                        {"boundary_start_word": fine_question},
+                        "choice_rank_start_word",
+                        question_state_override={"start_context": rank_state["start_context"]},
+                    )
+                    fine_choice = fine_ranked["answers"]["boundary_start_word"]["choice"]
+                    fine_start = fine_values.get(fine_choice)
+                    logger.info(
+                        "review request_id=%s stage=choice_rank_start_word choice=%s selected_time=%s cache_hit=%s",
+                        review_request_id, fine_choice, fine_start, fine_ranked["cache_hit"],
+                    )
+                elif fine_question is not None:
+                    logger.info(
+                        "review request_id=%s stage=choice_rank_start_word skipped=too_many_boundary_options options=%d limit=%d",
+                        review_request_id, len(fine_values), _BOUNDARY_CHOICE_LIMIT,
+                    )
             logger.info(
                 "review request_id=%s stage=choice_rank start_choice=%s start_time=%s start_probability=%s start_confidence=%s end_choice=%s end_time=%s end_probability=%s end_confidence=%s cache_hit=%s",
                 review_request_id,
@@ -1383,13 +1631,13 @@ def run_review(
                 end_values.get(end_answer["choice"]),
                 end_probs[end_answer["choice"]],
                 end_answer["confidence"],
-                ranked["cache_hit"],
+                bool(start_ranked["cache_hit"] and end_ranked["cache_hit"]),
             )
             proposed = cand
             start_choice = start_answer["choice"]
             end_choice = end_answer["choice"]
             if start_choice != "unknown" and end_choice != "unknown":
-                selected = (start_values[start_choice], end_values[end_choice])
+                selected = (fine_start if fine_start is not None else start_values[start_choice], end_values[end_choice])
                 if _valid_pair(
                     selected[0], selected[1], cand, (ad_start, ad_end),
                     boundary_context_start, boundary_context_end,
@@ -1471,14 +1719,84 @@ def run_review(
                 (float(value) for key, value in answer["probabilities"].items() if key != selected_choice),
                 default=0.0,
             )
-            proposed_safety = float(compared["answers"]["proposed_ad_only"]) if proposed_supported else None
-            original_safety = float(compared["answers"]["original_ad_only"]) if original_supported else None
-            proposed_safe = proposed_safety is not None and proposed_safety >= review_choice_enter
-            original_safe = original_safety is not None and original_safety >= review_choice_enter
+            promotion: dict[str, float | None] = {"proposed": None, "original": None}
+            intrusion: dict[str, float | None] = {"proposed": None, "original": None}
+            safe: dict[str, bool] = {"proposed": False, "original": False}
+            check_coverage: dict[str, tuple[bool, bool] | None] = {"proposed": None, "original": None}
+            promotion_cache: dict[str, bool | None] = {"proposed": None, "original": None}
+            programme_cache: dict[str, bool | None] = {"proposed": None, "original": None}
+            focused_guidance = _focused_guidance(review_guidance)
+            for label, bounds, eligible, interval_speech in (
+                ("proposed", proposed, proposed_supported, proposed_speech),
+                ("original", cand, original_supported, original_speech),
+            ):
+                if not eligible or not interval_speech:
+                    continue
+                additions: list[tuple[str, float, float]] = []
+                if label == "proposed":
+                    if proposed[0] < cand_start:
+                        additions.append(("start", proposed[0], cand_start))
+                    if proposed[1] > cand_end:
+                        additions.append(("end", cand_end, proposed[1]))
+                checks = _programme_checks(segments, word_edges, bounds, additions)
+                start_ok, end_ok = "start_speech" in checks, "end_speech" in checks
+                for index, (side, _, _) in enumerate(additions):
+                    if not any(key.startswith(f"added_{index}_") for key in checks):
+                        if side == "start":
+                            start_ok = False
+                        else:
+                            end_ok = False
+                for name, question in checks.items():
+                    if name == "end_speech" or any(
+                        name.startswith(f"added_{index}_") and side == "end"
+                        for index, (side, _, _) in enumerate(additions)
+                    ):
+                        instructions = question["instructions"]
+                        checks[name] = _continuity_question(
+                            instructions["speech_before"], instructions["target_speech"],
+                            instructions["speech_after"],
+                        )
+                interior = _interior_questions(segments, word_edges, bounds)
+                if interior is None:
+                    start_ok = end_ok = False
+                else:
+                    checks.update(interior)
+                    checks["whole_speech"] = _continuity_question("", interval_speech, "", whole=True)
+                check_coverage[label] = start_ok, end_ok
+                if not (start_ok and end_ok):
+                    continue
+                sponsor = review_questions(
+                    {"sponsor_read": _promotion_question(interval_speech)},
+                    f"{label}_promotion",
+                    question_state_override={"guidance": focused_guidance, "speech": interval_speech},
+                )
+                promotion_score = float(sponsor["answers"]["sponsor_read"])
+                promotion[label] = promotion_score
+                promotion_cache[label] = bool(sponsor["cache_hit"])
+                scores: list[float] = []
+                all_cached = True
+                items = list(checks.items())
+                for offset in range(0, len(items), 20):
+                    checked = review_questions(
+                        dict(items[offset:offset + 20]),
+                        f"{label}_programme",
+                        question_state_override={},
+                    )
+                    scores.extend(float(value) for value in checked["answers"].values())
+                    all_cached &= bool(checked["cache_hit"])
+                programme_score = max(scores)
+                intrusion[label] = programme_score
+                programme_cache[label] = all_cached
+                safe[label] = promotion_score >= review_choice_enter and programme_score < review_programme_veto
+            proposed_safety = promotion["proposed"]
+            original_safety = promotion["original"]
+            proposed_safe = safe["proposed"]
+            original_safe = safe["original"]
             logger.info(
-                "review request_id=%s stage=interval_comparison choice=%s probability=%s runner_up=%s safety_threshold=%s proposed_safety=%s original_safety=%s adjusted_probability=%s original_probability=%s neither_probability=%s original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f original_supported=%s proposed_supported=%s cache_hit=%s",
+                "review request_id=%s stage=interval_comparison choice=%s probability=%s runner_up=%s promotion_threshold=%s programme_veto=%s proposed_promotion=%s original_promotion=%s proposed_programme=%s original_programme=%s adjusted_probability=%s original_probability=%s neither_probability=%s original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f original_supported=%s proposed_supported=%s cache_hit=%s",
                 review_request_id, selected_choice, selected_probability, runner_up,
-                review_choice_enter, proposed_safety, original_safety,
+                review_choice_enter, review_programme_veto, proposed_safety, original_safety,
+                intrusion["proposed"], intrusion["original"],
                 answer["probabilities"].get("adjusted"), answer["probabilities"].get("original"),
                 answer["probabilities"]["neither"],
                 cand_start, cand_end, proposed[0], proposed[1],
@@ -1495,41 +1813,59 @@ def run_review(
                 metrics.record_review_refinement("completed", changed=False)
             else:
                 metrics.record_review_refinement("inconclusive")
-                proposal_diagnostic = None
-                if proposed != cand:
-                    proposal_diagnostic = (
-                        {
-                            "reason": "proposed_range_not_confirmed", "stage": "focused_validation",
-                            "range_start": proposed[0], "range_end": proposed[1],
-                            "score": proposed_safety, "threshold": review_choice_enter,
-                            "cache_hit": bool(compared["cache_hit"]),
+                def diagnostic(label: str, bounds: tuple[float, float], supported: bool,
+                               start_supported: bool, end_supported: bool) -> dict[str, Any]:
+                    if not supported:
+                        return {
+                            "reason": "insufficient_boundary_text" if start_supported and end_supported else "missing_boundary_coverage",
+                            "stage": "boundary_coverage", "range_start": bounds[0], "range_end": bounds[1],
+                            "start_supported": start_supported, "end_supported": end_supported,
                         }
-                        if proposed_supported else {
-                            "reason": "insufficient_boundary_text" if proposed_start_supported and proposed_end_supported else "missing_boundary_coverage",
-                            "stage": "boundary_coverage", "range_start": proposed[0], "range_end": proposed[1],
-                            "start_supported": proposed_start_supported, "end_supported": proposed_end_supported,
+                    coverage = check_coverage[label]
+                    if coverage is not None and intrusion[label] is None:
+                        start_ok, end_ok = coverage
+                        return {
+                            "reason": "insufficient_boundary_text", "stage": "boundary_coverage",
+                            "range_start": bounds[0], "range_end": bounds[1],
+                            "start_supported": start_ok, "end_supported": end_ok,
                         }
-                    )
-                fallback_diagnostic = (
-                    {
-                        "reason": "original_range_not_confirmed", "stage": "focused_validation",
-                        "range_start": cand_start, "range_end": cand_end,
-                        "score": original_safety, "threshold": review_choice_enter,
-                        "cache_hit": bool(compared["cache_hit"]),
+                    programme_score = intrusion[label]
+                    if programme_score is not None and programme_score >= review_programme_veto:
+                        return {
+                            "reason": "programme_content_detected", "stage": "focused_validation",
+                            "range_start": bounds[0], "range_end": bounds[1],
+                            "score": programme_score, "threshold": review_programme_veto,
+                            "cache_hit": bool(programme_cache[label]),
+                        }
+                    return {
+                        "reason": f"{label}_range_not_confirmed", "stage": "focused_validation",
+                        "range_start": bounds[0], "range_end": bounds[1],
+                        "score": promotion[label], "threshold": review_choice_enter,
+                        "cache_hit": bool(promotion_cache[label]),
                     }
-                    if original_supported else {
-                        "reason": "insufficient_boundary_text" if original_start_supported and original_end_supported else "missing_boundary_coverage",
-                        "stage": "boundary_coverage", "range_start": cand_start, "range_end": cand_end,
-                        "start_supported": original_start_supported, "end_supported": original_end_supported,
-                    }
+
+                proposal_diagnostic = (
+                    diagnostic("proposed", proposed, proposed_supported,
+                               proposed_start_supported, proposed_end_supported)
+                    if proposed != cand else None
                 )
-                alternative_score = max((score for score in (proposed_safety, original_safety) if score is not None), default=0.0)
+                fallback_diagnostic = diagnostic(
+                    "original", cand, original_supported,
+                    original_start_supported, original_end_supported,
+                )
+                primary = fallback_diagnostic if original_supported else proposal_diagnostic or fallback_diagnostic
+                reason = str(primary["reason"])
+                if reason == "programme_content_detected":
+                    reason = "original_range_not_confirmed" if primary is fallback_diagnostic else "proposed_range_not_confirmed"
+                elif reason in {"proposed_range_not_confirmed", "original_range_not_confirmed"}:
+                    reason = "ad_content_unconfirmed"
                 _review_unavailable(
-                    pool, "Jev could not confirm ad-only speech in either eligible interval", review_request_id,
-                    reason="ad_content_unconfirmed",
-                    stage="focused_validation",
-                    score=alternative_score,
-                    threshold=review_choice_enter, cache_hit=bool(compared["cache_hit"]),
+                    pool, "Jev could not confirm a safe advertising interval", review_request_id,
+                    reason=reason,
+                    stage=str(primary["stage"]),
+                    score=primary.get("score"),
+                    threshold=primary.get("threshold"),
+                    cache_hit=primary.get("cache_hit"),
                     proposal=proposal_diagnostic, fallback=fallback_diagnostic,
                 )
             logger.info(

@@ -351,8 +351,7 @@ def test_comparison_question_requires_complete_cut_and_neither_option():
     assert question["type"] == "choice"
     assert set(question["criteria"]) == {"adjusted", "original", "neither"}
     assert "advertising or promotional content in this break" in question["instructions"]
-    assert {"proposed_ad_only", "original_ad_only"} <= set(questions)
-    assert "omitted advertising words affect the comparison" in questions["proposed_ad_only"]["instructions"]
+    assert set(questions) == {"interval_comparison"}
     assert set(_comparison_question(False, True)["interval_comparison"]["criteria"]) == {"original", "neither"}
 
 
