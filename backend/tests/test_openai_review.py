@@ -39,6 +39,9 @@ from minuspod_compat import extract_json_ads_array, format_window_prompt
 _AD_KW = ("sponsor", "betterhelp", "promo code", "brought to you by", "acast")
 _START_OPTIONS: dict[str, float] = {}
 _WORD_START_OPTIONS: dict[str, float] = {}
+_END_UNIT_OPTIONS: dict[str, list[dict[str, Any]] | float] = {}
+_END_GROUP_OPTIONS: dict[str, list[float]] = {}
+_WORD_END_OPTIONS: dict[str, float] = {}
 
 
 def _upstream_status_error(
@@ -67,6 +70,9 @@ def reset_review_refinement_metrics():
 def capture_start_options(monkeypatch):
     original = adapter._unit_start_question
     original_word = adapter._word_start_question
+    original_end = adapter._unit_end_question
+    original_end_group = adapter._end_word_group_question
+    original_end_word = adapter._word_end_question
 
     def capture(*args, **kwargs):
         question, options = original(*args, **kwargs)
@@ -82,9 +88,36 @@ def capture_start_options(monkeypatch):
         return question, options
 
     monkeypatch.setattr(adapter, "_word_start_question", capture_word)
+
+    def capture_end(*args, **kwargs):
+        question, options = original_end(*args, **kwargs)
+        _END_UNIT_OPTIONS.clear()
+        _END_UNIT_OPTIONS.update(options)
+        return question, options
+
+    monkeypatch.setattr(adapter, "_unit_end_question", capture_end)
+
+    def capture_end_group(*args, **kwargs):
+        question, options = original_end_group(*args, **kwargs)
+        _END_GROUP_OPTIONS.clear()
+        _END_GROUP_OPTIONS.update(options)
+        return question, options
+
+    monkeypatch.setattr(adapter, "_end_word_group_question", capture_end_group)
+
+    def capture_end_word(*args, **kwargs):
+        question, options = original_end_word(*args, **kwargs)
+        _WORD_END_OPTIONS.clear()
+        _WORD_END_OPTIONS.update(options)
+        return question, options
+
+    monkeypatch.setattr(adapter, "_word_end_question", capture_end_word)
     yield
     _START_OPTIONS.clear()
     _WORD_START_OPTIONS.clear()
+    _END_UNIT_OPTIONS.clear()
+    _END_GROUP_OPTIONS.clear()
+    _WORD_END_OPTIONS.clear()
 
 
 def test_positive_word_edges_recover_only_whole_coarse_gaps():
@@ -374,10 +407,10 @@ def test_word_clipped_original_can_adjust_to_aligned_end(jev_env, tmp_path):
     ranked = _select_pair_fake(0.0, 94.2)
 
     def fake(payload, **kwargs):
-        if "boundary_end" in payload["questions"]:
-            options = payload["questions"]["boundary_end"]["criteria"].values()
-            assert any(option.startswith("94.20s:") for option in options)
-            assert not any(option.startswith("94.80s:") for option in options)
+        if "boundary_end_word" in payload["questions"]:
+            options = payload["questions"]["boundary_end_word"]["criteria"].values()
+            assert any("at 94.20s;" in option for option in options)
+            assert not any("at 94.80s;" in option for option in options)
         result = ranked(payload, **kwargs)
         if "interval_comparison" in payload["questions"]:
             assert "original" not in payload["questions"]["interval_comparison"]["criteria"]
@@ -397,19 +430,7 @@ def test_unsupported_original_can_trim_to_word_supported_range(jev_env, tmp_path
 
     def fake(payload, **kwargs):
         result = normal(payload, **kwargs)
-        if "boundary_start" in payload["questions"] or "boundary_end" in payload["questions"]:
-            for key, target in (("boundary_start", 94.0), ("boundary_end", 100.0)):
-                if key not in payload["questions"]:
-                    continue
-                criteria = payload["questions"][key]["criteria"]
-                option = (next(name for name, value in _START_OPTIONS.items() if value == target)
-                          if key == "boundary_start" else
-                          next(name for name, text in criteria.items() if f"{target:.2f}s" in text))
-                result["answers"][key]["choice"] = option
-                result["answers"][key]["probabilities"] = {
-                    name: 0.99 if name == option else 0.01 / (len(criteria) - 1)
-                    for name in criteria
-                }
+        _override_boundaries(result, payload, 94.0, 100.0)
         if "interval_comparison" in payload["questions"]:
             comparisons.append(payload)
         return result
@@ -451,19 +472,7 @@ def test_zero_duration_word_supports_selected_endpoint_outside_coarse_context(
 
     def fake(payload, **kwargs):
         result = normal(payload, **kwargs)
-        if "boundary_start" in payload["questions"] or "boundary_end" in payload["questions"]:
-            for key, target in (("boundary_start", 93.9), ("boundary_end", 110.0)):
-                if key not in payload["questions"]:
-                    continue
-                criteria = payload["questions"][key]["criteria"]
-                option = (next(name for name, value in _START_OPTIONS.items() if value == target)
-                          if key == "boundary_start" else
-                          next(name for name, text in criteria.items() if f"{target:.2f}s" in text))
-                result["answers"][key]["choice"] = option
-                result["answers"][key]["probabilities"] = {
-                    name: 0.99 if name == option else 0.01 / (len(criteria) - 1)
-                    for name in criteria
-                }
+        _override_boundaries(result, payload, 93.9, 110.0)
         if "sponsor_read" in payload["questions"]:
             result["answers"]["sponsor_read"] = {"noul": focused_score}
         if "interval_comparison" in payload["questions"]:
@@ -526,28 +535,50 @@ def _unsupported_original_prompt() -> str:
     )
 
 
+def _end_unit_option(target: float) -> str:
+    for name, value in _END_UNIT_OPTIONS.items():
+        if isinstance(value, float):
+            if value == target:
+                return name
+        elif float(value[0]["start"]) <= target <= float(value[-1]["end"]):
+            return name
+    raise AssertionError(f"no end unit contains {target}")
+
+
+def _boundary_option(key: str, target: float) -> str:
+    if key == "boundary_start":
+        selected = max(value for value in _START_OPTIONS.values() if value <= target)
+        return next(name for name, value in _START_OPTIONS.items() if value == selected)
+    if key == "boundary_start_word":
+        return next(name for name, value in _WORD_START_OPTIONS.items() if value == target)
+    if key == "boundary_end":
+        return _end_unit_option(target)
+    if key == "boundary_end_group":
+        return next(name for name, values in _END_GROUP_OPTIONS.items() if target in values)
+    return next(name for name, value in _WORD_END_OPTIONS.items() if value == target)
+
+
+def _override_boundaries(
+    result: dict[str, Any], payload: dict[str, Any], start: float, end: float,
+) -> None:
+    for key, question in payload["questions"].items():
+        if key not in {"boundary_start", "boundary_start_word", "boundary_end", "boundary_end_group", "boundary_end_word"}:
+            continue
+        target = start if key.startswith("boundary_start") else end
+        option = _boundary_option(key, target)
+        result["answers"][key]["choice"] = option
+        result["answers"][key]["probabilities"] = {
+            name: 0.99 if name == option else 0.01 / (len(question["criteria"]) - 1)
+            for name in question["criteria"]
+        }
+
+
 def _select_pair_fake(start: float, end: float):
     normal = make_text_fake()
 
     def fake(payload, **kwargs):
         result = normal(payload, **kwargs)
-        for key, question in payload["questions"].items():
-            if key not in {"boundary_start", "boundary_start_word", "boundary_end"}:
-                continue
-            target = start if key == "boundary_start" else end
-            if key == "boundary_start":
-                selected = max(value for value in _START_OPTIONS.values() if value <= target)
-                option = next(name for name, value in _START_OPTIONS.items() if value == selected)
-            elif key == "boundary_start_word":
-                target = start
-                option = next(name for name, value in _WORD_START_OPTIONS.items() if value == target)
-            else:
-                option = next(name for name, description in question["criteria"].items() if f"{target:.2f}s" in description)
-            result["answers"][key]["choice"] = option
-            result["answers"][key]["probabilities"] = {
-                name: 0.99 if name == option else 0.01 / (len(question["criteria"]) - 1)
-                for name in question["criteria"]
-            }
+        _override_boundaries(result, payload, start, end)
         return result
 
     return fake
@@ -621,9 +652,16 @@ def make_text_fake(*, keywords=_AD_KW, input_tokens=1200, output_tokens=6, raise
                 elif key == "boundary_start_word":
                     option = next((name for name, value in _WORD_START_OPTIONS.items() if value == candidate.get("start")), "unknown")
                 elif key == "boundary_end":
+                    option = _end_unit_option(candidate["end"])
+                elif key == "boundary_end_group":
                     option = next(
-                        (name for name, text in criteria.items() if f"{candidate.get('end'):.2f}s" in text),
-                        next(name for name in criteria if name != "unknown"),
+                        (name for name, values in _END_GROUP_OPTIONS.items() if candidate.get("end") in values),
+                        "unknown",
+                    )
+                elif key == "boundary_end_word":
+                    option = next(
+                        (name for name, value in _WORD_END_OPTIONS.items() if value == candidate.get("end")),
+                        "unknown",
                     )
                 else:
                     option = next(name for name in criteria if name != "unknown")
@@ -751,6 +789,59 @@ def test_review_evidence_threshold_is_independent(jev_env, tmp_path):
             tmp_path,
             review_evidence_enter=0.99,
         )
+
+
+def test_review_prefilter_uses_review_evidence_threshold_only(jev_env, tmp_path):
+    rows = [
+        (94.0, 100.0, "back to the topic"),
+        (100.0, 110.0, "This episode is sponsored by BetterHelp"),
+        (110.0, 120.0, "Use promo code SHOW"),
+        (120.0, 126.0, "and we are back"),
+    ]
+    prompt = build_review_prompt(100.0, 120.0, rows[:1], rows[1:3], rows[3:])
+    normal = make_text_fake()
+    evidence_calls = 0
+
+    def score_at_review_threshold(payload, **kwargs):
+        nonlocal evidence_calls
+        result = normal(payload, **kwargs)
+        for name, answer in result["answers"].items():
+            if name.startswith("s") and name[1:].isdigit() and answer["noul"] > 0.5:
+                answer["noul"] = 0.93
+        if "evidence" in result["answers"]:
+            evidence_calls += 1
+            result["answers"]["evidence"]["noul"] = 0.93
+        return result
+
+    reviewed = _run(
+        prompt, score_at_review_threshold, tmp_path,
+        enter=0.95, review_evidence_enter=0.85,
+    )
+    assert json.loads(reviewed["choices"][0]["message"]["content"])["ads"]
+    assert evidence_calls == 1
+
+    detection_prompt = format_window_prompt(
+        "Pod", "Ep", "", [f"[{start:.1f}s-{end:.1f}s] {text}" for start, end, text in rows],
+        0, 1, 0.0, 600.0,
+    )
+    detected = adapter.run_chat_completion(
+        messages=[{"role": "user", "content": detection_prompt}],
+        request_model="typesafe/jev",
+        url="u",
+        api_key="k",
+        timeout=1.0,
+        cache_path=str(tmp_path / "detection.json"),
+        model="jev-latest",
+        enter=0.95,
+        stay=0.40,
+        category_pass=False,
+        category_context=2,
+        default_category="sponsor",
+        review_evidence_enter=0.85,
+        fetcher=score_at_review_threshold,
+    )
+    assert json.loads(detected["choices"][0]["message"]["content"])["ads"] == []
+    assert evidence_calls == 1
 
 
 def test_review_choice_threshold_is_independent(jev_env, tmp_path):
@@ -1264,9 +1355,14 @@ def test_review_caller_context_reaches_detection_and_all_review_stages(jev_env, 
     _run(prompt, fake, tmp_path, refine_boundaries=True)
 
     caller_context, transcript_text = _review_prompt_parts(prompt)
-    assert len(payloads) == 9
+    assert len(payloads) == 11
     for payload in payloads:
-        if "sponsor_read" in payload["questions"] or "start_speech" in payload["questions"] or "boundary_start" in payload["questions"]:
+        if (
+            "sponsor_read" in payload["questions"]
+            or "start_speech" in payload["questions"]
+            or any(key.startswith("boundary_") for key in payload["questions"])
+            or all(key.endswith(("_near", "_extended")) for key in payload["questions"])
+        ):
             assert "caller_context" not in payload["state"]
         else:
             assert payload["state"]["caller_context"] == caller_context
@@ -1423,6 +1519,39 @@ def test_unrelated_editorial_vetoes_ad_present_in_mixed_cut(jev_env, tmp_path):
         _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
 
 
+def test_sentence_interior_veto_isolates_show_island_inside_coarse_segment(
+    jev_env, tmp_path,
+):
+    prompt = build_review_prompt(
+        100.0, 130.0,
+        [(94.0, 100.0, "Discussion ends.")],
+        [(100.0, 130.0, "Acme sponsor offer. We are back. The interview resumes now. Acme sponsor sign-off.")],
+        [(130.0, 136.0, "Discussion continues.")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] Acme\n"
+        "End edge:\n[129.0s-130.0s] sign-off.\n"
+    )
+    normal = make_text_fake()
+    interior_targets = []
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        for name, question in payload["questions"].items():
+            if name.startswith("interior_"):
+                target = question["instructions"]["target_speech"]
+                interior_targets.append(target)
+                result["answers"][name] = {"noul": 0.9 if target.startswith("We are back") else 0.02}
+        return result
+
+    with pytest.raises(ReviewInconclusiveError) as raised:
+        _run(prompt, fake, tmp_path, refine_boundaries=True)
+
+    assert "We are back. The interview resumes now." in interior_targets
+    assert raised.value.fallback["reason"] == "programme_content_detected"
+    assert raised.value.fallback["score"] == 0.9
+
+
 def test_rank_state_uses_nearby_context_without_duplicate_word_arrays(jev_env, tmp_path):
     normal = make_text_fake()
 
@@ -1443,6 +1572,143 @@ def test_rank_state_uses_nearby_context_without_duplicate_word_arrays(jev_env, t
         return normal(payload, **kwargs)
 
     _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+
+
+def test_end_hierarchy_selects_an_utterance_before_an_exact_word():
+    segments = [
+        {"start": 100.0, "end": 104.0, "text": "Use code ACME."},
+        {"start": 104.0, "end": 106.0, "text": "Welcome back."},
+    ]
+    words = [
+        {"start": 100.0, "end": 101.0, "text": "Use"},
+        {"start": 101.0, "end": 102.0, "text": "code"},
+        {"start": 102.0, "end": 104.0, "text": "ACME."},
+        {"start": 104.0, "end": 105.0, "text": "Welcome"},
+        {"start": 105.0, "end": 106.0, "text": "back."},
+    ]
+    coarse, units = adapter._unit_end_question(
+        segments, words, [101.0, 102.0, 104.0, 105.0, 106.0], 104.0,
+    )
+
+    sponsor_unit = next(value for value in units.values() if not isinstance(value, float) and value[-1]["text"] == "ACME.")
+    fine, values = adapter._word_end_question(
+        words, [101.0, 102.0, 104.0, 105.0, 106.0], sponsor_unit,
+    )
+
+    assert list(coarse["criteria"])[0] == "unknown"
+    assert any("Use code ACME." in text for text in coarse["criteria"].values())
+    assert set(values.values()) == {101.0, 102.0, 104.0}
+    assert any("Cut through 'Use code ACME.' at 104.00s" in text for text in fine["criteria"].values())
+    assert any("first kept words: 'Welcome back.'" in text for text in fine["criteria"].values())
+
+
+def test_large_end_unit_groups_every_word_end_before_exact_selection():
+    words = [
+        {"start": float(index), "end": float(index + 1), "text": f"word{index}"}
+        for index in range(29)
+    ]
+    values = [float(index + 1) for index in range(29)]
+
+    question, groups = adapter._end_word_group_question(words, values)
+
+    flattened = [value for group in groups.values() for value in group]
+    assert flattened == values
+    assert all(1 <= len(group) <= 8 for group in groups.values())
+    assert len(groups) == 4
+    assert "Every eligible word end appears in one group" in question["instructions"]
+    assert any("following speech" in text for text in question["criteria"].values())
+
+
+def test_oversized_end_group_choice_keeps_supported_original(
+    jev_env, tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(adapter, "_END_WORD_GROUP_THRESHOLD", 0)
+
+    def oversized_groups(words, values):
+        return {
+            "type": "choice",
+            "instructions": "Choose a group.",
+            "criteria": {"unknown": "Unknown.", **{f"group_{index}": "Option." for index in range(255)}},
+        }, {f"group_{index}": [values[0]] for index in range(255)}
+
+    monkeypatch.setattr(adapter, "_end_word_group_question", oversized_groups)
+    normal = make_text_fake()
+    group_calls = 0
+
+    def fake(payload, **kwargs):
+        nonlocal group_calls
+        group_calls += int("boundary_end_group" in payload["questions"])
+        return normal(payload, **kwargs)
+
+    response = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+
+    assert group_calls == 0
+    assert (ad["start"], ad["end"]) == (100.0, 120.0)
+
+
+def test_end_tail_programme_veto_targets_only_the_last_four_words():
+    segments = [{"start": 100.0, "end": 110.0, "text": "Use code ACME then welcome back now"}]
+    words = [
+        {"start": float(index + 100), "end": float(index + 101), "text": text}
+        for index, text in enumerate("Use code ACME then welcome back now".split())
+    ]
+    edges = {"start": words, "end": words}
+
+    checks = _programme_checks(segments, edges, (100.0, 107.0), [])
+
+    assert checks["end_tail"]["instructions"]["target_speech"] == "then welcome back now"
+
+
+def test_outside_completeness_checks_near_and_far_speech_separately():
+    before = [
+        {"start": float(index), "end": float(index + 1), "text": f"before{index}"}
+        for index in range(16)
+    ]
+    after = [
+        {"start": float(index + 20), "end": float(index + 21), "text": f"after{index}"}
+        for index in range(16)
+    ]
+
+    questions = adapter._outside_sponsor_questions(
+        {"start": before, "end": after}, (16.0, 20.0), "inside sponsor speech",
+    )
+
+    assert set(questions) == {"start_near", "start_extended", "end_near", "end_extended"}
+    assert questions["start_near"]["instructions"]["target_speech"] == " ".join(f"before{index}" for index in range(8, 16))
+    assert questions["start_extended"]["instructions"]["target_speech"] == " ".join(f"before{index}" for index in range(16))
+    assert questions["end_near"]["instructions"]["target_speech"] == " ".join(f"after{index}" for index in range(8))
+    assert questions["end_extended"]["instructions"]["target_speech"] == " ".join(f"after{index}" for index in range(16))
+
+
+def test_incomplete_edge_reranks_once_with_side_specific_context(jev_env, tmp_path):
+    select = _select_pair_fake(106.0, 120.0)
+    start_rank_payloads = []
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        if "boundary_start" in payload["questions"]:
+            start_rank_payloads.append(payload)
+        if "start_near" in payload["questions"]:
+            inside = payload["questions"]["start_near"]["instructions"]["inside_candidate_speech"]
+            score = 0.9 if inside.startswith("Sponsor offer") else 0.02
+            for name in payload["questions"]:
+                result["answers"][name] = {"noul": score if name.startswith("start_") else 0.02}
+        return result
+
+    _run(
+        _meaningful_pair_prompt(), fake, tmp_path,
+        refine_boundaries=True, review_choice_enter=0.85,
+    )
+
+    assert len(start_rank_payloads) == 2
+    assert set(start_rank_payloads[0]["state"]) == {"start_context"}
+    assert set(start_rank_payloads[1]["state"]) == {
+        "start_context", "nearest_outside_speech", "farther_outside_context",
+    }
+    base = start_rank_payloads[0]["questions"]["boundary_start"]["instructions"]
+    rerank = start_rank_payloads[1]["questions"]["boundary_start"]["instructions"]
+    assert rerank.startswith(base)
 
 
 def test_rank_upstream_error_logs_only_safe_metadata(jev_env, tmp_path, caplog):
@@ -1606,7 +1872,7 @@ def test_refinement_rank_and_pair_use_warm_cache(jev_env, tmp_path):
     first = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
     second = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
 
-    assert calls == 7
+    assert calls == 8
     assert first["choices"][0]["message"]["content"] == second["choices"][0]["message"]["content"]
 
 
@@ -1621,7 +1887,7 @@ def test_refinement_stages_share_one_deadline(jev_env, tmp_path, monkeypatch):
     monkeypatch.setattr(jev, "call_payload", fake)
     _run(_meaningful_pair_prompt(), None, tmp_path, refine_boundaries=True)
 
-    assert len(deadlines) == 7
+    assert len(deadlines) == 8
     assert len(set(deadlines)) == 1
 
 
@@ -1993,19 +2259,7 @@ def test_neither_choice_logs_unsupported_original_fallback(
 
     def fake(payload, **kwargs):
         result = normal(payload, **kwargs)
-        if "boundary_start" in payload["questions"] or "boundary_end" in payload["questions"]:
-            for key, target in (("boundary_start", 94.0), ("boundary_end", 100.0)):
-                if key not in payload["questions"]:
-                    continue
-                criteria = payload["questions"][key]["criteria"]
-                option = (next(name for name, value in _START_OPTIONS.items() if value == target)
-                          if key == "boundary_start" else
-                          next(name for name, text in criteria.items() if f"{target:.2f}s" in text))
-                result["answers"][key]["choice"] = option
-                result["answers"][key]["probabilities"] = {
-                    name: 0.99 if name == option else 0.01 / (len(criteria) - 1)
-                    for name in criteria
-                }
+        _override_boundaries(result, payload, 94.0, 100.0)
         if "interval_comparison" in payload["questions"]:
             focused_requests.append("interval_comparison")
             _set_choice_answer(result, payload, "interval_comparison", "neither")
@@ -2037,19 +2291,7 @@ async def test_review_api_reports_proposal_and_coverage_fallback_diagnostics(
 
     def fake(payload, **kwargs):
         result = normal(payload, **kwargs)
-        if "boundary_start" in payload["questions"] or "boundary_end" in payload["questions"]:
-            for key, target in (("boundary_start", 94.0), ("boundary_end", 100.0)):
-                if key not in payload["questions"]:
-                    continue
-                criteria = payload["questions"][key]["criteria"]
-                option = (next(name for name, value in _START_OPTIONS.items() if value == target)
-                          if key == "boundary_start" else
-                          next(name for name, text in criteria.items() if f"{target:.2f}s" in text))
-                result["answers"][key]["choice"] = option
-                result["answers"][key]["probabilities"] = {
-                    name: 0.99 if name == option else 0.01 / (len(criteria) - 1)
-                    for name in criteria
-                }
+        _override_boundaries(result, payload, 94.0, 100.0)
         if "interval_comparison" in payload["questions"]:
             _set_choice_answer(result, payload, "interval_comparison", "neither")
         if "sponsor_read" in payload["questions"]:

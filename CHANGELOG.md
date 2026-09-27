@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.21 - 2026-09-26
+
+- Select the utterance that contains the final sponsor word before choosing its exact word boundary. Check nearby excluded speech for sponsor continuity. Check the final four words and interior sentence pairs for programme speech.
+- Prefer complete produced ad scenes and full URLs or sign-offs. Keep the original interval available as a safety fallback.
+- Apply the configured review evidence threshold during the review prefilter. Standalone detection thresholds remain unchanged.
+
 ## 0.1.20 - 2026-09-26
 
 - Exclude reviewer cut boundaries that split a supplied word. Keep supported word and silence boundaries eligible.
