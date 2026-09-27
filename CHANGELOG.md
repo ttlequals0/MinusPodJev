@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.24 - 2026-09-27
+
+- Use supplied word boundaries up to 60 seconds from each review edge. Fine word ranking gets 30 seconds of context centered on the selected coarse boundary.
+- Treat an explicit `neither` interval comparison as inconclusive instead of returning a separately validated interval.
+- Compare intervals only when both have complete transcript and boundary support. A sole supported range still must pass every absolute safety check.
+- Give programme-speech checks the complete candidate passage. This connects staged commercial scenes and sponsor-linked personal setups to their payoff without reclassifying an independent story.
+
 ## 0.1.23 - 2026-09-27
 
 - Allow a complete sponsor closing phrase at the end of the supplied review context to define the final word boundary. Continue to abstain when the context ends mid-URL or mid-phrase.

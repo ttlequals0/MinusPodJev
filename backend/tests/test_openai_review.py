@@ -202,24 +202,33 @@ def test_transcript_gap_abstains_without_upstream_request(jev_env, tmp_path):
     assert metrics.snapshot()["review"]["refinement"]["skipped"]["transcript_gap"] == 1
 
 
-def test_boundary_candidates_stay_within_search_window():
-    segments = [{"start": 90.0, "end": 170.0, "text": "context"}]
+def test_boundary_candidates_use_supplied_words_up_to_sixty_seconds():
+    segments = [{"start": 40.0, "end": 190.0, "text": "context"}]
     words = {
         "start": [
             {"start": value, "end": value + 0.1, "text": f"w{index}"}
-            for index, value in enumerate((100.0, 101.1, 109.9, 129.8, 130.1, 131.0, 161.0))
+            for index, value in enumerate((39.9, 40.0, 69.9, 100.0, 130.1, 159.9, 160.1))
         ],
         "end": [
             {"start": value - 0.1, "end": value, "text": f"w{index}"}
-            for index, value in enumerate((89.0, 90.0, 90.2, 110.1, 118.9, 120.0))
+            for index, value in enumerate((59.9, 60.0, 60.1, 90.0, 120.0, 150.1, 180.0, 180.1))
         ],
     }
 
     starts, ends = _boundary_candidates(segments, words, (100.0, 120.0))
 
-    assert 100.0 in starts and 130.1 not in starts and 161.0 not in starts
-    assert 120.0 in ends and 89.0 not in ends
+    assert 40.0 in starts and 159.9 in starts
+    assert 39.9 not in starts and 160.1 not in starts
+    assert 60.0 in ends and 180.0 in ends
+    assert 59.9 not in ends and 180.1 not in ends
     assert len(starts) == len(set(starts)) and len(ends) == len(set(ends))
+
+
+def test_comparison_question_compares_two_eligible_intervals():
+    question = adapter._comparison_question()["interval_comparison"]
+
+    assert set(question["criteria"]) == {"adjusted", "original", "neither"}
+    assert question["instructions"].startswith("Which eligible interval")
 
 
 def test_boundary_candidates_keep_all_observed_word_edges_within_window():
@@ -426,22 +435,20 @@ def test_word_clipped_original_can_adjust_to_aligned_end(jev_env, tmp_path):
 def test_unsupported_original_can_trim_to_word_supported_range(jev_env, tmp_path):
     prompt = _unsupported_original_prompt()
     normal = make_text_fake()
-    comparisons = []
+    stages = []
 
     def fake(payload, **kwargs):
         result = normal(payload, **kwargs)
         _override_boundaries(result, payload, 94.0, 100.0)
-        if "interval_comparison" in payload["questions"]:
-            comparisons.append(payload)
+        stages.extend(payload["questions"])
         return result
 
     response = _run(prompt, fake, tmp_path, refine_boundaries=True)
 
     ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
     assert (ad["start"], ad["end"]) == (94.0, 100.0)
-    assert len(comparisons) == 1
-    assert comparisons[0]["state"]["proposed_speech"] == "This episode is sponsored by BetterHelp"
-    assert set(comparisons[0]["questions"]["interval_comparison"]["criteria"]) == {"adjusted", "neither"}
+    assert "interval_comparison" not in stages
+    assert "sponsor_read" in stages
     refinement = metrics.snapshot()["review"]["refinement"]
     assert refinement["attempted"] == 1
     assert refinement["changed"] == 1
@@ -490,11 +497,7 @@ def test_zero_duration_word_supports_selected_endpoint_outside_coarse_context(
     assert raised.value.proposal["reason"] == "insufficient_boundary_text"
     assert raised.value.proposal["stage"] == "boundary_coverage"
 
-    assert len(focused_payloads) == 1
-    focused = focused_payloads[0]
-    assert set(focused["questions"]) == {"interval_comparison"}
-    assert focused["state"]["proposed_speech"] == "This episode is sponsored by BetterHelp"
-    assert "transcript" not in focused["state"]
+    assert focused_payloads == []
     coarse = [{"start": 80.0, "end": 89.9}, {"start": 94.0, "end": 100.0}]
     words = {
         "start": [{"start": 93.9, "end": 94.1}],
@@ -629,7 +632,8 @@ def make_text_fake(*, keywords=_AD_KW, input_tokens=1200, output_tokens=6, raise
             ).lower()
         answers: dict[str, Any] = {}
         for key in payload["questions"]:
-            if key.endswith("_speech") or key.startswith(("added_", "interior_")) or key == "whole_speech":
+            instructions = payload["questions"][key].get("instructions")
+            if isinstance(instructions, dict) and "target_speech" in instructions:
                 answers[key] = {"noul": 0.02}
                 continue
             if key in {"unrelated_editorial", "before_continuation", "after_continuation"}:
@@ -1459,6 +1463,69 @@ def test_opt_in_refinement_applies_selected_meaningful_pair(jev_env, tmp_path, s
     assert (start, end) == expected
 
 
+def test_refinement_centers_fine_context_on_distant_selected_end(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        100.0, 180.5,
+        [(90.0, 100.0, "Discussion ends.")],
+        [(100.0, 144.0, "Acme sponsor offer and sign-off."),
+         (144.0, 150.0, "Back to the discussion."),
+         (150.0, 181.0, "The discussion continues.")],
+        [(181.0, 190.0, "More discussion follows.")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] Acme\n"
+        "End edge:\n[143.0s-144.0s] sign-off.\n"
+        "[144.0s-145.0s] Back\n[179.0s-180.0s] discussion.\n"
+    )
+    select = _select_pair_fake(100.0, 144.0)
+    fine_contexts = []
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        if "boundary_end_word" in payload["questions"]:
+            fine_contexts.append(payload["state"]["end_context"])
+        if "interval_comparison" in payload["questions"]:
+            _set_choice_answer(result, payload, "interval_comparison", "adjusted")
+        return result
+
+    response = _run(prompt, fake, tmp_path, refine_boundaries=True)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+
+    assert len(fine_contexts) == 1
+    assert "Acme sponsor offer and sign-off" in fine_contexts[0]
+    assert "Back to the discussion" in fine_contexts[0]
+    assert "More discussion follows" not in fine_contexts[0]
+    assert (ad["start"], ad["end"]) == (100.0, 144.0)
+
+
+def test_supported_expansion_does_not_require_partial_added_delta(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        100.0, 119.5,
+        [(94.0, 100.0, "Discussion ends.")],
+        [(100.0, 118.0, "This episode is sponsored by Acme."),
+         (118.0, 120.0, "Final sponsor sign-off.")],
+        [(120.0, 126.0, "The interview resumes.")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] This\n"
+        "End edge:\n[119.0s-120.0s] sign-off.\n"
+    )
+    select = _select_pair_fake(100.0, 120.0)
+    comparison_requests = []
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        if "interval_comparison" in payload["questions"]:
+            comparison_requests.append(payload)
+        return result
+
+    response = _run(prompt, fake, tmp_path, refine_boundaries=True)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+
+    assert (ad["start"], ad["end"]) == (100.0, 120.0)
+    assert comparison_requests == []
+
+
 def test_weak_edge_choice_can_reach_pair_comparison(jev_env, tmp_path):
     base = _select_pair_fake(106.0, 120.0)
 
@@ -1511,7 +1578,7 @@ def test_weak_choice_cannot_confirm_original_with_same_ad_after_end(jev_env, tmp
             result["answers"]["sponsor_read"] = {"noul": 0.4}
         return result
 
-    with pytest.raises(ReviewInconclusiveError, match="a safe advertising interval"):
+    with pytest.raises(ReviewInconclusiveError, match="could not confirm a safe advertising interval"):
         _run(prompt, fake, tmp_path, refine_boundaries=True)
 
 
@@ -1554,7 +1621,7 @@ def test_unrelated_editorial_vetoes_ad_present_in_mixed_cut(jev_env, tmp_path):
             result["answers"]["sponsor_read"] = {"noul": 0.2}
         return result
 
-    with pytest.raises(ReviewInconclusiveError, match="a safe advertising interval"):
+    with pytest.raises(ReviewInconclusiveError, match="could not confirm a safe advertising interval"):
         _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
 
 
@@ -1588,7 +1655,46 @@ def test_sentence_interior_veto_isolates_show_island_inside_coarse_segment(
 
     assert "We are back. The interview resumes now." in interior_targets
     assert raised.value.fallback["reason"] == "programme_content_detected"
-    assert raised.value.fallback["score"] == 0.9
+
+
+def test_separate_sponsor_does_not_reclassify_independent_personal_story(
+    jev_env, tmp_path,
+):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(94.0, 100.0, "Discussion continues.")],
+        [(100.0, 110.0, "After my father died, I spent a year rebuilding our family home."),
+         (110.0, 120.0, "This episode is sponsored by Acme. Visit acme.com.")],
+        [(120.0, 126.0, "The interview resumes.")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] After\n"
+        "End edge:\n[119.0s-120.0s] acme.com.\n"
+    )
+    normal = make_text_fake()
+    programme_states = []
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if "start_speech" in payload["questions"]:
+            programme_states.append(payload["state"])
+            for name, question in payload["questions"].items():
+                target = question["instructions"]["target_speech"]
+                result["answers"][name] = {
+                    "noul": 0.95 if "father died" in target else 0.02
+                }
+        return result
+
+    with pytest.raises(ReviewInconclusiveError) as raised:
+        _run(prompt, fake, tmp_path, refine_boundaries=True)
+
+    assert raised.value.reason == "original_range_not_confirmed"
+    assert raised.value.fallback["reason"] == "programme_content_detected"
+    assert len(programme_states) == 1
+    assert "father died" in programme_states[0]["candidate_interval_speech"]
+    assert "sponsored by Acme" in programme_states[0]["candidate_interval_speech"]
+    assert "not mere proximity" in programme_states[0]["evaluation_rule"]
+    assert raised.value.fallback["score"] == 0.95
 
 
 def test_rank_state_uses_nearby_context_without_duplicate_word_arrays(jev_env, tmp_path):
@@ -1754,6 +1860,8 @@ def test_end_tail_programme_veto_targets_only_the_last_four_words():
 
     assert checks["end_tail"]["instructions"]["target_speech"] == "then welcome back now"
     assert checks["end_boundary_speech"]["instructions"]["target_speech"] == "now"
+    assert "target function, not mere proximity" in adapter._PROGRAMME_CONTEXT_RULE
+    assert "character scene, or role-play" in adapter._PROGRAMME_CONTEXT_RULE
     assert "opening word" in checks["end_boundary_speech"]["instructions"]["question"]
 
 
@@ -1881,7 +1989,7 @@ def test_ad_only_cut_can_omit_ad_intro_when_original_is_unsafe(jev_env, tmp_path
         result = select(payload, **kwargs)
         if "interval_comparison" in payload["questions"]:
             assert "sponsor message begins" in payload["state"]["excluded_start_speech"]
-            _set_choice_answer(result, payload, "interval_comparison", "neither", 0.9)
+            _set_choice_answer(result, payload, "interval_comparison", "adjusted", 0.9)
         if "sponsor_read" in payload["questions"]:
             result["answers"]["sponsor_read"] = {
                 "noul": 0.4 if "This sponsor message begins" in payload["state"]["speech"] else 0.96
@@ -1969,7 +2077,7 @@ def test_refinement_rank_and_pair_use_warm_cache(jev_env, tmp_path):
     first = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
     second = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
 
-    assert calls == 8
+    assert calls == 7
     assert first["choices"][0]["message"]["content"] == second["choices"][0]["message"]["content"]
 
 
@@ -1984,7 +2092,7 @@ def test_refinement_stages_share_one_deadline(jev_env, tmp_path, monkeypatch):
     monkeypatch.setattr(jev, "call_payload", fake)
     _run(_meaningful_pair_prompt(), None, tmp_path, refine_boundaries=True)
 
-    assert len(deadlines) == 8
+    assert len(deadlines) == 7
     assert len(set(deadlines)) == 1
 
 
@@ -2145,7 +2253,7 @@ def test_unknown_rank_cannot_confirm_without_original_comparison(jev_env, tmp_pa
             result["answers"]["sponsor_read"] = {"noul": 0.4}
         return result
 
-    with pytest.raises(ReviewInconclusiveError, match="a safe advertising interval"):
+    with pytest.raises(ReviewInconclusiveError, match="could not confirm a safe advertising interval"):
         _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
 
 
@@ -2168,7 +2276,9 @@ def test_comparison_can_keep_complete_original(jev_env, tmp_path):
 @pytest.mark.parametrize(
     "proposed_safety, original_safety, preference, preference_score, expected",
     [
-        (0.96, 0.96, "neither", 0.54, (100.0, 120.0)),
+        (0.96, 0.96, "neither", 0.54, None),
+        (0.96, 0.3, "neither", 0.9, None),
+        (0.3, 0.96, "neither", 0.9, None),
         (0.96, 0.3, "original", 0.9, (106.0, 120.0)),
         (0.3, 0.96, "adjusted", 0.9, (100.0, 120.0)),
         (0.96, 0.96, "adjusted", 0.54, (106.0, 120.0)),
@@ -2192,14 +2302,19 @@ def test_interval_safety_is_independent_of_relative_preference(
     if expected is None:
         with pytest.raises(ReviewInconclusiveError) as raised:
             _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True, review_choice_enter=0.85)
-        assert raised.value.reason == "ad_content_unconfirmed"
-        assert raised.value.threshold == 0.85
-        assert raised.value.proposal["reason"] == "proposed_range_not_confirmed"
-        assert raised.value.proposal["score"] == proposed_safety
-        assert raised.value.proposal["threshold"] == 0.85
-        assert raised.value.fallback["reason"] == "original_range_not_confirmed"
-        assert raised.value.fallback["score"] == original_safety
-        assert raised.value.fallback["threshold"] == 0.85
+        if preference == "neither":
+            assert raised.value.reason == "neither_complete"
+            assert raised.value.stage == "interval_comparison"
+            assert raised.value.score == preference_score
+        else:
+            assert raised.value.reason == "ad_content_unconfirmed"
+            assert raised.value.threshold == 0.85
+            assert raised.value.proposal["reason"] == "proposed_range_not_confirmed"
+            assert raised.value.proposal["score"] == proposed_safety
+            assert raised.value.proposal["threshold"] == 0.85
+            assert raised.value.fallback["reason"] == "original_range_not_confirmed"
+            assert raised.value.fallback["score"] == original_safety
+            assert raised.value.fallback["threshold"] == 0.85
     else:
         response = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True, review_choice_enter=0.85)
         ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
@@ -2225,7 +2340,9 @@ def test_promotion_requires_local_programme_clearance(
             result["answers"]["sponsor_read"] = {"noul": 0.98}
         if "start_speech" in questions:
             stages.append("programme")
-            assert payload["state"] == {}
+            assert set(payload["state"]) == {"guidance", "candidate_interval_speech", "evaluation_rule"}
+            assert "Sponsor offer ends" in payload["state"]["candidate_interval_speech"]
+            assert "Judge only target_speech" in payload["state"]["evaluation_rule"]
             target = questions["start_speech"]["instructions"]["target_speech"]
             result["answers"]["start_speech"] = {
                 "noul": 0.9 if "Editorial" in target else proposed_programme_score
@@ -2287,7 +2404,7 @@ def test_inconclusive_cache_hit_matches_deciding_question(
     assert raised.value.fallback["cache_hit"] is expected_cache_hit
 
 
-def test_comparison_neither_reports_both_alternatives(jev_env, tmp_path):
+def test_comparison_neither_rejects_safe_alternatives(jev_env, tmp_path):
     select = _select_pair_fake(106.0, 120.0)
     states = {}
 
@@ -2302,15 +2419,14 @@ def test_comparison_neither_reports_both_alternatives(jev_env, tmp_path):
             result["answers"]["sponsor_read"] = {"noul": 0.4}
         return result
 
-    with pytest.raises(ReviewInconclusiveError, match="a safe advertising interval") as raised:
+    with pytest.raises(ReviewInconclusiveError, match="rejected every eligible advertising interval") as raised:
         _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
 
-    assert raised.value.reason == "ad_content_unconfirmed"
-    assert raised.value.score == pytest.approx(0.4)
-    assert raised.value.proposal["range_start"] == 106.0
-    assert raised.value.proposal["score"] == pytest.approx(0.4)
-    assert raised.value.fallback["range_start"] == 100.0
-    assert raised.value.fallback["score"] == pytest.approx(0.4)
+    assert raised.value.reason == "neither_complete"
+    assert raised.value.stage == "interval_comparison"
+    assert raised.value.score == pytest.approx(0.99)
+    assert raised.value.proposal is None
+    assert raised.value.fallback is None
     assert states["evidence"]["candidate"] == {"start": 100.0, "end": 120.0}
     assert set(states["boundary_start"]) == {"start_context"}
     assert "assessment_range" not in states["evidence"]
@@ -2328,14 +2444,15 @@ def test_unsupported_original_start_uses_supported_word_start(jev_env, tmp_path)
 
     def fake(payload, **kwargs):
         result = normal(payload, **kwargs)
-        comparison_requests.extend(key for key in payload["questions"] if key == "interval_comparison")
+        if "interval_comparison" in payload["questions"]:
+            comparison_requests.append(payload)
         return result
 
     result = _run(prompt, fake, tmp_path, refine_boundaries=True)
 
     ad = json.loads(result["choices"][0]["message"]["content"])["ads"][0]
     assert (ad["start"], ad["end"]) == (94.0, 110.0)
-    assert comparison_requests == ["interval_comparison"]
+    assert comparison_requests == []
     assert _range_boundary_support(
         [{"start": 80.0, "end": 89.9}, {"start": 94.0, "end": 120.0}],
         {"start": [{"start": 94.0, "end": 94.5}], "end": []},
@@ -2345,20 +2462,20 @@ def test_unsupported_original_start_uses_supported_word_start(jev_env, tmp_path)
     assert refinement["attempted"] == 1 and refinement["changed"] == 1
 
 
-def test_neither_choice_logs_unsupported_original_fallback(
+def test_single_supported_proposal_still_requires_absolute_validation(
     jev_env, tmp_path, caplog
 ):
     import logging
 
     prompt = _unsupported_original_prompt()
     normal = make_text_fake()
-    focused_requests = []
+    comparison_requests = []
 
     def fake(payload, **kwargs):
         result = normal(payload, **kwargs)
         _override_boundaries(result, payload, 94.0, 100.0)
         if "interval_comparison" in payload["questions"]:
-            focused_requests.append("interval_comparison")
+            comparison_requests.append("interval_comparison")
             _set_choice_answer(result, payload, "interval_comparison", "neither")
         if "sponsor_read" in payload["questions"]:
             result["answers"]["sponsor_read"] = {"noul": 0.4}
@@ -2370,10 +2487,10 @@ def test_neither_choice_logs_unsupported_original_fallback(
 
     assert raised.value.reason == "ad_content_unconfirmed"
     assert raised.value.stage == "focused_validation"
-    assert raised.value.fallback["reason"] == "missing_boundary_coverage"
-    assert focused_requests == ["interval_comparison"]
+    assert raised.value.proposal["reason"] == "proposed_range_not_confirmed"
+    assert comparison_requests == []
     messages = [record.getMessage() for record in caplog.records]
-    assert any("stage=interval_comparison choice=neither" in message and "original_supported=False" in message for message in messages)
+    assert any("stage=interval_comparison skipped=single_eligible" in message for message in messages)
     refinement = metrics.snapshot()["review"]["refinement"]
     assert refinement["attempted"] == 1
     assert refinement["inconclusive"] == 1
@@ -2390,7 +2507,7 @@ async def test_review_api_reports_proposal_and_coverage_fallback_diagnostics(
         result = normal(payload, **kwargs)
         _override_boundaries(result, payload, 94.0, 100.0)
         if "interval_comparison" in payload["questions"]:
-            _set_choice_answer(result, payload, "interval_comparison", "neither")
+            _set_choice_answer(result, payload, "interval_comparison", "adjusted")
         if "sponsor_read" in payload["questions"]:
             result["answers"]["sponsor_read"] = {"noul": 0.4}
         return result
@@ -2443,7 +2560,7 @@ async def test_review_api_keeps_range_reason_and_counts_decisive_programme_veto(
     def fake(payload, **kwargs):
         result = select(payload, **kwargs)
         if "interval_comparison" in payload["questions"]:
-            _set_choice_answer(result, payload, "interval_comparison", "neither")
+            _set_choice_answer(result, payload, "interval_comparison", "adjusted")
         if "sponsor_read" in payload["questions"]:
             result["answers"]["sponsor_read"] = {"noul": 0.98}
         for name in payload["questions"]:
@@ -2497,7 +2614,7 @@ async def test_review_api_reports_pair_comparison_abstention(
     jev_env, client, monkeypatch, choice, probability
 ):
     monkeypatch.setattr(settings, "JEV_REVIEW_REFINE_BOUNDARIES", True)
-    normal = make_text_fake()
+    normal = _select_pair_fake(106.0, 120.0)
 
     def fake(payload, **kwargs):
         result = normal(payload, **kwargs)
@@ -2515,9 +2632,12 @@ async def test_review_api_reports_pair_comparison_abstention(
     )
 
     assert response.status_code == 422
-    assert response.json()["error"]["reason"] == "ad_content_unconfirmed"
-    assert response.json()["error"]["stage"] == "focused_validation"
-    assert metrics.snapshot()["review"]["reasons"]["ad_content_unconfirmed"] == 1
+    error = response.json()["error"]
+    expected_reason = "neither_complete" if choice == "neither" else "ad_content_unconfirmed"
+    expected_stage = "interval_comparison" if choice == "neither" else "focused_validation"
+    assert error["reason"] == expected_reason
+    assert error["stage"] == expected_stage
+    assert metrics.snapshot()["review"]["reasons"][expected_reason] == 1
 
 
 async def test_focused_validation_upstream_failure_preserves_503(
@@ -2526,7 +2646,7 @@ async def test_focused_validation_upstream_failure_preserves_503(
     import app.services.jev as jev
 
     monkeypatch.setattr(settings, "JEV_REVIEW_REFINE_BOUNDARIES", True)
-    normal = make_text_fake()
+    normal = _select_pair_fake(106.0, 120.0)
     stages = []
 
     def fake(payload, **kwargs):
@@ -2536,16 +2656,9 @@ async def test_focused_validation_upstream_failure_preserves_503(
         return normal(payload, **kwargs)
 
     monkeypatch.setattr(jev, "call_payload", fake)
-    prompt = build_review_prompt(
-        100.0,
-        120.0,
-        [(94.0, 100.0, "context before")],
-        [(100.0, 120.0, "This episode is sponsored by BetterHelp")],
-        [(120.0, 126.0, "context after")],
-    )
     response = await client.post(
         "/v1/chat/completions",
-        json={"messages": [{"role": "user", "content": _with_word_edges(prompt)}]},
+        json={"messages": [{"role": "user", "content": _meaningful_pair_prompt()}]},
         headers={"Authorization": "Bearer test-key"},
     )
 
@@ -2562,7 +2675,7 @@ async def test_malformed_choice_returns_503_with_safe_validation_diagnostic(
     import app.services.jev as jev
 
     monkeypatch.setattr(settings, "JEV_REVIEW_REFINE_BOUNDARIES", True)
-    normal = make_text_fake()
+    normal = _select_pair_fake(106.0, 120.0)
 
     def malformed(payload, **kwargs):
         result = normal(payload, **kwargs)
@@ -2573,17 +2686,10 @@ async def test_malformed_choice_returns_503_with_safe_validation_diagnostic(
         return result
 
     monkeypatch.setattr(jev, "call_payload", malformed)
-    prompt = build_review_prompt(
-        100.0,
-        120.0,
-        [(94.0, 100.0, "context before")],
-        [(100.0, 120.0, "This episode is sponsored by BetterHelp")],
-        [(120.0, 126.0, "context after")],
-    )
     with caplog.at_level(logging.WARNING, logger="app.services.openai_adapter"):
         response = await client.post(
             "/v1/chat/completions",
-            json={"messages": [{"role": "user", "content": _with_word_edges(prompt)}]},
+            json={"messages": [{"role": "user", "content": _meaningful_pair_prompt()}]},
             headers={"Authorization": "Bearer test-key"},
         )
 
@@ -2605,7 +2711,7 @@ async def test_foreign_validation_error_uses_generic_safe_diagnostic(
     import app.services.jev as jev
 
     monkeypatch.setattr(settings, "JEV_REVIEW_REFINE_BOUNDARIES", True)
-    normal = make_text_fake()
+    normal = _select_pair_fake(106.0, 120.0)
 
     def invalid(payload, **kwargs):
         if "interval_comparison" in payload["questions"]:
@@ -2613,17 +2719,10 @@ async def test_foreign_validation_error_uses_generic_safe_diagnostic(
         return normal(payload, **kwargs)
 
     monkeypatch.setattr(jev, "call_payload", invalid)
-    prompt = build_review_prompt(
-        100.0,
-        120.0,
-        [(94.0, 100.0, "context before")],
-        [(100.0, 120.0, "This episode is sponsored by BetterHelp")],
-        [(120.0, 126.0, "context after")],
-    )
     with caplog.at_level(logging.WARNING, logger="app.services.openai_adapter"):
         response = await client.post(
             "/v1/chat/completions",
-            json={"messages": [{"role": "user", "content": _with_word_edges(prompt)}]},
+            json={"messages": [{"role": "user", "content": _meaningful_pair_prompt()}]},
             headers={"Authorization": "Bearer test-key"},
         )
 

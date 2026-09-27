@@ -345,14 +345,13 @@ def test_pair_choice_keeps_all_supplied_words_in_shared_state():
 
 
 def test_comparison_question_requires_complete_cut_and_neither_option():
-    questions = _comparison_question(True, True)
+    questions = _comparison_question()
     question = questions["interval_comparison"]
 
     assert question["type"] == "choice"
     assert set(question["criteria"]) == {"adjusted", "original", "neither"}
     assert "complete advertising or promotional read" in question["instructions"]
     assert set(questions) == {"interval_comparison"}
-    assert set(_comparison_question(False, True)["interval_comparison"]["criteria"]) == {"original", "neither"}
 
 
 def _corpus_prompt(

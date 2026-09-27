@@ -225,7 +225,10 @@ _INCONCLUSIVE_REASONS = frozenset(
     }
 )
 _INCONCLUSIVE_STAGES = frozenset(
-    {"context", "evidence", "choice_rank", "focused_validation", "boundary_coverage"}
+    {
+        "context", "evidence", "choice_rank", "focused_validation",
+        "interval_comparison", "boundary_coverage",
+    }
 )
 _METRIC_REASONS = frozenset(
     {

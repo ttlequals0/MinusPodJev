@@ -160,7 +160,10 @@ class ReviewInconclusiveError(ReviewUnavailableError):
         }
     )
     _STAGES = frozenset(
-        {"context", "evidence", "choice_rank", "focused_validation", "boundary_coverage"}
+        {
+            "context", "evidence", "choice_rank", "focused_validation",
+            "interval_comparison", "boundary_coverage",
+        }
     )
 
     def __init__(
@@ -791,8 +794,8 @@ def _choice_state(
 ) -> dict[str, Any]:
     def nearby(value: float) -> str:
         nearby_rows = [segment for segment in segments
-                       if float(segment["end"]) >= value - _BOUNDARY_SEARCH_SECONDS
-                       and float(segment["start"]) <= value + _BOUNDARY_SEARCH_SECONDS]
+                       if float(segment["end"]) >= value - _BOUNDARY_CONTEXT_SECONDS
+                       and float(segment["start"]) <= value + _BOUNDARY_CONTEXT_SECONDS]
         before = [segment for segment in nearby_rows if float(segment["end"]) <= value][-16:]
         crossing = [segment for segment in nearby_rows
                     if float(segment["start"]) < value < float(segment["end"])]
@@ -828,7 +831,8 @@ def _edge_reference(words: Sequence[dict[str, Any]], value: float, direction: st
     return f"{value:.2f}s: before {before!r}; after {after!r}"
 
 
-_BOUNDARY_SEARCH_SECONDS = 30.0
+_BOUNDARY_CANDIDATE_CAP_SECONDS = 60.0
+_BOUNDARY_CONTEXT_SECONDS = 30.0
 _BOUNDARY_CHOICE_LIMIT = 254
 _END_WORD_GROUP_SIZE = 8
 _END_WORD_GROUP_THRESHOLD = 24
@@ -842,9 +846,9 @@ def _boundary_candidates(
     """Return every observed word edge near the current cut."""
     context_start, context_end = _review_context_envelope(segments, word_edges)
     starts = [float(word["start"]) for word in word_edges["start"]
-              if abs(float(word["start"]) - cand[0]) <= _BOUNDARY_SEARCH_SECONDS]
+              if abs(float(word["start"]) - cand[0]) <= _BOUNDARY_CANDIDATE_CAP_SECONDS]
     ends = [float(word["end"]) for word in word_edges["end"]
-            if abs(float(word["end"]) - cand[1]) <= _BOUNDARY_SEARCH_SECONDS]
+            if abs(float(word["end"]) - cand[1]) <= _BOUNDARY_CANDIDATE_CAP_SECONDS]
     start_supported, end_supported = _range_boundary_support(segments, word_edges, cand)
     if start_supported:
         starts.append(cand[0])
@@ -1038,18 +1042,16 @@ def _end_word_group_question(
     }, mapping
 
 
-def _comparison_question(has_adjustment: bool, original_supported: bool) -> dict[str, dict[str, Any]]:
-    criteria = {}
-    if has_adjustment:
-        criteria["adjusted"] = "The proposed interval is better than the original at capturing the advertising or promotional content in this break."
-    if original_supported:
-        criteria["original"] = "The original interval captures the advertising or promotional content in this break at least as well as the proposed interval."
-    criteria["neither"] = "Neither interval is preferable, or the transcript does not settle the comparison."
+def _comparison_question() -> dict[str, dict[str, Any]]:
     questions = {
         "interval_comparison": {
             "type": "choice",
             "instructions": "Which eligible interval cuts the complete advertising or promotional read while preserving independent show speech? Include a staged ad scene, personal problem setup, offer, URL, and sign-off when they belong to the same read. Inspect speech added or excluded by the adjustment. Leaving same-read speech audible makes an interval worse; prefer the original only when ad coverage and show preservation are equally good. Choose neither when the evidence is unclear.",
-            "criteria": criteria,
+            "criteria": {
+                "adjusted": "The proposed interval is better than the original at capturing the advertising or promotional content in this break.",
+                "original": "The original interval captures the advertising or promotional content in this break at least as well as the proposed interval.",
+                "neither": "Neither interval is preferable, or the transcript does not settle the comparison.",
+            },
         }
     }
     return questions
@@ -1063,6 +1065,9 @@ _CONTINUITY_CRITERIA = {
     "true": "The target has moved away from a commercial message into independent episode conversation, reporting, interview, news, or a spoken return to the show. It introduces substantive programme content rather than setting up a sponsor product, problem, claim, or offer. Judge only the target using the words before and after to locate the change in function.",
     "false": "The target continues the commercial message. Product explanation, a demonstration, sponsor-related commentary, an offer, URL, or thanks remains promotional while that sponsor presentation continues. Generic rhetoric, a curiosity hook, or a fact teaser also remains promotional when surrounding speech connects it to the sponsor's product, problem, claim, or offer.",
 }
+_PROGRAMME_CONTEXT_RULE = (
+    "Judge only target_speech. Use candidate_interval_speech to identify the target function, not mere proximity. A host anecdote, origin story, personal experience, character scene, or role-play remains promotional when it functions as the setup or argument for a sponsor-specific problem, claim, product, offer, or call to action later in the same produced commercial. A separate sponsor elsewhere in candidate_interval_speech does not make an independent anecdote or programme segment promotional."
+)
 
 
 def _focused_guidance(guidance: str) -> str:
@@ -1723,6 +1728,21 @@ def run_review(
         )
         try:
             rank_state = _choice_state(coarse_segments, cand, review_guidance, caller_context)
+
+            def fine_choice_state(
+                side: str,
+                selected: float,
+                base: dict[str, Any],
+            ) -> dict[str, Any]:
+                centered = (
+                    (selected, cand_end) if side == "start" else (cand_start, selected)
+                )
+                state = dict(base)
+                state[f"{side}_context"] = _choice_state(
+                    coarse_segments, centered, review_guidance, caller_context,
+                )[f"{side}_context"]
+                return state
+
             start_ranked = review_questions(
                 {"boundary_start": start_question},
                 "choice_rank_start",
@@ -1742,6 +1762,9 @@ def run_review(
                 unit: Sequence[dict[str, Any]],
                 question_state: dict[str, Any],
             ) -> float | None:
+                question_state = fine_choice_state(
+                    "end", float(unit[-1]["end"]), question_state,
+                )
                 fine_question, fine_values = _word_end_question(
                     word_edges["end"], ends, unit,
                 )
@@ -1797,15 +1820,19 @@ def run_review(
                     )
             fine_start = None
             if start_answer["choice"] != "unknown":
+                selected_start = start_values[start_answer["choice"]]
                 fine_question, fine_values = _word_start_question(
                     coarse_segments, word_edges["start"], starts,
-                    start_values[start_answer["choice"]],
+                    selected_start,
                 )
                 if fine_question is not None and len(fine_values) <= _BOUNDARY_CHOICE_LIMIT:
                     fine_ranked = review_questions(
                         {"boundary_start_word": fine_question},
                         "choice_rank_start_word",
-                        question_state_override={"start_context": rank_state["start_context"]},
+                        question_state_override=fine_choice_state(
+                            "start", selected_start,
+                            {"start_context": rank_state["start_context"]},
+                        ),
                     )
                     fine_choice = fine_ranked["answers"]["boundary_start_word"]["choice"]
                     fine_start = fine_values.get(fine_choice)
@@ -1920,7 +1947,9 @@ def run_review(
                             fine_ranked = review_questions(
                                 {"boundary_start_word": fine_question},
                                 "choice_rank_start_word",
-                                question_state_override=rerank_state,
+                                question_state_override=fine_choice_state(
+                                    "start", start_value, rerank_state,
+                                ),
                             )
                             fine_choice = fine_ranked["answers"]["boundary_start_word"]["choice"]
                             start_value = fine_values.get(fine_choice, start_value)
@@ -1955,7 +1984,6 @@ def run_review(
                     if bounds[1] <= bounds[0]:
                         continue
                     edge_text = _assessment_speech(segments, word_edges, bounds)
-                    proposed_text_supported &= edge_text is not None
                     if edge_text:
                         edge_speech[field] = edge_text
             proposed_supported = (
@@ -1973,43 +2001,50 @@ def run_review(
                     range_start=proposed[0], range_end=proposed[1],
                     start_supported=start_supported, end_supported=end_supported,
                 )
-            context = _choice_state(coarse_segments, cand, review_guidance, caller_context)
-            comparison_state: dict[str, Any] = {
-                "guidance": review_guidance,
-                "original_interval": {"start": cand_start, "end": cand_end},
-                "original_speech": original_speech or "",
-                "original_eligible": original_supported,
-                "proposed_interval": {"start": proposed[0], "end": proposed[1]},
-                "proposed_speech": proposed_speech or "",
-                "proposed_eligible": proposed_supported,
-                "start_context": context["start_context"],
-                "end_context": context["end_context"],
-                **edge_speech,
-            }
-            if caller_context:
-                comparison_state["caller_context"] = caller_context
-            for label, bounds in (("original", cand), ("proposed", proposed)):
-                if label == "proposed" and proposed == cand:
-                    continue
-                for edge, direction, value in (
-                    ("start", "before", bounds[0]), ("end", "after", bounds[1]),
-                ):
-                    neighbor, farther = _neighbor_speech(word_edges[edge], value, direction)
-                    if neighbor:
-                        comparison_state[f"{label}_{direction}_speech"] = neighbor
-                        comparison_state[f"{label}_{direction}_context"] = farther
-            compared = review_questions(
-                _comparison_question(proposed_supported, original_supported),
-                "focused_validation",
-                question_state_override=comparison_state,
-            )
-            answer = compared["answers"]["interval_comparison"]
-            selected_choice = answer["choice"]
-            selected_probability = float(answer["probabilities"][selected_choice])
-            runner_up = max(
-                (float(value) for key, value in answer["probabilities"].items() if key != selected_choice),
-                default=0.0,
-            )
+            answer: dict[str, Any] | None = None
+            compared_cache_hit: bool | None = None
+            selected_choice: str | None = None
+            selected_probability: float | None = None
+            runner_up: float | None = None
+            if proposed_supported and original_supported:
+                context = _choice_state(
+                    coarse_segments, cand, review_guidance, caller_context,
+                )
+                comparison_state: dict[str, Any] = {
+                    "guidance": review_guidance,
+                    "proposed_interval": {"start": proposed[0], "end": proposed[1]},
+                    "proposed_speech": proposed_speech or "",
+                    "proposed_eligible": True,
+                    "original_interval": {"start": cand_start, "end": cand_end},
+                    "original_speech": original_speech or "",
+                    "original_eligible": True,
+                    "start_context": context["start_context"],
+                    "end_context": context["end_context"],
+                    **edge_speech,
+                }
+                if caller_context:
+                    comparison_state["caller_context"] = caller_context
+                for label, bounds in (("original", cand), ("proposed", proposed)):
+                    for edge, direction, value in (
+                        ("start", "before", bounds[0]), ("end", "after", bounds[1]),
+                    ):
+                        neighbor, farther = _neighbor_speech(word_edges[edge], value, direction)
+                        if neighbor:
+                            comparison_state[f"{label}_{direction}_speech"] = neighbor
+                            comparison_state[f"{label}_{direction}_context"] = farther
+                compared = review_questions(
+                    _comparison_question(),
+                    "focused_validation",
+                    question_state_override=comparison_state,
+                )
+                answer = compared["answers"]["interval_comparison"]
+                selected_choice = answer["choice"]
+                selected_probability = float(answer["probabilities"][selected_choice])
+                runner_up = max(
+                    (float(value) for key, value in answer["probabilities"].items() if key != selected_choice),
+                    default=0.0,
+                )
+                compared_cache_hit = bool(compared["cache_hit"])
             promotion: dict[str, float | None] = {"proposed": None, "original": None}
             intrusion: dict[str, float | None] = {"proposed": None, "original": None}
             safe: dict[str, bool] = {"proposed": False, "original": False}
@@ -2073,7 +2108,11 @@ def run_review(
                     checked = review_questions(
                         dict(items[offset:offset + 20]),
                         f"{label}_programme",
-                        question_state_override={},
+                        question_state_override={
+                            "guidance": focused_guidance,
+                            "candidate_interval_speech": interval_speech,
+                            "evaluation_rule": _PROGRAMME_CONTEXT_RULE,
+                        },
                     )
                     programme_scores.extend(float(value) for value in checked["answers"].values())
                     all_cached &= bool(checked["cache_hit"])
@@ -2093,18 +2132,41 @@ def run_review(
             original_safety = promotion["original"]
             proposed_safe = safe["proposed"]
             original_safe = safe["original"]
-            logger.info(
-                "review request_id=%s stage=interval_comparison choice=%s probability=%s runner_up=%s promotion_threshold=%s programme_veto=%s proposed_promotion=%s original_promotion=%s proposed_programme=%s original_programme=%s proposed_continuation=%s original_continuation=%s adjusted_probability=%s original_probability=%s neither_probability=%s original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f original_supported=%s proposed_supported=%s cache_hit=%s",
-                review_request_id, selected_choice, selected_probability, runner_up,
-                review_choice_enter, review_programme_veto, proposed_safety, original_safety,
-                intrusion["proposed"], intrusion["original"],
-                continuation["proposed"], continuation["original"],
-                answer["probabilities"].get("adjusted"), answer["probabilities"].get("original"),
-                answer["probabilities"]["neither"],
-                cand_start, cand_end, proposed[0], proposed[1],
-                original_supported, proposed_supported, compared["cache_hit"],
+            if answer is None:
+                logger.info(
+                    "review request_id=%s stage=interval_comparison skipped=single_eligible promotion_threshold=%s programme_veto=%s proposed_promotion=%s original_promotion=%s proposed_programme=%s original_programme=%s proposed_continuation=%s original_continuation=%s original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f original_supported=%s proposed_supported=%s",
+                    review_request_id, review_choice_enter, review_programme_veto,
+                    proposed_safety, original_safety,
+                    intrusion["proposed"], intrusion["original"],
+                    continuation["proposed"], continuation["original"],
+                    cand_start, cand_end, proposed[0], proposed[1],
+                    original_supported, proposed_supported,
+                )
+            else:
+                logger.info(
+                    "review request_id=%s stage=interval_comparison choice=%s probability=%s runner_up=%s promotion_threshold=%s programme_veto=%s proposed_promotion=%s original_promotion=%s proposed_programme=%s original_programme=%s proposed_continuation=%s original_continuation=%s adjusted_probability=%s original_probability=%s neither_probability=%s original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f original_supported=%s proposed_supported=%s cache_hit=%s",
+                    review_request_id, selected_choice, selected_probability, runner_up,
+                    review_choice_enter, review_programme_veto, proposed_safety, original_safety,
+                    intrusion["proposed"], intrusion["original"],
+                    continuation["proposed"], continuation["original"],
+                    answer["probabilities"].get("adjusted"), answer["probabilities"].get("original"),
+                    answer["probabilities"]["neither"],
+                    cand_start, cand_end, proposed[0], proposed[1],
+                    original_supported, proposed_supported, compared_cache_hit,
+                )
+            if selected_choice == "neither":
+                metrics.record_review_refinement("inconclusive")
+                _review_unavailable(
+                    pool, "Jev rejected every eligible advertising interval", review_request_id,
+                    reason="neither_complete", stage="interval_comparison",
+                    score=selected_probability, cache_hit=compared_cache_hit,
+                )
+            prefer_adjusted = (
+                selected_choice == "adjusted"
+                and selected_probability is not None
+                and runner_up is not None
+                and selected_probability > runner_up
             )
-            prefer_adjusted = selected_choice == "adjusted" and selected_probability > runner_up
             if proposed_safe and (not original_safe or prefer_adjusted):
                 ad_start, ad_end = proposed
                 metrics.record_review_refinement(
