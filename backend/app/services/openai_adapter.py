@@ -603,12 +603,12 @@ def _finite_review_number(value: Any) -> float | None:
     return None
 
 
-def _review_line(line: str, *, allow_zero: bool = False) -> dict[str, Any] | None:
+def _review_line(line: str) -> dict[str, Any] | None:
     m = _TS_LINE.match(line)
     if not m:
         return None
     start, end = float(m.group(1)), float(m.group(2))
-    if not math.isfinite(start) or not math.isfinite(end) or end < start or (end == start and not allow_zero):
+    if not math.isfinite(start) or not math.isfinite(end) or end < start:
         raise ValueError("timestamped review interval is invalid")
     return {"start": start, "end": end, "text": m.group(3).strip()}
 
@@ -629,7 +629,7 @@ def parse_review_context(text: str) -> tuple[list[dict[str, Any]], dict[str, lis
         if section in {"words", "start"} and line.strip() == "End edge:":
             section = "end"
             continue
-        record = _review_line(line, allow_zero=section in words)
+        record = _review_line(line)
         if record is None:
             continue
         key = (record["start"], record["end"], record["text"])
@@ -887,15 +887,24 @@ def _unit_start_question(
             criteria[key] = _edge_reference(words, value, "start", original)
         else:
             suffix = [word for word in unit if float(word["start"]) >= value]
+            unit_index = units.index(unit)
+            before = " ".join(
+                str(word["text"]).strip() for word in (units[unit_index - 1] if unit_index else [])
+            )
+            after = " ".join(
+                str(word["text"]).strip()
+                for word in (units[unit_index + 1] if unit_index + 1 < len(units) else [])
+            )
+            target = " ".join(str(word["text"]).strip() for word in suffix)
             criteria[key] = (
-                "The sponsor message begins with: "
-                + " ".join(str(word["text"]).strip() for word in suffix)
+                f"The sponsor message begins with: target {target!r}; "
+                f"preceding utterance: {before!r}; following utterance: {after!r}"
                 if suffix else _edge_reference(words, value, "start", original)
             )
         mapping[key] = value
     return {
         "type": "choice",
-        "instructions": "Choose the beginning of the entire produced ad scene, not the first line that identifies the product. A scene with multiple speakers or role-play starts at its first spoken line if the following lines reveal it as the commercial. Include a personal problem resolved by the sponsor. Do not leave behind an isolated line from that scene. Exclude independent programme speech and generic navigation. Choose unknown if unsupported.",
+        "instructions": "Choose the target where the entire produced ad scene begins, not the first line that identifies the product. Use the neighboring utterances to separate a genuine staged scene or sponsor-specific problem setup from prior programme speech or navigation. A scene with multiple speakers or role-play starts at its first spoken line if the following lines reveal it as the commercial. Do not leave behind an isolated line from that scene. Choose unknown if unsupported.",
         "criteria": criteria,
     }, mapping
 
@@ -945,8 +954,16 @@ def _unit_end_question(
     mapping: dict[str, list[dict[str, Any]] | float] = {}
     for index, unit in enumerate(units):
         key = f"unit_{index:02d}"
-        criteria[key] = "The final sponsor word is in: " + " ".join(
-            str(word["text"]).strip() for word in unit
+        target = " ".join(str(word["text"]).strip() for word in unit)
+        before = " ".join(
+            str(word["text"]).strip() for word in (units[index - 1] if index else [])
+        )
+        after = " ".join(
+            str(word["text"]).strip() for word in (units[index + 1] if index + 1 < len(units) else [])
+        )
+        criteria[key] = (
+            f"Target utterance: {target!r}; preceding utterance: {before!r}; "
+            f"following utterance: {after!r}"
         )
         mapping[key] = unit
     if original in ends and not any(
@@ -956,7 +973,7 @@ def _unit_end_question(
         mapping["original"] = original
     return {
         "type": "choice",
-        "instructions": "Which utterance contains the final sponsor word of this commercial read, including its offer, URL, conversational thanks, or sign-off? Stay with the current sponsor message that overlaps the candidate; do not jump to a later neighboring advertisement. Do not choose a return-to-show utterance that follows the sponsor read. The correct utterance may continue into independent show speech after its sponsor words. Choose unknown if none fits.",
+        "instructions": "Which target utterance contains the final sponsor word of this commercial read, including its offer, URL, conversational thanks, or sign-off? Use the neighboring utterances to avoid leaving same-read speech audible. Stay with the current sponsor message that overlaps the candidate; do not jump to a later neighboring advertisement. Do not choose a return-to-show utterance that follows the sponsor read. The correct utterance may continue into independent show speech after its sponsor words. Choose unknown if none fits.",
         "criteria": criteria,
     }, mapping
 
@@ -973,16 +990,19 @@ def _word_end_question(
     criteria = {"unknown": "Insufficient evidence to place the word boundary at a listed option."}
     for index, value in enumerate(values):
         word_index = min(
+            range(len(unit)), key=lambda item: abs(float(unit[item]["end"]) - value),
+        )
+        global_index = min(
             range(len(words)), key=lambda item: abs(float(words[item]["end"]) - value),
         )
-        included = " ".join(str(word["text"]).strip() for word in words[max(0, word_index - 7):word_index + 1])
-        remaining = " ".join(str(word["text"]).strip() for word in words[word_index + 1:word_index + 9])
+        included = " ".join(str(word["text"]).strip() for word in unit[max(0, word_index - 15):word_index + 1])
+        remaining = " ".join(str(word["text"]).strip() for word in words[global_index + 1:global_index + 17])
         criteria[f"end_{index:02d}"] = (
-            f"Cut through {included!r} at {value:.2f}s; first kept words: {remaining!r}"
+            f"At {value:.2f}s, removed speech ends: {included!r}; kept speech begins: {remaining!r}"
         )
     return {
         "type": "choice",
-        "instructions": "Choose the boundary immediately after the final sponsor word and before the first kept programme word. Include the final sponsor offer, full URL, conversational thanks, and sign-off. Do not choose the end of the utterance merely because no words remain after it. Stop before a spoken return to the show or independent programme speech. Choose unknown if the boundary is unclear.",
+        "instructions": "Choose the transition where the removed side ends with a complete sponsor phrase and the kept side begins with a complete programme phrase. Include the final sponsor offer, full URL, conversational thanks, and sign-off. Do not remove the opening word of the kept phrase or leave the closing word of the sponsor phrase audible. Do not choose the end of the utterance merely because no words remain after it. Choose unknown if the boundary is unclear.",
         "criteria": criteria,
     }, {f"end_{index:02d}": value for index, value in enumerate(values)}
 
@@ -1039,8 +1059,8 @@ _PROGRAMME_CRITERIA = {
     "false": "The target contains only the sponsor or promotional read, including narrative setup, personal story used to lead into the product, sponsor-related conversational thanks, offer, URL, or disclaimer. A pronoun referring to the sponsor in a brief relationship remark continues the sign-off. Brief break navigation without episode discussion is separate.",
 }
 _CONTINUITY_CRITERIA = {
-    "true": "The target has moved away from a commercial message into independent episode conversation, reporting, interview, news, or a spoken return to the show. It is programme speech even if it discusses the same broad topic as an earlier sponsor. Judge only the target using the words before and after to locate the change in function.",
-    "false": "The target continues the commercial message. Product explanation, a hands-on demonstration of the named sponsor product, a sponsor-related personal aside, an offer, URL, or thanks remains promotional while that sponsor presentation continues. Conversational delivery or technical subject matter alone does not make it programme speech.",
+    "true": "The target has moved away from a commercial message into independent episode conversation, reporting, interview, news, or a spoken return to the show. It introduces substantive programme content rather than setting up a sponsor product, problem, claim, or offer. Judge only the target using the words before and after to locate the change in function.",
+    "false": "The target continues the commercial message. Product explanation, a demonstration, sponsor-related commentary, an offer, URL, or thanks remains promotional while that sponsor presentation continues. Generic rhetoric, a curiosity hook, or a fact teaser also remains promotional when surrounding speech connects it to the sponsor's product, problem, claim, or offer.",
 }
 
 
@@ -1178,6 +1198,14 @@ def _programme_checks(
         add_question(f"{side}_speech", side, target)
         if side == "end":
             add_question("end_tail", side, inside[-4:])
+            add_question("end_boundary_speech", side, inside[-1:])
+            questions["end_boundary_speech"]["instructions"]["question"] = (
+                "Does target_speech contain any opening word from the complete programme phrase shown in speech_after?"
+            )
+            questions["end_boundary_speech"]["criteria"] = {
+                "true": "The target is the opening portion of the independent programme phrase that continues in speech_after, so cutting it would remove part of that phrase.",
+                "false": "The target completes the sponsor or promotional read; the independent programme phrase begins only in speech_after.",
+            }
     for edge, (side, start, end) in enumerate(additions):
         words = word_edges[side]
         added = [word for word in words if float(word["end"]) > start and float(word["start"]) < end]

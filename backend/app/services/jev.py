@@ -43,7 +43,6 @@ class JevReviewValidationError(ValueError):
             "choice_probability",
             "choice_probability_keys",
             "choice_probability_sum",
-            "choice_winner",
             "usage_object",
             "usage_input_tokens",
             "usage_output_tokens",
@@ -57,8 +56,6 @@ class JevReviewValidationError(ValueError):
             "expected_total",
             "actual_total",
             "tolerance",
-            "selected_probability",
-            "max_probability",
         }
     )
 
@@ -491,12 +488,6 @@ def _review_answers(body: dict[str, Any], questions: dict[str, dict[str, Any]]) 
                     "actual_total": total,
                     "tolerance": CHOICE_PROBABILITY_SUM_TOLERANCE,
                 },
-            )
-        winner = max(parsed_probs.values())
-        if parsed_probs[choice] != winner:
-            raise JevReviewValidationError(
-                "choice_winner",
-                {"selected_probability": parsed_probs[choice], "max_probability": winner},
             )
         parsed[key] = {
             "choice": choice,

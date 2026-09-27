@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.22 - 2026-09-26
+
+- Honor the provider's explicit Choice selection even when another option has a higher independent score. Existing interval safety checks still control review adjustments.
+- Preserve positive-duration transcript lines that round to a point timestamp, while rejecting reversed intervals.
+- Compare neighboring utterances at both boundaries and the removed and kept speech at the end, then check whether the cut includes the opening of the kept programme phrase.
+- Keep generic hooks and commentary in a sponsor read when nearby speech ties them to its problem, claim, product, or offer.
+
 ## 0.1.21 - 2026-09-26
 
 - Select the utterance that contains the final sponsor word before choosing its exact word boundary. Check nearby excluded speech for sponsor continuity. Check the final four words and interior sentence pairs for programme speech.

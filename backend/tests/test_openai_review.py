@@ -409,8 +409,8 @@ def test_word_clipped_original_can_adjust_to_aligned_end(jev_env, tmp_path):
     def fake(payload, **kwargs):
         if "boundary_end_word" in payload["questions"]:
             options = payload["questions"]["boundary_end_word"]["criteria"].values()
-            assert any("at 94.20s;" in option for option in options)
-            assert not any("at 94.80s;" in option for option in options)
+            assert any("At 94.20s," in option for option in options)
+            assert not any("At 94.80s," in option for option in options)
         result = ranked(payload, **kwargs)
         if "interval_comparison" in payload["questions"]:
             assert "original" not in payload["questions"]["interval_comparison"]["criteria"]
@@ -1300,6 +1300,45 @@ def test_word_timing_is_not_mixed_into_coarse_review_segments():
     assert words["end"][0]["end"] == 120.0
 
 
+def test_rounded_zero_width_coarse_line_is_preserved_as_point_evidence():
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(94.0, 100.0, "context before")],
+        [
+            (100.0, 109.0, "This episode is sponsored by Acme"),
+            (109.2, 109.2, "brief sponsor word"),
+            (109.4, 120.0, "Visit example.com for details"),
+        ],
+        [(120.0, 126.0, "context after")],
+    )
+
+    segments, _ = parse_review_context(prompt)
+
+    point = next(segment for segment in segments if segment["text"] == "brief sponsor word")
+    assert (point["start"], point["end"]) == (109.2, 109.2)
+    words = {"start": [], "end": []}
+    assert _range_boundary_support(segments, words, (109.2, 109.2)) == (True, True)
+    assert _range_boundary_support(segments, words, (109.1, 109.3)) == (False, False)
+    assert not adapter._valid_pair(
+        109.1, 109.3, (109.1, 109.3), (109.2, 109.2), 109.2, 109.2,
+    )
+
+
+def test_reversed_coarse_line_remains_invalid():
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(94.0, 100.0, "context before")],
+        [(100.0, 120.0, "This episode is sponsored by Acme")],
+        [(120.0, 126.0, "context after")],
+    ).replace(
+        "[100.0s-120.0s] This episode is sponsored by Acme",
+        "[120.0s-100.0s] This episode is sponsored by Acme",
+    )
+
+    with pytest.raises(ValueError, match="timestamped review interval is invalid"):
+        parse_review_context(prompt)
+
+
 def test_review_word_edges_are_sorted_and_deduplicated():
     prompt = _meaningful_pair_prompt().replace(
         "[90.0s-91.0s] Editorial.\n[100.0s-101.0s] Editorial\n[106.0s-107.0s] Sponsor\n",
@@ -1597,9 +1636,31 @@ def test_end_hierarchy_selects_an_utterance_before_an_exact_word():
 
     assert list(coarse["criteria"])[0] == "unknown"
     assert any("Use code ACME." in text for text in coarse["criteria"].values())
+    assert any("following utterance: 'Welcome back.'" in text for text in coarse["criteria"].values())
     assert set(values.values()) == {101.0, 102.0, 104.0}
-    assert any("Cut through 'Use code ACME.' at 104.00s" in text for text in fine["criteria"].values())
-    assert any("first kept words: 'Welcome back.'" in text for text in fine["criteria"].values())
+    assert any("At 104.00s, removed speech ends: 'Use code ACME.'" in text for text in fine["criteria"].values())
+    assert any("kept speech begins: 'Welcome back.'" in text for text in fine["criteria"].values())
+
+
+def test_start_unit_options_include_neighboring_utterances():
+    segments = [
+        {"start": 90.0, "end": 92.0, "text": "Back after the break."},
+        {"start": 92.0, "end": 94.0, "text": "I have a storage problem."},
+        {"start": 94.0, "end": 96.0, "text": "Acme solves it."},
+    ]
+    words = [
+        {"start": 90.0, "end": 92.0, "text": "Back after the break."},
+        {"start": 92.0, "end": 94.0, "text": "I have a storage problem."},
+        {"start": 94.0, "end": 96.0, "text": "Acme solves it."},
+    ]
+
+    question, values = adapter._unit_start_question(
+        segments, words, [90.0, 92.0, 94.0], 92.0,
+    )
+    setup_option = next(key for key, value in values.items() if value == 92.0)
+
+    assert "preceding utterance: 'Back after the break.'" in question["criteria"][setup_option]
+    assert "following utterance: 'Acme solves it.'" in question["criteria"][setup_option]
 
 
 def test_large_end_unit_groups_every_word_end_before_exact_selection():
@@ -1658,6 +1719,8 @@ def test_end_tail_programme_veto_targets_only_the_last_four_words():
     checks = _programme_checks(segments, edges, (100.0, 107.0), [])
 
     assert checks["end_tail"]["instructions"]["target_speech"] == "then welcome back now"
+    assert checks["end_boundary_speech"]["instructions"]["target_speech"] == "now"
+    assert "opening word" in checks["end_boundary_speech"]["instructions"]["question"]
 
 
 def test_outside_completeness_checks_near_and_far_speech_separately():
