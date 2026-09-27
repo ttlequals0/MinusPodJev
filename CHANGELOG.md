@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.23 - 2026-09-27
+
+- Allow a complete sponsor closing phrase at the end of the supplied review context to define the final word boundary. Continue to abstain when the context ends mid-URL or mid-phrase.
+
 ## 0.1.22 - 2026-09-26
 
 - Honor the provider's explicit Choice selection even when another option has a higher independent score. Existing interval safety checks still control review adjustments.

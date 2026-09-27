@@ -1642,6 +1642,40 @@ def test_end_hierarchy_selects_an_utterance_before_an_exact_word():
     assert any("kept speech begins: 'Welcome back.'" in text for text in fine["criteria"].values())
 
 
+def test_end_word_options_allow_a_complete_closing_phrase_at_context_end():
+    words = [
+        {"start": 100.0, "end": 101.0, "text": "Visit"},
+        {"start": 101.0, "end": 102.0, "text": "example"},
+        {"start": 102.0, "end": 103.0, "text": ".com"},
+    ]
+
+    question, _ = adapter._word_end_question(words, [101.0, 102.0, 103.0], words)
+
+    assert "complete sponsor URL" in question["instructions"]
+    assert any(
+        "removed speech ends: 'Visit example .com'" in option
+        and "no later speech is present" in option
+        for option in question["criteria"].values()
+    )
+
+
+def test_end_word_options_keep_truncated_closing_phrases_unknown():
+    words = [
+        {"start": 100.0, "end": 101.0, "text": "Visit"},
+        {"start": 101.0, "end": 102.0, "text": "example"},
+        {"start": 102.0, "end": 103.0, "text": "dot"},
+    ]
+
+    question, _ = adapter._word_end_question(words, [101.0, 102.0, 103.0], words)
+
+    assert "Choose unknown when the supplied speech ends mid-URL or mid-phrase" in question["instructions"]
+    assert any(
+        "removed speech ends: 'Visit example dot'" in option
+        and "no later speech is present" in option
+        for option in question["criteria"].values()
+    )
+
+
 def test_start_unit_options_include_neighboring_utterances():
     segments = [
         {"start": 90.0, "end": 92.0, "text": "Back after the break."},

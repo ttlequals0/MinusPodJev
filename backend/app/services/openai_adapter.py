@@ -997,12 +997,13 @@ def _word_end_question(
         )
         included = " ".join(str(word["text"]).strip() for word in unit[max(0, word_index - 15):word_index + 1])
         remaining = " ".join(str(word["text"]).strip() for word in words[global_index + 1:global_index + 17])
+        kept = repr(remaining) if remaining else "no later speech is present in the supplied review context"
         criteria[f"end_{index:02d}"] = (
-            f"At {value:.2f}s, removed speech ends: {included!r}; kept speech begins: {remaining!r}"
+            f"At {value:.2f}s, removed speech ends: {included!r}; kept speech begins: {kept}"
         )
     return {
         "type": "choice",
-        "instructions": "Choose the transition where the removed side ends with a complete sponsor phrase and the kept side begins with a complete programme phrase. Include the final sponsor offer, full URL, conversational thanks, and sign-off. Do not remove the opening word of the kept phrase or leave the closing word of the sponsor phrase audible. Do not choose the end of the utterance merely because no words remain after it. Choose unknown if the boundary is unclear.",
+        "instructions": "Choose the transition where the removed side ends with a complete sponsor phrase and the kept side begins with a complete programme phrase. Include the final sponsor offer, full URL, conversational thanks, and sign-off. Do not remove the opening word of the kept phrase or leave the closing word of the sponsor phrase audible. If no kept speech remains in the supplied review context, choose the last observed endpoint only when the removed speech itself ends with a complete sponsor URL, offer, thanks, sign-off, or other complete closing phrase. Choose unknown when the supplied speech ends mid-URL or mid-phrase; the absence of later words alone is insufficient.",
         "criteria": criteria,
     }, {f"end_{index:02d}": value for index, value in enumerate(values)}
 
