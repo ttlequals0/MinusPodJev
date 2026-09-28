@@ -3133,6 +3133,110 @@ def test_interval_safety_is_independent_of_relative_preference(
         assert (ad["start"], ad["end"]) == expected
 
 
+@pytest.mark.parametrize(
+    ("selected_start", "outer_label", "outer_text"),
+    [(106.0, "original", "Editorial transition."),
+     (90.0, "proposed", "Editorial before.")],
+)
+@pytest.mark.parametrize("veto_signal", ["programme", "policy"])
+def test_nested_protected_veto_blocks_containing_interval(
+    jev_env, tmp_path, selected_start, outer_label, outer_text, veto_signal,
+):
+    select = _select_pair_fake(selected_start, 120.0)
+    observed = {}
+    prompt = _meaningful_pair_prompt()
+    if veto_signal == "policy":
+        prompt = prompt.replace(
+            "\nTranscript (60s before, the candidate ad, 60s after;",
+            "\nEffective category actions: sponsor=remove, self_promo=keep\n\n"
+            "Transcript (60s before, the candidate ad, 60s after;",
+        )
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        questions = payload["questions"]
+        if "interval_comparison" in questions:
+            _set_choice_answer(
+                result, payload, "interval_comparison",
+                "original" if outer_label == "original" else "adjusted",
+            )
+        if "sponsor_read" in questions:
+            result["answers"]["sponsor_read"] = {"noul": 0.98}
+        if "kept_category" in questions:
+            result["answers"]["kept_category"] = {"noul": 0.02}
+        if "whole_speech" in questions and veto_signal == "programme":
+            speech = payload["state"]["candidate_interval_speech"]
+            score = 0.84 if outer_text in speech else 0.86
+            observed["outer" if outer_text in speech else "inner"] = score
+            result["answers"]["whole_speech"] = {"noul": score}
+        if veto_signal == "policy" and any(name.startswith("same_show_access_") for name in questions):
+            speech = payload["state"]["candidate_interval_speech"]
+            score = 0.84 if outer_text in speech else 0.86
+            observed["outer" if outer_text in speech else "inner"] = score
+            for name in questions:
+                result["answers"][name] = {"noul": score}
+        return result
+
+    with pytest.raises(ReviewInconclusiveError) as raised:
+        _run(prompt, fake, tmp_path, refine_boundaries=True)
+
+    assert observed == {"inner": 0.86, "outer": 0.84}
+    reason = "programme_content_detected" if veto_signal == "programme" else "category_policy_unconfirmed"
+    assert raised.value.proposal["reason"] == reason
+    assert raised.value.fallback["reason"] == reason
+    assert raised.value.proposal["score"] == pytest.approx(0.86)
+    assert raised.value.fallback["score"] == pytest.approx(0.86)
+
+
+def test_partial_overlap_does_not_transfer_programme_veto(jev_env, tmp_path):
+    select = _select_pair_fake(106.0, 130.0)
+    observed = {}
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        questions = payload["questions"]
+        if "interval_comparison" in questions:
+            _set_choice_answer(result, payload, "interval_comparison", "adjusted")
+        if "sponsor_read" in questions:
+            result["answers"]["sponsor_read"] = {"noul": 0.98}
+        if "whole_speech" in questions:
+            original = "Editorial transition." in payload["state"]["candidate_interval_speech"]
+            score = 0.86 if original else 0.84
+            observed["original" if original else "proposed"] = score
+            result["answers"]["whole_speech"] = {"noul": score}
+        return result
+
+    response = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+
+    assert observed == {"original": 0.86, "proposed": 0.84}
+    assert (ad["start"], ad["end"]) == (106.0, 130.0)
+
+
+def test_outside_continuation_does_not_veto_containing_interval(jev_env, tmp_path):
+    select = _select_pair_fake(106.0, 120.0)
+    outside_scores = {}
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        questions = payload["questions"]
+        if "interval_comparison" in questions:
+            _set_choice_answer(result, payload, "interval_comparison", "adjusted")
+        for name, question in questions.items():
+            if name.endswith(("_near", "_extended")):
+                inside = question["instructions"]["inside_candidate_speech"]
+                score = 0.98 if name.startswith("start_") and inside.startswith("Sponsor offer") else 0.02
+                outside_scores[(inside, name)] = score
+                result["answers"][name] = {"noul": score}
+        return result
+
+    response = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+
+    assert any(score == 0.98 for score in outside_scores.values())
+    assert (ad["start"], ad["end"]) == (100.0, 120.0)
+
+
 @pytest.mark.parametrize("proposed_programme_score, approved", [(0.1, True), (0.85, False), (0.9, False)])
 def test_promotion_requires_local_programme_clearance(
     jev_env, tmp_path, proposed_programme_score, approved

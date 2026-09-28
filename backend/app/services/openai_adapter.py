@@ -2692,6 +2692,26 @@ def run_review(
                         or relation_score < review_programme_veto
                     )
                 )
+            for inner, outer, inner_bounds, outer_bounds in (
+                ("proposed", "original", proposed, original_bounds),
+                ("original", "proposed", original_bounds, proposed),
+            ):
+                if outer_bounds[0] > inner_bounds[0] or inner_bounds[1] > outer_bounds[1]:
+                    continue
+                inner_intrusion = intrusion[inner]
+                outer_intrusion = intrusion[outer]
+                if inner_intrusion is not None and inner_intrusion >= review_programme_veto:
+                    safe[outer] = False
+                    if outer_intrusion is None or outer_intrusion < inner_intrusion:
+                        intrusion[outer] = inner_intrusion
+                        programme_cache[outer] = programme_cache[inner]
+                inner_relation = policy_relation[inner]
+                outer_relation = policy_relation[outer]
+                if inner_relation is not None and inner_relation >= review_programme_veto:
+                    safe[outer] = False
+                    if outer_relation is None or outer_relation < inner_relation:
+                        policy_relation[outer] = inner_relation
+                        policy_relation_cache[outer] = policy_relation_cache[inner]
             proposed_safety = promotion["proposed"]
             original_safety = promotion["original"]
             proposed_safe = safe["proposed"]

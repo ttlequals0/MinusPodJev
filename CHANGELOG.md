@@ -3,6 +3,7 @@
 ## 0.1.26 - 2026-09-28
 
 - Include consecutive removable ads and produced trailers in one review cut. Preserve programme and configured keep speech, and validate an aligned earlier end if extending the cut fails safety checks.
+- Apply a programme or configured keep speech veto to any larger review interval that contains the protected interval.
 
 ## 0.1.25 - 2026-09-27
 
