@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.28 - 2026-09-28
+
+- Return the canonical name for a known sponsor in detection output so downstream brand checks can match spoken mentions. Unknown detection spans still omit the sponsor field.
+
 ## 0.1.27 - 2026-09-28
 
 - Ground review evidence in the candidate's observed words when boundary refinement can validate the full interval. Check added start speech for a spoken return to the episode before widening a cut. Keep the existing evidence check for reviews without usable word timing.

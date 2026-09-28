@@ -165,8 +165,9 @@ async def test_chat_completions_timestamps_round_trip(jev_env, client, monkeypat
 
     content = data["choices"][0]["message"]["content"]
     assert isinstance(content, str)
-    # The proxy adds only its provenance label beyond MinusPod's base schema.
-    for raw_ad in json.loads(content)["ads"]:
+    raw_ads = json.loads(content)["ads"]
+    assert raw_ads[0]["sponsor_name"] == "BetterHelp"
+    for raw_ad in raw_ads:
         assert set(raw_ad) <= _SCHEMA_AD_KEYS
     ads = parse_ads_from_response(content)
     assert len(ads) == 1
@@ -175,7 +176,7 @@ async def test_chat_completions_timestamps_round_trip(jev_env, client, monkeypat
     assert ad["end"] == 36.0
     assert ad["category"] == "sponsor"
     assert ad["confidence"] == 0.98
-    assert ad["sponsor"] == "jev-BetterHelp"
+    assert ad["sponsor"] == "BetterHelp"
     assert ad["end_text"].startswith("Use code SHOW")
     assert ad["reason"].startswith("This episode is sponsored by BetterHelp.")
     assert is_sponsor_reasoning_rationale(ad["reason"]) is False
@@ -400,6 +401,7 @@ async def test_chat_completions_segment_ids_round_trip(jev_env, client, monkeypa
     ad = parsed["ads"][0]
     assert ad["start_id"] == 12
     assert ad["end_id"] == 13
+    assert ad["sponsor_name"] == "Squarespace"
     assert "start" not in ad and "end" not in ad
     assert isinstance(ad["start_id"], int)
 
@@ -414,7 +416,7 @@ async def test_chat_completions_segment_ids_round_trip(jev_env, client, monkeypa
     resolved = resolve_segment_id_ads(id_ads, window)
     assert len(resolved) == 1
     assert resolved[0]["start"] == 120.0 and resolved[0]["end"] == 132.0
-    assert resolved[0]["sponsor"] == "jev-Squarespace"
+    assert resolved[0]["sponsor"] == "Squarespace"
 
 
 async def test_chat_completions_requires_api_key(jev_env, client, monkeypatch):
@@ -590,6 +592,7 @@ def test_unknown_sponsor_uses_grounded_reason_without_minting_label(jev_env, tmp
     content = response["choices"][0]["message"]["content"]
     raw_ad = json.loads(content)["ads"][0]
     assert "sponsor" not in raw_ad
+    assert "sponsor_name" not in raw_ad
     assert raw_ad["reason"] == "Based on transcript: Sponsored by Unknown Brand, visit unknown.example today."
     parsed = parse_ads_from_response(content)
     assert "sponsor" not in parsed[0]

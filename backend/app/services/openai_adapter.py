@@ -325,10 +325,6 @@ def _category_guidance(system_text: str) -> str:
     )
 
 
-def _jev_sponsor_label(sponsor: str) -> str:
-    return sponsor if sponsor.lower().startswith("jev-") else f"jev-{sponsor}"
-
-
 def _transcript_evidence(members: Sequence[dict[str, Any]], probabilities: dict[str, float], enter: float) -> str:
     """A bounded source excerpt from segments that opened the detected span."""
     excerpts = [
@@ -604,10 +600,9 @@ def run_chat_completion(
         sponsor = matched_sponsor_for_span(span_text, deadline_at=deadline_at)
         excerpt = _transcript_evidence(members, probabilities, enter)
         if sponsor is not None:
-            label = _jev_sponsor_label(sponsor)
-            ad[SPONSOR_PRIORITY_FIELDS[0]] = label
+            ad[SPONSOR_PRIORITY_FIELDS[0]] = sponsor
             ad["reason"] = excerpt
-            logger.debug("sponsor: %s", label)
+            logger.debug("sponsor: %s", sponsor)
         else:
             ad["reason"] = f"Based on transcript: {excerpt}"
         ads.append(ad)

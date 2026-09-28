@@ -111,10 +111,10 @@ The category pass uses one Jev Choice for each detected span. Its values are `sp
 ## Sponsor naming
 
 - Set `MINUSPOD_BASE_URL` and `MINUSPOD_PASSWORD`; the proxy logs into MinusPod (cached session) to read `GET /api/v1/sponsors`.
-- It emits `sponsor_name` only for one known sponsor with local ad evidence, using the `jev-` namespace, for example `jev-ButcherBox`.
-- The prefix identifies a proxy-generated learned record and the suffix is the matched canonical brand. An unmatched span leaves the field absent, preventing false sponsor evidence.
+- It emits `sponsor_name` only for one known sponsor with local ad evidence, using the canonical name from the sponsor list.
+- An unmatched span leaves the field absent, preventing false sponsor evidence.
 - For a confirmed local sponsor match, the rationale uses the raw transcript excerpt instead of a `Based on transcript:` wrapper that MinusPod can reject as generated text.
-- Unmatched spans keep the wrapper and omit an explicit sponsor name. This preserves MinusPod's guard against minting unprefixed regex sponsors. Other learning guards still apply.
+- Unmatched spans keep the wrapper and omit an explicit sponsor name. The legacy `sponsor_for_span` helper still uses `jev-` placeholders for unknown sponsors; detection does not call it.
 - Unset `MINUSPOD_BASE_URL` falls back to the gazetteer.
 
 ## Runtime ownership
