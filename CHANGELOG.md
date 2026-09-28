@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.27 - 2026-09-28
+
+- Ground review evidence in the candidate's observed words when boundary refinement can validate the full interval. Check added start speech for a spoken return to the episode before widening a cut. Keep the existing evidence check for reviews without usable word timing.
+
 ## 0.1.26 - 2026-09-28
 
 - Include consecutive removable ads and produced trailers in one review cut. Preserve programme and configured keep speech, and validate an aligned earlier end if extending the cut fails safety checks.

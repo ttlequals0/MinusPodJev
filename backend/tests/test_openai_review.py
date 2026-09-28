@@ -795,6 +795,64 @@ def _run(
     )
 
 
+def test_refined_evidence_uses_only_candidate_speech(jev_env, tmp_path):
+    evidence_state = {}
+    evidence_question = {}
+    normal = make_text_fake()
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if "evidence" in payload["questions"]:
+            evidence_state.update(payload["state"])
+            evidence_question.update(payload["questions"]["evidence"])
+            result["answers"]["evidence"] = {"noul": 0.01}
+        return result
+
+    with pytest.raises(ReviewInconclusiveError) as raised:
+        _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+
+    assert raised.value.reason == "insufficient_evidence"
+    assert evidence_state["candidate_interval_speech"] == (
+        "Editorial transition.\nSponsor offer ends.\nSponsor continues."
+    )
+    assert "Editorial before." not in evidence_state["candidate_interval_speech"]
+    assert "Editorial return." not in evidence_state["candidate_interval_speech"]
+    assert "transcript" not in evidence_state
+    assert "candidate_interval_speech" in evidence_question["instructions"]
+    assert set(evidence_question["criteria"]) == {"true", "false"}
+
+
+@pytest.mark.parametrize("refine_boundaries,include_end_words", [(False, True), (True, False)])
+def test_unvalidated_review_paths_keep_full_context_evidence(
+    jev_env, tmp_path, refine_boundaries, include_end_words,
+):
+    prompt = _meaningful_pair_prompt()
+    if not include_end_words:
+        prompt = prompt.split("End edge:\n", 1)[0] + "End edge:\n"
+    evidence_state = {}
+    evidence_question = {}
+    normal = make_text_fake()
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if "evidence" in payload["questions"]:
+            evidence_state.update(payload["state"])
+            evidence_question.update(payload["questions"]["evidence"])
+            result["answers"]["evidence"] = {"noul": 0.01}
+        return result
+
+    with pytest.raises(ReviewInconclusiveError) as raised:
+        _run(prompt, fake, tmp_path, refine_boundaries=refine_boundaries)
+
+    assert raised.value.reason == "insufficient_evidence"
+    assert "transcript" in evidence_state
+    assert "candidate_interval_speech" not in evidence_state
+    assert evidence_question == {
+        "type": "noul",
+        "instructions": "The candidate interval contains transcript-grounded advertising or promotional content covered by the supplied guidance, not merely editorial discussion or a brand mention.",
+    }
+
+
 def test_review_evidence_threshold_is_independent(jev_env, tmp_path):
     prompt = build_review_prompt(
         100.0,
@@ -1898,6 +1956,78 @@ def test_start_alternative_preserves_provider_choice_when_probability_is_not_max
     assert alternative_requests[0]["state"]["added_speech_if_earlier"] == "Editorial transition."
 
 
+@pytest.mark.parametrize(
+    "added_speech,prefix_score,expected_start",
+    [
+        ("Back to the discussion.", 0.98, 106.0),
+        ("Sponsor offer begins.", 0.02, 100.0),
+    ],
+)
+def test_start_alternative_protects_episode_return_but_allows_ad_setup(
+    jev_env, tmp_path, added_speech, prefix_score, expected_start,
+):
+    prompt = _meaningful_pair_prompt().replace("Editorial transition.", added_speech)
+    select = _select_pair_fake(106.0, 120.0)
+    prefix_requests = []
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        questions = payload["questions"]
+        if "boundary_start" in questions:
+            selected = _boundary_option("boundary_start", 106.0)
+            earlier = _boundary_option("boundary_start", 100.0)
+            criteria = questions["boundary_start"]["criteria"]
+            result["answers"]["boundary_start"] = {
+                "choice": selected,
+                "confidence": 0.2,
+                "probabilities": {
+                    key: 0.2 if key == selected else 0.7 if key == earlier
+                    else 0.1 / (len(criteria) - 2)
+                    for key in criteria
+                },
+            }
+        if "boundary_start_alternative" in questions:
+            _set_choice_answer(result, payload, "boundary_start_alternative", "earlier")
+            prefix_requests.append(payload)
+            result["answers"]["added_prefix_return"] = {"noul": prefix_score}
+        if "interval_comparison" in questions:
+            _set_choice_answer(result, payload, "interval_comparison", "adjusted")
+        return result
+
+    response = _run(prompt, fake, tmp_path, refine_boundaries=True)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+
+    assert len(prefix_requests) == 1
+    assert prefix_requests[0]["state"]["added_speech_if_earlier"] == added_speech
+    assert (ad["start"], ad["end"]) == (expected_start, 120.0)
+
+
+def test_widened_start_programme_check_vetoes_episode_return(
+    jev_env, tmp_path,
+):
+    prompt = _meaningful_pair_prompt().replace("Editorial before.", "Back to the discussion.")
+    select = _select_pair_fake(90.0, 120.0)
+    prefix_requests = []
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        questions = payload["questions"]
+        if "interval_comparison" in questions:
+            _set_choice_answer(result, payload, "interval_comparison", "adjusted")
+        if "added_prefix_return" in questions:
+            prefix_requests.append(payload)
+            result["answers"]["added_prefix_return"] = {"noul": 0.98}
+        return result
+
+    response = _run(prompt, fake, tmp_path, refine_boundaries=True)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+
+    assert len(prefix_requests) == 1
+    assert prefix_requests[0]["state"]["added_speech_if_earlier"] == "Back to the discussion."
+    assert "start_speech" in prefix_requests[0]["questions"]
+    assert (ad["start"], ad["end"]) == (100.0, 120.0)
+
+
 def test_unknown_start_does_not_trigger_alternative_choice(
     jev_env, tmp_path,
 ):
@@ -2183,9 +2313,13 @@ def test_separate_neighboring_ad_does_not_block_complete_cut(jev_env, tmp_path):
 
 def test_unrelated_editorial_vetoes_ad_present_in_mixed_cut(jev_env, tmp_path):
     normal = make_text_fake()
+    evidence_states = []
 
     def fake(payload, **kwargs):
         result = normal(payload, **kwargs)
+        if "evidence" in payload["questions"]:
+            evidence_states.append(payload["state"])
+            result["answers"]["evidence"] = {"noul": 0.98}
         if "interval_comparison" in payload["questions"]:
             assert "Editorial transition" in payload["state"]["original_speech"]
             _set_choice_answer(result, payload, "interval_comparison", "neither")
@@ -2195,6 +2329,8 @@ def test_unrelated_editorial_vetoes_ad_present_in_mixed_cut(jev_env, tmp_path):
 
     with pytest.raises(ReviewInconclusiveError, match="could not confirm a safe advertising interval"):
         _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+    assert evidence_states[0]["candidate_interval_speech"].startswith("Editorial transition.")
+    assert "transcript" not in evidence_states[0]
 
 
 def test_sentence_interior_veto_isolates_show_island_inside_coarse_segment(

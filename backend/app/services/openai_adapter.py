@@ -1269,6 +1269,20 @@ def _continuity_question(before: str, target: str, after: str, *, whole: bool = 
     }
 
 
+def _prefix_return_question(speech: str) -> dict[str, Any]:
+    return {
+        "type": "noul",
+        "instructions": {
+            "question": "Does added_speech_if_earlier contain an explicit spoken handoff from a promotion or break back into this podcast episode's independent story or discussion? Judge the handoff itself, even if another separate ad plays before the story resumes.",
+            "target_speech": speech,
+        },
+        "criteria": {
+            "true": "The host explicitly closes the earlier promotion and announces a return to the current episode story or discussion. That handoff is independent programme speech.",
+            "false": "The added speech stays within a removable pitch, a trailer story hook, or generic break navigation without an explicit return to the current episode.",
+        },
+    }
+
+
 def _interior_questions(
     segments: Sequence[dict[str, Any]],
     word_edges: dict[str, list[dict[str, Any]]],
@@ -1825,13 +1839,36 @@ def run_review(
             all_cached &= bool(checked["cache_hit"])
         return max(scores), all_cached
 
-    evidence = review_questions(
-        {
-            "evidence": {
-                "type": "noul",
-                "instructions": "The candidate interval contains transcript-grounded advertising or promotional content covered by the supplied guidance, not merely editorial discussion or a brand mention.",
-            }
-        }, "evidence", question_state_override={
+    candidate_speech = (
+        _assessment_speech(segments, word_edges, cand)
+        if refine_boundaries and word_edges["start"] and word_edges["end"]
+        else None
+    )
+    if candidate_speech:
+        evidence_question = {
+            "type": "noul",
+            "instructions": {
+                "question": "Does candidate_interval_speech contain a real sponsor read, product offer, or other removable promotion? This asks whether promotional evidence exists, not whether the full interval is safe to cut.",
+                "candidate_interval_speech": candidate_speech,
+            },
+            "criteria": {
+                "true": "The candidate speech directly pitches a real product, service, or show, such as with a benefit, price, offer, URL, or listener call to action. A host-read sponsor may include jokes or personal anecdotes.",
+                "false": "The candidate speech is only editorial discussion, a passing brand mention, a fictional bit, or a protected keep-category message.",
+            },
+        }
+        evidence_state: dict[str, Any] = {
+            "guidance": _focused_guidance(review_guidance),
+            "candidate_interval_speech": candidate_speech,
+            "candidate": {"start": cand_start, "end": cand_end},
+            **policy_state,
+            **({"caller_context": caller_context} if caller_context else {}),
+        }
+    else:
+        evidence_question = {
+            "type": "noul",
+            "instructions": "The candidate interval contains transcript-grounded advertising or promotional content covered by the supplied guidance, not merely editorial discussion or a brand mention.",
+        }
+        evidence_state = {
             "guidance": review_guidance,
             "transcript": build_state(segments),
             "candidate": {"start": cand_start, "end": cand_end},
@@ -1841,6 +1878,8 @@ def run_review(
             ],
             **({"caller_context": caller_context} if caller_context else {}),
         }
+    evidence = review_questions(
+        {"evidence": evidence_question}, "evidence", question_state_override=evidence_state
     )
     evidence_score = float(evidence["answers"]["evidence"])
     logger.info(
@@ -2310,6 +2349,7 @@ def run_review(
                                     "neither": "Neither listed start is proven to capture the complete promotional run while preserving protected speech.",
                                 },
                             },
+                            "added_prefix_return": _prefix_return_question(added_speech or ""),
                         },
                         "choice_rank_start_alternative",
                         question_state_override={
@@ -2327,6 +2367,9 @@ def run_review(
                     )
                     alternative_answer = compared_starts["answers"]["boundary_start_alternative"]
                     alternative_choice = alternative_answer["choice"]
+                    prefix_return_score = float(compared_starts["answers"]["added_prefix_return"])
+                    if alternative_choice == "earlier" and prefix_return_score >= review_programme_veto:
+                        alternative_choice = "selected"
                     if alternative_choice == "neither":
                         _review_unavailable(
                             pool,
@@ -2618,12 +2661,22 @@ def run_review(
                         additions.append(("end", cand_end, proposed[1]))
                 checks = _programme_checks(segments, word_edges, bounds, additions)
                 start_ok, end_ok = "start_speech" in checks, "end_speech" in checks
-                for index, (side, _, _) in enumerate(additions):
-                    if not any(key.startswith(f"added_{index}_") for key in checks):
+                added_prefix_speech = None
+                for index, (side, added_start, added_end) in enumerate(additions):
+                    added_keys = [key for key in checks if key.startswith(f"added_{index}_")]
+                    if not added_keys:
                         if side == "start":
                             start_ok = False
                         else:
                             end_ok = False
+                    if side == "start":
+                        added_prefix_speech = _assessment_speech(
+                            segments, word_edges, (added_start, added_end)
+                        )
+                        if added_prefix_speech:
+                            checks["added_prefix_return"] = _prefix_return_question(added_prefix_speech)
+                        else:
+                            start_ok = False
                 for name, question in checks.items():
                     if name in {"end_speech", "end_tail"} or any(
                         name.startswith(f"added_{index}_") and side == "end"
@@ -2669,6 +2722,7 @@ def run_review(
                             "guidance": focused_guidance,
                             "candidate_interval_speech": interval_speech,
                             "evaluation_rule": _PROGRAMME_CONTEXT_RULE,
+                            **({"added_speech_if_earlier": added_prefix_speech} if added_prefix_speech else {}),
                             **(identity_state if "keep" in category_actions.values() else {}),
                             **policy_state,
                         },
