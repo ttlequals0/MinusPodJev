@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.25 - 2026-09-27
+
+- Anchor review boundaries to the configured removable category run that intersects the candidate. Apply explicit category actions to boundary and safety checks, including kept-category protection.
+- Treat podcast trailers and story teasers that lead to a follow, listen, or subscribe call to action as promotional speech.
+- Compare a selected start with one earlier observed boundary when the transcript may contain an omitted promotional setup. Show both sides of fine word boundaries so opening fragments stay with the promotion.
+- Center coarse end context on a corroborated advertising edge within the configured search cap while retaining the original candidate and supplied boundary options.
+- Preserve same-show follow, subscription, and early-access offers when self-promotion is configured to stay.
+- Compare the selected closing utterance with the next one before placing the final word boundary. This keeps a late sponsor URL inside the cut while leaving the return to the show intact.
+
 ## 0.1.24 - 2026-09-27
 
 - Use supplied word boundaries up to 60 seconds from each review edge. Fine word ranking gets 30 seconds of context centered on the selected coarse boundary.

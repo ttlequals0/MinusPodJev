@@ -21,6 +21,7 @@ from app.services.openai_adapter import (
     _assessment_speech,
     _boundary_candidates,
     _choice_state,
+    _effective_category_actions,
     _neighbor_speech,
     _programme_checks,
     _range_boundary_support,
@@ -1398,11 +1399,12 @@ def test_review_caller_context_reaches_detection_and_all_review_stages(jev_env, 
     _run(prompt, fake, tmp_path, refine_boundaries=True)
 
     caller_context, transcript_text = _review_prompt_parts(prompt)
-    assert len(payloads) == 11
+    assert len(payloads) == 12
     for payload in payloads:
         if (
             "sponsor_read" in payload["questions"]
             or "start_speech" in payload["questions"]
+            or "end_unit_comparison" in payload["questions"]
             or any(key.startswith("boundary_") for key in payload["questions"])
             or all(key.endswith(("_near", "_extended")) for key in payload["questions"])
         ):
@@ -1426,6 +1428,382 @@ def test_review_prompt_without_minuspod_transcript_heading_has_no_caller_context
 
     assert context == ""
     assert transcript_text == prompt
+
+
+def test_effective_category_actions_parse_partial_policy_and_beep():
+    actions = _effective_category_actions(
+        "Podcast: My Podcast\n"
+        "Effective category actions: sponsor=remove, self_promo=keep, interaction=beep\n"
+    )
+
+    assert actions == {
+        "sponsor": "remove", "self_promo": "keep", "interaction": "beep",
+    }
+    assert _effective_category_actions("Podcast: Legacy") == {}
+
+
+def test_effective_category_actions_stops_at_header_line():
+    actions = _effective_category_actions(
+        "Effective category actions: sponsor=remove\n\n"
+        "Evidence envelope: self_promo=keep\n"
+    )
+
+    assert actions == {"sponsor": "remove"}
+
+
+def test_effective_category_actions_ignores_unknown_future_category():
+    actions = _effective_category_actions(
+        "Effective category actions: sponsor=remove, future_category=keep, self_promo=keep"
+    )
+
+    assert actions == {"sponsor": "remove", "self_promo": "keep"}
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Effective category actions: sponsor=remove, sponsor=keep",
+        "Effective category actions: sponsor=drop",
+        "Effective category actions: sponsor",
+        "Effective category actions:",
+    ],
+)
+def test_effective_category_actions_reject_ambiguous_policy(line):
+    with pytest.raises(ValueError):
+        _effective_category_actions(line)
+
+
+def test_duplicate_effective_category_action_headers_are_inconclusive(jev_env, tmp_path):
+    prompt = _meaningful_pair_prompt().replace(
+        "\nTranscript (60s before, the candidate ad, 60s after;",
+        "\nEffective category actions: sponsor=remove\n"
+        "Effective category actions: sponsor=remove\n\n"
+        "Transcript (60s before, the candidate ad, 60s after;",
+    )
+
+    with pytest.raises(ReviewInconclusiveError) as raised:
+        _run(prompt, _select_pair_fake(106.0, 120.0), tmp_path, refine_boundaries=True)
+
+    assert raised.value.reason == "policy_conflict"
+    assert raised.value.stage == "context"
+
+
+async def test_duplicate_effective_category_action_headers_return_policy_conflict(
+    jev_env, client,
+):
+    prompt = _meaningful_pair_prompt().replace(
+        "\nTranscript (60s before, the candidate ad, 60s after;",
+        "\nEffective category actions: sponsor=remove\n"
+        "Effective category actions: sponsor=keep\n\n"
+        "Transcript (60s before, the candidate ad, 60s after;",
+    )
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": prompt}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == 422
+    assert response.headers["x-should-retry"] == "false"
+    assert response.json()["error"]["code"] == "jev_review_inconclusive"
+    assert response.json()["error"]["reason"] == "policy_conflict"
+
+
+@pytest.mark.parametrize(
+    ("policy", "code", "reason"),
+    [
+        (
+            "sponsor=remove, sponsor=keep",
+            "jev_review_inconclusive",
+            "policy_conflict",
+        ),
+        ("sponsor=drop", "jev_review_invalid_request", "malformed_context"),
+    ],
+)
+async def test_effective_category_action_errors_keep_api_semantics(
+    jev_env, client, policy, code, reason,
+):
+    prompt = _meaningful_pair_prompt().replace(
+        "\nTranscript (60s before, the candidate ad, 60s after;",
+        f"\nEffective category actions: {policy}\n\n"
+        "Transcript (60s before, the candidate ad, 60s after;",
+    )
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": prompt}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == 422
+    assert response.headers["x-should-retry"] == "false"
+    assert response.json()["error"]["code"] == code
+    assert response.json()["error"]["reason"] == reason
+
+
+@pytest.mark.parametrize(
+    ("action", "held"),
+    [("keep", True), ("remove", False), ("beep", False)],
+)
+def test_explicit_category_policy_reaches_rank_and_focused_guards(
+    jev_env, tmp_path, action, held,
+):
+    prompt = _meaningful_pair_prompt().replace(
+        "\nTranscript (60s before, the candidate ad, 60s after;",
+        f"\nEffective category actions: sponsor=remove, future_category=remove, self_promo={action}\n\n"
+        "Transcript (60s before, the candidate ad, 60s after;",
+    )
+    normal = _select_pair_fake(106.0, 120.0)
+    observed = []
+
+    def fake(payload, **kwargs):
+        observed.append(payload)
+        result = normal(payload, **kwargs)
+        if "kept_category" in payload["questions"]:
+            result["answers"]["kept_category"] = {"noul": 0.99 if action == "keep" else 0.01}
+        return result
+
+    if held:
+        with pytest.raises(ReviewInconclusiveError) as raised:
+            _run(prompt, fake, tmp_path, refine_boundaries=True)
+        assert raised.value.proposal["reason"] == "programme_content_detected"
+    else:
+        _run(prompt, fake, tmp_path, refine_boundaries=True)
+
+    policy = {"sponsor": "remove", "self_promo": action}
+    relevant = [
+        payload for payload in observed
+        if (
+            any(key.startswith("boundary_") for key in payload["questions"])
+            or "sponsor_read" in payload["questions"]
+            or "start_speech" in payload["questions"]
+            or all(key.endswith(("_near", "_extended")) for key in payload["questions"])
+        )
+    ]
+    assert relevant
+    assert all(payload["state"]["category_actions"] == policy for payload in relevant)
+    assert all(payload["state"]["candidate"] == {"start": 100.0, "end": 120.0}
+               for payload in relevant if any(key.startswith("boundary_") for key in payload["questions"]))
+
+
+@pytest.mark.parametrize("refine_boundaries", [False, True])
+@pytest.mark.parametrize(("kept_score", "held"), [(0.99, True), (0.01, False)])
+def test_keep_policy_is_checked_without_boundary_refinement(
+    jev_env, tmp_path, refine_boundaries, kept_score, held,
+):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(90.0, 100.0, "Editorial before.")],
+        [(100.0, 120.0, "Sponsor and self promotion.")],
+        [(120.0, 130.0, "Editorial after.")],
+    ).replace(
+        "\nTranscript (60s before, the candidate ad, 60s after;",
+        "\nEffective category actions: sponsor=remove, self_promo=keep\n\n"
+        "Transcript (60s before, the candidate ad, 60s after;",
+    )
+    normal = make_text_fake()
+    kept_requests = []
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if "kept_category" in payload["questions"]:
+            kept_requests.append(payload)
+            result["answers"]["kept_category"] = {"noul": kept_score}
+        return result
+
+    if held:
+        with pytest.raises(ReviewInconclusiveError) as raised:
+            _run(prompt, fake, tmp_path, refine_boundaries=refine_boundaries)
+        assert raised.value.reason == "programme_content_detected"
+    else:
+        _run(prompt, fake, tmp_path, refine_boundaries=refine_boundaries)
+
+    assert len(kept_requests) == 1
+    assert kept_requests[0]["state"]["candidate_interval_speech"] == "Sponsor and self promotion."
+    instructions = kept_requests[0]["questions"]["kept_category"]["instructions"]
+    assert instructions["keep_categories"] == ["self_promo"]
+    assert "same podcast" in instructions["category_definitions"]["self_promo"]
+
+
+def test_keep_policy_without_isolatable_candidate_speech_abstains(
+    jev_env, tmp_path, monkeypatch,
+):
+    prompt = build_review_prompt(
+        101.0, 119.0,
+        [(90.0, 100.0, "Editorial before.")],
+        [(100.0, 120.0, "Sponsor and self promotion.")],
+        [(120.0, 130.0, "Editorial after.")],
+    ).replace(
+        "\nTranscript (60s before, the candidate ad, 60s after;",
+        "\nEffective category actions: sponsor=remove, self_promo=keep\n\n"
+        "Transcript (60s before, the candidate ad, 60s after;",
+    )
+
+    original = adapter._assessment_speech
+
+    def missing_returned_speech(segments, word_edges, bounds):
+        if bounds == (100.0, 120.0):
+            return None
+        return original(segments, word_edges, bounds)
+
+    monkeypatch.setattr(adapter, "_assessment_speech", missing_returned_speech)
+    with pytest.raises(ReviewInconclusiveError) as raised:
+        _run(prompt, make_text_fake(), tmp_path, refine_boundaries=False)
+
+    assert raised.value.reason == "insufficient_boundary_text"
+    assert raised.value.stage == "boundary_coverage"
+
+
+def test_keep_policy_checks_broader_detected_interval_without_refinement(
+    jev_env, tmp_path,
+):
+    prompt = build_review_prompt(
+        100.0, 110.0,
+        [(90.0, 100.0, "Editorial before.")],
+        [(100.0, 110.0, "Sponsor offer.")],
+        [(110.0, 120.0, "Self promotion follows."),
+         (120.0, 130.0, "Editorial after.")],
+    ).replace(
+        "\nTranscript (60s before, the candidate ad, 60s after;",
+        "\nEffective category actions: sponsor=remove, self_promo=keep\n\n"
+        "Transcript (60s before, the candidate ad, 60s after;",
+    )
+    normal = make_text_fake(keywords=("sponsor", "self promotion"))
+    kept_requests = []
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if "kept_category" in payload["questions"]:
+            kept_requests.append(payload)
+            result["answers"]["kept_category"] = {"noul": 0.99}
+        return result
+
+    with pytest.raises(ReviewInconclusiveError) as raised:
+        _run(prompt, fake, tmp_path, refine_boundaries=False)
+
+    assert raised.value.reason == "programme_content_detected"
+    assert kept_requests[0]["state"]["candidate"] == {"start": 100.0, "end": 120.0}
+    assert kept_requests[0]["state"]["candidate_interval_speech"] == (
+        "Sponsor offer.\nSelf promotion follows."
+    )
+
+
+@pytest.mark.parametrize("refine_boundaries", [False, True])
+def test_self_promo_keep_vetoes_same_show_access_without_policy_bias(
+    jev_env, tmp_path, refine_boundaries,
+):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(90.0, 100.0, "Thanks for listening to My Podcast.")],
+        [(100.0, 110.0, "Subscribe to My Podcast for early ad-free episodes."),
+         (110.0, 120.0, "Sponsor Acme offers its independent service.")],
+        [(120.0, 130.0, "The paid sponsor follows.")],
+    ).replace(
+        "\nTranscript (60s before, the candidate ad, 60s after;",
+        "\nEffective category actions: sponsor=remove, self_promo=keep\n\n"
+        "Transcript (60s before, the candidate ad, 60s after;",
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] Subscribe\n"
+        "End edge:\n[119.0s-120.0s] episodes.\n"
+    )
+    normal = _select_pair_fake(100.0, 120.0)
+    relation_requests = []
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        relation_names = [
+            name for name in payload["questions"]
+            if name.startswith("same_show_access_")
+        ]
+        if relation_names:
+            relation_requests.append(payload)
+            for name in relation_names:
+                result["answers"][name] = {"noul": 0.97}
+        if "kept_category" in payload["questions"]:
+            result["answers"]["kept_category"] = {"noul": 0.01}
+        return result
+
+    with pytest.raises(ReviewInconclusiveError) as raised:
+        _run(
+            prompt, fake, tmp_path,
+            refine_boundaries=refine_boundaries,
+            review_choice_enter=0.85,
+        )
+
+    assert raised.value.reason == "category_policy_unconfirmed"
+    assert raised.value.stage == "focused_validation"
+    assert raised.value.score == pytest.approx(0.97)
+    assert relation_requests
+    for request in relation_requests:
+        assert request["state"]["podcast"] == "My Podcast"
+        assert request["state"]["episode"] == "Ep 1"
+        assert "Sponsor Acme" in request["state"]["candidate_interval_speech"]
+        assert "category_actions" not in request["state"]
+        assert "category_policy_rule" not in request["state"]
+
+
+@pytest.mark.parametrize("action", ["remove", "beep"])
+def test_self_promo_removal_actions_skip_same_show_access_guard(
+    jev_env, tmp_path, action,
+):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(90.0, 100.0, "The episode ends.")],
+        [(100.0, 120.0, "Subscribe to My Podcast for early ad-free episodes.")],
+        [(120.0, 130.0, "The paid sponsor follows.")],
+    ).replace(
+        "\nTranscript (60s before, the candidate ad, 60s after;",
+        f"\nEffective category actions: sponsor=remove, self_promo={action}\n\n"
+        "Transcript (60s before, the candidate ad, 60s after;",
+    )
+    normal = make_text_fake(keywords=("subscribe",))
+    seen_relation = False
+
+    def fake(payload, **kwargs):
+        nonlocal seen_relation
+        seen_relation |= any(
+            name.startswith("same_show_access_") for name in payload["questions"]
+        )
+        return normal(payload, **kwargs)
+
+    _run(prompt, fake, tmp_path, refine_boundaries=False)
+    assert seen_relation is False
+
+
+def test_self_promo_keep_allows_independent_sponsor(
+    jev_env, tmp_path,
+):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(90.0, 100.0, "The episode ends.")],
+        [(100.0, 120.0, "Sponsor Acme offers its independent subscription service.")],
+        [(120.0, 130.0, "The episode resumes.")],
+    ).replace(
+        "\nTranscript (60s before, the candidate ad, 60s after;",
+        "\nEffective category actions: sponsor=remove, self_promo=keep\n\n"
+        "Transcript (60s before, the candidate ad, 60s after;",
+    )
+    normal = make_text_fake(keywords=("acme",))
+    relation_requests = []
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        relation_names = [
+            name for name in payload["questions"]
+            if name.startswith("same_show_access_")
+        ]
+        if relation_names:
+            relation_requests.append(payload)
+            for name in relation_names:
+                result["answers"][name] = {"noul": 0.02}
+        if "kept_category" in payload["questions"]:
+            result["answers"]["kept_category"] = {"noul": 0.01}
+        return result
+
+    _run(prompt, fake, tmp_path, refine_boundaries=False)
+    assert relation_requests
 
 
 @pytest.mark.parametrize(
@@ -1463,6 +1841,144 @@ def test_opt_in_refinement_applies_selected_meaningful_pair(jev_env, tmp_path, s
     assert (start, end) == expected
 
 
+def test_start_alternative_preserves_provider_choice_when_probability_is_not_max(
+    jev_env, tmp_path,
+):
+    base = _select_pair_fake(106.0, 120.0)
+    alternative_requests = []
+
+    def fake(payload, **kwargs):
+        result = base(payload, **kwargs)
+        if "boundary_start" in payload["questions"]:
+            selected = _boundary_option("boundary_start", 106.0)
+            alternative = _boundary_option("boundary_start", 100.0)
+            criteria = payload["questions"]["boundary_start"]["criteria"]
+            remainder = 0.1 / (len(criteria) - 2)
+            result["answers"]["boundary_start"] = {
+                "choice": selected,
+                "confidence": 0.2,
+                "probabilities": {
+                    key: 0.2 if key == selected else 0.7 if key == alternative else remainder
+                    for key in criteria
+                },
+            }
+        if "boundary_start_alternative" in payload["questions"]:
+            alternative_requests.append(payload)
+            _set_choice_answer(
+                result, payload, "boundary_start_alternative", "selected",
+            )
+        return result
+
+    response = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+
+    assert (ad["start"], ad["end"]) == (106.0, 120.0)
+    assert alternative_requests[0]["state"]["provider_selected"] == "selected"
+    assert alternative_requests[0]["state"]["start_options"]["selected"]["start"] == 106.0
+    assert alternative_requests[0]["state"]["start_options"]["earlier"]["start"] == 100.0
+    assert alternative_requests[0]["state"]["added_speech_if_earlier"] == "Editorial transition."
+
+
+def test_unknown_start_does_not_trigger_alternative_choice(
+    jev_env, tmp_path,
+):
+    base = _select_pair_fake(106.0, 120.0)
+    stages = []
+
+    def fake(payload, **kwargs):
+        result = base(payload, **kwargs)
+        stages.extend(payload["questions"])
+        if "boundary_start" in payload["questions"]:
+            first = _boundary_option("boundary_start", 106.0)
+            second = _boundary_option("boundary_start", 100.0)
+            criteria = payload["questions"]["boundary_start"]["criteria"]
+            remainder = 0.05 / (len(criteria) - 3)
+            result["answers"]["boundary_start"] = {
+                "choice": "unknown",
+                "confidence": 0.3,
+                "probabilities": {
+                    key: 0.3 if key == "unknown" else 0.4 if key == first
+                    else 0.25 if key == second else remainder
+                    for key in criteria
+                },
+            }
+        return result
+
+    response = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+
+    assert (ad["start"], ad["end"]) == (100.0, 120.0)
+    assert "boundary_start_alternative" not in stages
+
+
+def test_start_alternative_neither_is_inconclusive(jev_env, tmp_path):
+    base = _select_pair_fake(106.0, 120.0)
+
+    def fake(payload, **kwargs):
+        result = base(payload, **kwargs)
+        if "boundary_start_alternative" in payload["questions"]:
+            _set_choice_answer(
+                result, payload, "boundary_start_alternative", "neither",
+            )
+        return result
+
+    with pytest.raises(ReviewInconclusiveError) as raised:
+        _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+
+    assert raised.value.reason == "choice_inconclusive"
+    assert raised.value.stage == "choice_rank"
+
+
+def test_single_start_option_skips_alternative_choice(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(90.0, 100.0, "Editorial before.")],
+        [(100.0, 120.0, "Sponsor offer and sign-off.")],
+        [(120.0, 130.0, "Editorial after.")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] Sponsor\n"
+        "End edge:\n[119.0s-120.0s] sign-off.\n"
+    )
+    normal = make_text_fake()
+    stages = []
+
+    def fake(payload, **kwargs):
+        stages.extend(payload["questions"])
+        return normal(payload, **kwargs)
+
+    _run(prompt, fake, tmp_path, refine_boundaries=True)
+
+    assert "boundary_start_alternative" not in stages
+
+
+def test_unsupported_selected_start_skips_alternative_choice(
+    jev_env, tmp_path, monkeypatch,
+):
+    original = adapter._assessment_speech
+
+    def missing_selected_speech(segments, word_edges, bounds):
+        if bounds == (106.0, 120.0):
+            return None
+        return original(segments, word_edges, bounds)
+
+    monkeypatch.setattr(adapter, "_assessment_speech", missing_selected_speech)
+    normal = _select_pair_fake(106.0, 120.0)
+    stages = []
+
+    def fake(payload, **kwargs):
+        stages.extend(payload["questions"])
+        return normal(payload, **kwargs)
+
+    response = _run(
+        _meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True,
+    )
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+
+    assert "boundary_start_alternative" not in stages
+    assert (ad["start"], ad["end"]) == (100.0, 120.0)
+
+
 def test_refinement_centers_fine_context_on_distant_selected_end(jev_env, tmp_path):
     prompt = build_review_prompt(
         100.0, 180.5,
@@ -1479,9 +1995,12 @@ def test_refinement_centers_fine_context_on_distant_selected_end(jev_env, tmp_pa
     )
     select = _select_pair_fake(100.0, 144.0)
     fine_contexts = []
+    coarse_contexts = []
 
     def fake(payload, **kwargs):
         result = select(payload, **kwargs)
+        if "boundary_end" in payload["questions"]:
+            coarse_contexts.append(payload["state"]["end_context"])
         if "boundary_end_word" in payload["questions"]:
             fine_contexts.append(payload["state"]["end_context"])
         if "interval_comparison" in payload["questions"]:
@@ -1491,11 +2010,45 @@ def test_refinement_centers_fine_context_on_distant_selected_end(jev_env, tmp_pa
     response = _run(prompt, fake, tmp_path, refine_boundaries=True)
     ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
 
+    assert len(coarse_contexts) == 1
+    assert "Acme sponsor offer and sign-off" in coarse_contexts[0]
+    assert "Back to the discussion" in coarse_contexts[0]
+    assert "More discussion follows" not in coarse_contexts[0]
     assert len(fine_contexts) == 1
     assert "Acme sponsor offer and sign-off" in fine_contexts[0]
     assert "Back to the discussion" in fine_contexts[0]
     assert "More discussion follows" not in fine_contexts[0]
     assert (ad["start"], ad["end"]) == (100.0, 144.0)
+
+
+def test_coarse_end_context_rejects_detector_edge_beyond_search_cap(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        100.0, 180.0,
+        [(90.0, 100.0, "Discussion ends.")],
+        [(100.0, 140.0, "Sponsor opening."),
+         (140.0, 180.0, "Candidate sponsor ending."),
+         (180.0, 205.0, "Bridge sponsor speech."),
+         (205.0, 245.0, "Later sponsor message.")],
+        [(245.0, 270.0, "After the later message.")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] Sponsor\n"
+        "End edge:\n[179.0s-180.0s] ending.\n"
+    )
+    normal = _select_pair_fake(100.0, 180.0)
+    end_contexts = []
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        if "boundary_end" in payload["questions"]:
+            end_contexts.append(payload["state"]["end_context"])
+        return result
+
+    _run(prompt, fake, tmp_path, refine_boundaries=True)
+
+    assert len(end_contexts) == 1
+    assert "Candidate sponsor ending." in end_contexts[0]
+    assert "After the later message." not in end_contexts[0]
 
 
 def test_supported_expansion_does_not_require_partial_added_delta(jev_env, tmp_path):
@@ -1704,7 +2257,8 @@ def test_rank_state_uses_nearby_context_without_duplicate_word_arrays(jev_env, t
         if "boundary_start" in payload["questions"]:
             state = payload["state"]
             assert "Editorial before" in state["start_context"]
-            assert set(state) == {"start_context"}
+            assert set(state) == {"candidate", "start_context"}
+            assert state["candidate"] == {"start": 100.0, "end": 120.0}
             assert any(
                 option.startswith("The sponsor message begins with:")
                 for option in payload["questions"]["boundary_start"]["criteria"].values()
@@ -1757,7 +2311,7 @@ def test_end_word_options_allow_a_complete_closing_phrase_at_context_end():
 
     question, _ = adapter._word_end_question(words, [101.0, 102.0, 103.0], words)
 
-    assert "complete sponsor URL" in question["instructions"]
+    assert "complete URL" in question["instructions"]
     assert any(
         "removed speech ends: 'Visit example .com'" in option
         and "no later speech is present" in option
@@ -1818,6 +2372,69 @@ def test_large_end_unit_groups_every_word_end_before_exact_selection():
     assert len(groups) == 4
     assert "Every eligible word end appears in one group" in question["instructions"]
     assert any("following speech" in text for text in question["criteria"].values())
+
+
+@pytest.mark.parametrize(
+    ("pair_choice", "expected_end"),
+    [("following", 123.0), ("selected", 120.0), ("unknown", None)],
+)
+def test_adjacent_end_unit_comparison_recovers_closing_url(
+    jev_env, tmp_path, pair_choice, expected_end,
+):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(90.0, 100.0, "Editorial discussion ends.")],
+        [(100.0, 115.0, "Acme sponsor offer."),
+         (115.0, 120.0, "Use Acme.")],
+        [(120.0, 126.0, "I trust Acme .com. Back to the show."),
+         (126.0, 130.0, "Editorial discussion resumes.")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] Acme\n"
+        "End edge:\n[119.0s-120.0s] Acme.\n"
+        "[120.0s-121.0s] I\n[121.0s-121.5s] trust\n"
+        "[121.5s-122.0s] Acme\n[122.0s-123.0s] .com.\n"
+        "[123.0s-124.0s] Back\n[124.0s-124.5s] to\n"
+        "[124.5s-125.0s] the\n[125.0s-126.0s] show.\n"
+    )
+    normal = make_text_fake()
+    compared = []
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        questions = payload["questions"]
+        if "boundary_end" in questions:
+            _set_choice_answer(
+                result, payload, "boundary_end", _end_unit_option(120.0),
+            )
+        if "end_unit_comparison" in questions:
+            compared.append(questions["end_unit_comparison"]["criteria"])
+            _set_choice_answer(result, payload, "end_unit_comparison", pair_choice)
+            if pair_choice == "selected":
+                result["answers"]["end_unit_comparison"]["probabilities"] = {
+                    "selected": 0.09, "following": 0.90, "unknown": 0.01,
+                }
+        if "boundary_end_word" in questions:
+            _set_choice_answer(
+                result, payload, "boundary_end_word",
+                _boundary_option("boundary_end_word", expected_end or 120.0),
+            )
+        if "interval_comparison" in questions:
+            _set_choice_answer(result, payload, "interval_comparison", "adjusted")
+        return result
+
+    if pair_choice == "unknown":
+        with pytest.raises(ReviewInconclusiveError) as error:
+            _run(prompt, fake, tmp_path, refine_boundaries=True)
+        assert error.value.reason == "choice_inconclusive"
+        assert error.value.stage == "choice_rank"
+    else:
+        response = _run(prompt, fake, tmp_path, refine_boundaries=True)
+        ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+        assert (ad["start"], ad["end"]) == (100.0, expected_end)
+
+    assert len(compared) == 1
+    assert "Acme" in compared[0]["following"]
 
 
 def test_oversized_end_group_choice_keeps_supported_original(
@@ -1907,9 +2524,9 @@ def test_incomplete_edge_reranks_once_with_side_specific_context(jev_env, tmp_pa
     )
 
     assert len(start_rank_payloads) == 2
-    assert set(start_rank_payloads[0]["state"]) == {"start_context"}
+    assert set(start_rank_payloads[0]["state"]) == {"candidate", "start_context"}
     assert set(start_rank_payloads[1]["state"]) == {
-        "start_context", "nearest_outside_speech", "farther_outside_context",
+        "candidate", "start_context", "nearest_outside_speech", "farther_outside_context",
     }
     base = start_rank_payloads[0]["questions"]["boundary_start"]["instructions"]
     rerank = start_rank_payloads[1]["questions"]["boundary_start"]["instructions"]
@@ -2077,7 +2694,7 @@ def test_refinement_rank_and_pair_use_warm_cache(jev_env, tmp_path):
     first = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
     second = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
 
-    assert calls == 7
+    assert calls == 9
     assert first["choices"][0]["message"]["content"] == second["choices"][0]["message"]["content"]
 
 
@@ -2092,8 +2709,80 @@ def test_refinement_stages_share_one_deadline(jev_env, tmp_path, monkeypatch):
     monkeypatch.setattr(jev, "call_payload", fake)
     _run(_meaningful_pair_prompt(), None, tmp_path, refine_boundaries=True)
 
-    assert len(deadlines) == 7
+    assert len(deadlines) == 9
     assert len(set(deadlines)) == 1
+
+
+def test_start_alternative_shares_deadline_and_accumulates_usage(
+    jev_env, tmp_path, monkeypatch,
+):
+    deadlines = []
+    stages = []
+    normal = make_text_fake(input_tokens=10, output_tokens=2)
+
+    def fake(payload, **kwargs):
+        deadlines.append(kwargs["deadline_at"])
+        stages.extend(payload["questions"])
+        result = normal(payload, **kwargs)
+        _override_boundaries(result, payload, 106.0, 120.0)
+        if "boundary_start_alternative" in payload["questions"]:
+            _set_choice_answer(
+                result, payload, "boundary_start_alternative", "selected",
+            )
+        return result
+
+    monkeypatch.setattr(jev, "call_payload", fake)
+    response = _run(
+        _meaningful_pair_prompt(), None, tmp_path, refine_boundaries=True,
+    )
+
+    assert "boundary_start_alternative" in stages
+    assert len(set(deadlines)) == 1
+    assert response["usage"] == {
+        "prompt_tokens": len(deadlines) * 10,
+        "completion_tokens": len(deadlines) * 2,
+        "total_tokens": len(deadlines) * 12,
+    }
+
+
+def test_same_show_guard_shares_deadline_and_accumulates_usage(
+    jev_env, tmp_path, monkeypatch,
+):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(90.0, 100.0, "The episode ends.")],
+        [(100.0, 120.0, "Sponsor Acme offers its independent subscription service.")],
+        [(120.0, 130.0, "The episode resumes.")],
+    ).replace(
+        "\nTranscript (60s before, the candidate ad, 60s after;",
+        "\nEffective category actions: sponsor=remove, self_promo=keep\n\n"
+        "Transcript (60s before, the candidate ad, 60s after;",
+    )
+    deadlines = []
+    stages = []
+    normal = make_text_fake(input_tokens=10, output_tokens=2)
+
+    def fake(payload, **kwargs):
+        deadlines.append(kwargs["deadline_at"])
+        stages.extend(payload["questions"])
+        result = normal(payload, **kwargs)
+        for name in payload["questions"]:
+            if name.startswith("same_show_access_"):
+                result["answers"][name] = {"noul": 0.02}
+        if "kept_category" in payload["questions"]:
+            result["answers"]["kept_category"] = {"noul": 0.01}
+        return result
+
+    monkeypatch.setattr(jev, "call_payload", fake)
+    response = _run(prompt, None, tmp_path, refine_boundaries=False)
+
+    assert any(name.startswith("same_show_access_") for name in stages)
+    assert len(set(deadlines)) == 1
+    assert response["usage"] == {
+        "prompt_tokens": len(deadlines) * 10,
+        "completion_tokens": len(deadlines) * 2,
+        "total_tokens": len(deadlines) * 12,
+    }
 
 
 def test_refinement_gates_never_enter_choice(jev_env, tmp_path):
@@ -2428,7 +3117,7 @@ def test_comparison_neither_rejects_safe_alternatives(jev_env, tmp_path):
     assert raised.value.proposal is None
     assert raised.value.fallback is None
     assert states["evidence"]["candidate"] == {"start": 100.0, "end": 120.0}
-    assert set(states["boundary_start"]) == {"start_context"}
+    assert set(states["boundary_start"]) == {"candidate", "start_context"}
     assert "assessment_range" not in states["evidence"]
     assert "assessment_range" not in states["boundary_start"]
     assert states["interval_comparison"]["proposed_speech"] == "Sponsor offer ends.\nSponsor continues."
@@ -2581,6 +3270,47 @@ async def test_review_api_keeps_range_reason_and_counts_decisive_programme_veto(
     assert error["proposal"]["reason"] == "programme_content_detected"
     assert error["fallback"]["reason"] == "missing_boundary_coverage"
     assert metrics.snapshot()["review"]["reasons"]["programme_content_detected"] == 1
+
+
+async def test_review_api_reports_same_show_policy_veto(
+    jev_env, client, monkeypatch,
+):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(90.0, 100.0, "Thanks for listening to My Podcast.")],
+        [(100.0, 110.0, "Subscribe to My Podcast for early ad-free episodes."),
+         (110.0, 120.0, "Sponsor Acme offers its independent service.")],
+        [(120.0, 130.0, "The episode resumes.")],
+    ).replace(
+        "\nTranscript (60s before, the candidate ad, 60s after;",
+        "\nEffective category actions: sponsor=remove, self_promo=keep\n\n"
+        "Transcript (60s before, the candidate ad, 60s after;",
+    )
+    normal = make_text_fake()
+
+    def fake(payload, **kwargs):
+        result = normal(payload, **kwargs)
+        for name in payload["questions"]:
+            if name.startswith("same_show_access_"):
+                result["answers"][name] = {"noul": 0.97}
+        if "kept_category" in payload["questions"]:
+            result["answers"]["kept_category"] = {"noul": 0.01}
+        return result
+
+    monkeypatch.setattr(jev, "call_payload", fake)
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": prompt}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    error = response.json()["error"]
+    assert response.status_code == 422
+    assert error["reason"] == "category_policy_unconfirmed"
+    assert error["stage"] == "focused_validation"
+    assert error["score"] == pytest.approx(0.97)
+    assert error["threshold"] == pytest.approx(0.85)
+    assert metrics.snapshot()["review"]["reasons"]["category_policy_unconfirmed"] == 1
 
 
 async def test_review_api_reports_unaligned_boundary_text_as_inconclusive(jev_env, client, monkeypatch):

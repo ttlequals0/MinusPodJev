@@ -222,6 +222,8 @@ _INCONCLUSIVE_REASONS = frozenset(
         "unrelated_editorial",
         "missing_boundary_coverage",
         "insufficient_boundary_text",
+        "policy_conflict",
+        "category_policy_unconfirmed",
     }
 )
 _INCONCLUSIVE_STAGES = frozenset(
@@ -241,6 +243,8 @@ _METRIC_REASONS = frozenset(
         "neither_complete",
         "ad_content_unconfirmed",
         "programme_content_detected",
+        "policy_conflict",
+        "category_policy_unconfirmed",
         "malformed_context",
         "missing_boundary_coverage",
         "insufficient_boundary_text",
