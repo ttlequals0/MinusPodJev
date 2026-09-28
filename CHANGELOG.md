@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.26 - 2026-09-28
+
+- Include consecutive removable ads and produced trailers in one review cut. Preserve programme and configured keep speech, and validate an aligned earlier end if extending the cut fails safety checks.
+
 ## 0.1.25 - 2026-09-27
 
 - Anchor review boundaries to the configured removable category run that intersects the candidate. Apply explicit category actions to boundary and safety checks, including kept-category protection.

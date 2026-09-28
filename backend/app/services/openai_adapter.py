@@ -1022,7 +1022,7 @@ def _unit_end_question(
         unit for unit in _word_units(words, segments)
         if any(float(unit[0]["start"]) <= value <= float(unit[-1]["end"]) for value in ends)
     ]
-    criteria = {"unknown": "No listed utterance contains the final sponsor word."}
+    criteria = {"unknown": "No listed utterance contains the final removable promotional word."}
     mapping: dict[str, list[dict[str, Any]] | float] = {}
     for index, unit in enumerate(units):
         key = f"unit_{index:02d}"
@@ -1045,7 +1045,7 @@ def _unit_end_question(
         mapping["original"] = original
     return {
         "type": "choice",
-        "instructions": "Which target utterance contains the final promotional word of the complete consecutive removable break that intersects the candidate, including every adjacent removal-eligible read when no independent programme or keep speech separates them? When category_actions is supplied, remove and beep are eligible while keep must be preserved. Include each offer, URL, conversational thanks, call to action, and sign-off. Do not jump across independent programme speech or a keep message to a later break. The correct utterance may continue into independent show speech after its promotional words. Choose unknown if none fits.",
+        "instructions": "Which target utterance contains the final removable promotional word before the first independent programme or keep-category speech? Include all consecutive removal-eligible messages that intersect the candidate, even when adjacent messages promote different sponsors, shows, or products. When category_actions is supplied, remove and beep are eligible while keep must be preserved. Include each offer, URL, conversational thanks, call to action, and sign-off. Do not jump across independent programme speech or a keep message to a later break. The correct utterance may continue into independent show speech after its promotional words. Choose unknown if none fits.",
         "criteria": criteria,
     }, mapping
 
@@ -1130,8 +1130,8 @@ _PROGRAMME_CRITERIA = {
     "false": "The target contains only the sponsor or promotional read, including narrative setup, personal story used to lead into the product, sponsor-related conversational thanks, offer, URL, or disclaimer. A pronoun referring to the sponsor in a brief relationship remark continues the sign-off. Brief break navigation without episode discussion is separate.",
 }
 _CONTINUITY_CRITERIA = {
-    "true": "The target has moved away from a commercial message into independent episode conversation, reporting, interview, news, or a spoken return to the show. It introduces substantive programme content rather than setting up a sponsor product, problem, claim, or offer. Judge only the target using the words before and after to locate the change in function.",
-    "false": "The target continues the commercial message. Product explanation, a demonstration, sponsor-related commentary, an offer, URL, or thanks remains promotional while that sponsor presentation continues. Generic rhetoric, a curiosity hook, or a fact teaser also remains promotional when surrounding speech connects it to the sponsor's product, problem, claim, or offer.",
+    "true": "The target has moved from removable promotion into independent episode conversation, reporting, interview, news, a spoken return to the show, or a keep-category message. It introduces protected speech rather than continuing the removable break. Judge only the target using the words before and after to locate the change in function.",
+    "false": "The target remains in the removable promotional break, including a distinct adjacent ad for another sponsor, show, or product. Product explanation, a demonstration, sponsor-related commentary, an offer, URL, or thanks remains promotional. Generic rhetoric, a curiosity hook, or a fact teaser also remains promotional when surrounding speech connects it to the promoted product, problem, claim, or offer.",
 }
 _PROGRAMME_CONTEXT_RULE = (
     "Judge only target_speech. Use candidate_interval_speech to identify the target function, not mere proximity. A host anecdote, origin story, personal experience, character scene, or role-play remains promotional when it functions as the setup or argument for a sponsor-specific problem, claim, product, offer, or call to action later in the same produced commercial. A separate sponsor elsewhere in candidate_interval_speech does not make an independent anecdote or programme segment promotional."
@@ -1257,9 +1257,9 @@ def _continuity_question(before: str, target: str, after: str, *, whole: bool = 
         "type": "noul",
         "instructions": {
             "question": (
-                "Does any speech in target_speech move away from a commercial message into independent programme speech?"
+                "Does any speech in target_speech move away from the consecutive removable promotional break into independent programme or keep-category speech?"
                 if whole else
-                "Has target_speech moved away from the commercial message into independent programme speech?"
+                "Has target_speech moved away from the consecutive removable promotional break into independent programme or keep-category speech?"
             ),
             "speech_before": before,
             "target_speech": target,
@@ -1300,12 +1300,12 @@ def _promotion_question(speech: str) -> dict[str, Any]:
     return {
         "type": "noul",
         "instructions": {
-            "question": "Is this passage a sponsor read or an inserted promotional advertisement?",
+            "question": "Does this passage contain a sponsor ad, a commercial trailer for another programme, or a promotional call to watch, listen, or buy?",
             "speech": speech,
         },
         "criteria": {
-            "true": "The passage is a sponsor or promotional read. Conversational setup, product demonstration, a personal anecdote used in the pitch, disclaimers, offers, URLs, thanks, and multiple consecutive sponsors belong to the read.",
-            "false": "The passage is programme reporting or discussion that merely mentions a brand, or it combines advertising with substantive show discussion.",
+            "true": "At least one sponsor ad or promotional trailer is present. A third-party network tune-in spot is advertising even if it includes programme clips or excited dialogue. Staged scenes, demonstrations, pitch anecdotes, disclaimers, offers, URLs, and thanks remain part of advertising.",
+            "false": "The passage has no sponsor ad or promotional trailer. It is only independent episode speech, a keep-category message, or discussion that mentions a brand.",
         },
     }
 
@@ -2005,12 +2005,17 @@ def run_review(
                 and abs(ad_end - cand_end) <= _BOUNDARY_CANDIDATE_CAP_SECONDS
                 else cand_end
             )
-            coarse_end_context = _choice_state(
-                coarse_segments,
-                (cand_start, end_context_center),
-                review_guidance,
-                caller_context,
-            )["end_context"]
+
+            def end_context(*centers: float) -> str:
+                return "\n".join(dict.fromkeys(
+                    line
+                    for center in sorted({*centers, cand_end})
+                    for line in _choice_state(
+                        coarse_segments, (cand_start, center), review_guidance, caller_context,
+                    )["end_context"].splitlines()
+                ))
+
+            coarse_end_context = end_context(end_context_center)
 
             def fine_choice_state(
                 side: str,
@@ -2021,9 +2026,12 @@ def run_review(
                     (selected, cand_end) if side == "start" else (cand_start, selected)
                 )
                 state = dict(base)
-                state[f"{side}_context"] = _choice_state(
-                    coarse_segments, centered, review_guidance, caller_context,
-                )[f"{side}_context"]
+                state[f"{side}_context"] = (
+                    end_context(selected) if side == "end" else
+                    _choice_state(
+                        coarse_segments, centered, review_guidance, caller_context,
+                    )[f"{side}_context"]
+                )
                 return state
 
             start_ranked = review_questions(
@@ -2093,11 +2101,105 @@ def run_review(
                 return fine_value
 
             fine_end = None
+            initial_end_choice = end_answer["choice"]
             if end_answer["choice"] != "unknown":
                 selected_end_choice = end_answer["choice"]
                 end_keys = list(end_units)
                 selected_index = end_keys.index(selected_end_choice)
-                if selected_index + 1 < len(end_keys):
+                end_word_units = {
+                    key: value for key, value in end_units.items() if isinstance(value, list)
+                }
+                later_in_candidate = any(
+                    key in end_word_units
+                    and float(end_word_units[key][0]["start"]) < cand_end
+                    for key in end_keys[selected_index + 1:]
+                )
+                if later_in_candidate and selected_end_choice in end_word_units:
+                    candidate_tail = " ".join(
+                        str(word["text"]).strip()
+                        for key in end_keys[selected_index + 1:]
+                        if key in end_word_units
+                        and float(end_word_units[key][0]["start"]) < cand_end
+                        for word in end_word_units[key]
+                    )
+                    compared = review_questions(
+                        {
+                            "end_run_category": {
+                                "type": "choice",
+                                "instructions": "Classify how candidate_tail begins using end_context to resolve its function. Choose removable for another sponsor message or produced promotional trailer continuing the break. A staged scene is promotional only when contiguous following speech actually connects it to an advertiser, offer, or call to action. A question followed by ordinary episode conversation or a spoken return naming the current podcast is protected speech, not a promotion merely because it follows an ad. Apply category_actions and keep categories. Choose mixed when protected speech comes before a later promotion. Choose unknown when the supplied words do not settle this.",
+                                "criteria": {
+                                    "removable": "The tail begins with an uninterrupted commercial message, sponsor spot, or produced trailer promoting another programme; it may end with a return to the episode after the final ad.",
+                                    "protected": "The tail begins with current-episode speech, including hosts identifying their own podcast, or a keep-category message.",
+                                    "mixed": "Independent programme or keep-category speech separates the selected promotion from a later promotion.",
+                                    "unknown": "The candidate tail cannot be classified from the supplied transcript.",
+                                },
+                            },
+                        },
+                        "choice_rank_end_run_category",
+                        question_state_override={
+                            "candidate_tail": candidate_tail,
+                            "end_context": coarse_end_context,
+                            **boundary_state,
+                        },
+                    )
+                    compared_choice = compared["answers"]["end_run_category"]["choice"]
+                    if compared_choice == "unknown":
+                        _review_unavailable(
+                            pool, "Jev could not classify speech after the selected ad",
+                            review_request_id, reason="choice_inconclusive", stage="choice_rank",
+                            cache_hit=bool(compared["cache_hit"]),
+                        )
+                    logger.info(
+                        "review request_id=%s stage=choice_rank_end_run_category choice=%s cache_hit=%s",
+                        review_request_id, compared_choice, compared["cache_hit"],
+                    )
+                    if compared_choice == "removable":
+                        transition_keys = [
+                            key for key in end_keys[selected_index + 1:]
+                            if key in end_word_units
+                            and float(end_word_units[key][0]["start"]) <= cand_end + _BOUNDARY_CONTEXT_SECONDS
+                        ]
+                        transition_criteria = {"unknown": "The final promotional utterance is not supported by the supplied speech."}
+                        for index, key in enumerate(transition_keys):
+                            transition_unit = end_word_units[key]
+                            following = [
+                                word for next_key in transition_keys[index + 1:index + 4]
+                                for word in end_word_units[next_key]
+                            ]
+                            transition_criteria[key] = (
+                                f"Potential final utterance at {float(transition_unit[0]['start']):.2f}s-"
+                                f"{float(transition_unit[-1]['end']):.2f}s: "
+                                f"{' '.join(str(word['text']).strip() for word in transition_unit)!r}; "
+                                f"following utterances: {' '.join(str(word['text']).strip() for word in following)!r}"
+                            )
+                        transition = review_questions(
+                            {
+                                "end_transition": {
+                                    "type": "choice",
+                                    "instructions": "The complete candidate_tail continues this removable break. Choose the utterance containing its final promotional word before independent programme or keep-category speech begins. A later word-level question will place the exact boundary, including within a mixed utterance. A staged scene or network tune-in trailer may reveal its advertiser only after several lines; inspect all candidate_tail. Do not jump across independent programme or keep speech to a later promotion. Choose unknown when no listed utterance is supported.",
+                                    "criteria": transition_criteria,
+                                },
+                            },
+                            "choice_rank_end_transition",
+                            question_state_override={
+                                "candidate_tail": candidate_tail,
+                                "end_context": coarse_end_context,
+                                **boundary_state,
+                            },
+                        )
+                        transition_choice = transition["answers"]["end_transition"]["choice"]
+                        if transition_choice == "unknown":
+                            _review_unavailable(
+                                pool, "Jev could not locate the final promotional utterance",
+                                review_request_id, reason="choice_inconclusive", stage="choice_rank",
+                                cache_hit=bool(transition["cache_hit"]),
+                            )
+                        selected_end_choice = transition_choice
+                        logger.info(
+                            "review request_id=%s stage=choice_rank_end_transition choice=%s cache_hit=%s",
+                            review_request_id, selected_end_choice, transition["cache_hit"],
+                        )
+                elif selected_index + 1 < len(end_keys):
                     following_choice = end_keys[selected_index + 1]
                     selected_candidate = end_units[selected_end_choice]
                     following_candidate = end_units[following_choice]
@@ -2106,7 +2208,7 @@ def run_review(
                             {
                                 "end_unit_comparison": {
                                     "type": "choice",
-                                    "instructions": "Choose which target utterance contains the final promotional word before independent programme speech begins. Include the sponsor-specific conversational endorsement, full URL and closing sign-off. The selected utterance can also contain the first programme words; a later fine word question will separate them. Choose unknown only when the supplied transcript cannot distinguish these utterances.",
+                                    "instructions": "Choose which target utterance contains the final removable promotional word before independent programme or keep-category speech begins. Include a distinct adjacent promotion when no protected speech separates it from the first read. Include each full URL and closing sign-off. The selected utterance can also contain the first programme words; a later fine word question will separate them. Choose unknown only when the supplied transcript cannot distinguish these utterances.",
                                     "criteria": {
                                         "selected": end_unit_question["criteria"][selected_end_choice],
                                         "following": end_unit_question["criteria"][following_choice],
@@ -2140,6 +2242,15 @@ def run_review(
                     fine_end = select_end_word(
                         selected_unit, {"end_context": coarse_end_context, **boundary_state},
                     )
+            fallback_end = None
+            if initial_end_choice != "unknown" and selected_end_choice != initial_end_choice:
+                initial_unit = end_units[initial_end_choice]
+                fallback_end = (
+                    initial_unit if isinstance(initial_unit, float) else
+                    select_end_word(
+                        initial_unit, {"end_context": coarse_end_context, **boundary_state},
+                    )
+                )
             start_choice = start_answer["choice"]
             if fine_end is not None and start_choice in start_values:
                 selected_start = start_values[start_choice]
@@ -2181,19 +2292,13 @@ def run_review(
                     earlier_choice = ""
                 if earlier_choice:
                     comparison_choices = [start_choice, earlier_choice]
-                    option_values = {
-                        "selected": selected_start,
-                        "earlier": earlier_start,
-                    }
-                    option_speech = {
-                        "selected": selected_speech,
-                        "earlier": earlier_speech,
-                    }
+                    option_values = {"selected": selected_start, "earlier": earlier_start}
+                    option_speech = {"selected": selected_speech, "earlier": earlier_speech}
                     compared_starts = review_questions(
                         {
                             "boundary_start_alternative": {
                                 "type": "choice",
-                                "instructions": "Which start boundary captures the complete removal-eligible promotional run that intersects the candidate while preserving independent programme speech and every keep category? Choose earlier only when its added speech functions as the setup, trailer, story excerpt, fact hook, teaser, staged scene, role-play, or other part of the same produced promotion. Choose selected when the added speech before it is programme content, generic show or break navigation such as a transition into ads, or a separate promotion. Choose neither when the transcript does not settle this.",
+                                "instructions": "Which start boundary captures the complete removal-eligible promotional run that intersects the candidate while preserving independent programme speech and every keep category? Choose earlier when its added speech functions as the setup, trailer, story excerpt, fact hook, teaser, staged scene, role-play, or other part of the same produced promotion. Choose selected when the added speech before it is programme content, generic show or break navigation, or a separate promotion. Choose neither when the transcript does not settle this.",
                                 "criteria": {
                                     **{
                                         key: (
@@ -2211,11 +2316,7 @@ def run_review(
                             "start_context": rank_state["start_context"],
                             "candidate": {"start": cand_start, "end": cand_end},
                             "start_options": {
-                                key: {
-                                    "start": value,
-                                    "end": fine_end,
-                                    "speech": option_speech[key],
-                                }
+                                key: {"start": value, "end": fine_end, "speech": option_speech[key]}
                                 for key, value in option_values.items()
                             },
                             "provider_selected": "selected",
@@ -2401,10 +2502,18 @@ def run_review(
                         "review request_id=%s stage=choice_rank_%s_recheck choice=%s selected_time=%s cache_hit=%s",
                         review_request_id, side, choice, selected[0] if side == "start" else selected[1], reranked["cache_hit"],
                     )
+            original_bounds = cand
+            if fallback_end is not None and not all(_range_boundary_support(coarse_segments, word_edges, cand)):
+                fallback_bounds = (proposed[0], fallback_end)
+                if _valid_pair(
+                    *fallback_bounds, cand, (ad_start, ad_end),
+                    boundary_context_start, boundary_context_end,
+                ):
+                    original_bounds = fallback_bounds
             original_start_supported, original_end_supported = _range_boundary_support(
-                coarse_segments, word_edges, cand
+                coarse_segments, word_edges, original_bounds
             )
-            original_speech = _assessment_speech(segments, word_edges, cand)
+            original_speech = _assessment_speech(segments, word_edges, original_bounds)
             original_supported = original_start_supported and original_end_supported and bool(original_speech)
             proposed_start_supported, proposed_end_supported = _range_boundary_support(
                 coarse_segments, word_edges, proposed
@@ -2444,7 +2553,7 @@ def run_review(
             selected_choice: str | None = None
             selected_probability: float | None = None
             runner_up: float | None = None
-            if proposed_supported and original_supported:
+            if proposed_supported and original_supported and original_bounds == cand:
                 context = _choice_state(
                     coarse_segments, cand, review_guidance, caller_context,
                 )
@@ -2453,7 +2562,7 @@ def run_review(
                     "proposed_interval": {"start": proposed[0], "end": proposed[1]},
                     "proposed_speech": proposed_speech or "",
                     "proposed_eligible": True,
-                    "original_interval": {"start": cand_start, "end": cand_end},
+                    "original_interval": {"start": original_bounds[0], "end": original_bounds[1]},
                     "original_speech": original_speech or "",
                     "original_eligible": True,
                     "start_context": context["start_context"],
@@ -2463,7 +2572,7 @@ def run_review(
                 }
                 if caller_context:
                     comparison_state["caller_context"] = caller_context
-                for label, bounds in (("original", cand), ("proposed", proposed)):
+                for label, bounds in (("original", original_bounds), ("proposed", proposed)):
                     for edge, direction, value in (
                         ("start", "before", bounds[0]), ("end", "after", bounds[1]),
                     ):
@@ -2497,7 +2606,7 @@ def run_review(
             focused_guidance = _focused_guidance(review_guidance)
             for label, bounds, eligible, interval_speech in (
                 ("proposed", proposed, proposed_supported, proposed_speech),
-                ("original", cand, original_supported, original_speech),
+                ("original", original_bounds, original_supported, original_speech),
             ):
                 if not eligible or not interval_speech:
                     continue
@@ -2622,14 +2731,14 @@ def run_review(
                 and runner_up is not None
                 and selected_probability > runner_up
             )
-            if proposed_safe and (not original_safe or prefer_adjusted):
+            if proposed_safe and (not original_safe or prefer_adjusted or original_bounds != cand):
                 ad_start, ad_end = proposed
                 metrics.record_review_refinement(
                     "completed", changed=abs(proposed[0] - cand_start) > 0.1 or abs(proposed[1] - cand_end) > 0.1,
                 )
             elif original_safe:
-                ad_start, ad_end = cand
-                metrics.record_review_refinement("completed", changed=False)
+                ad_start, ad_end = original_bounds
+                metrics.record_review_refinement("completed", changed=original_bounds != cand)
             else:
                 metrics.record_review_refinement("inconclusive")
                 def diagnostic(label: str, bounds: tuple[float, float], supported: bool,
@@ -2686,7 +2795,7 @@ def run_review(
                     if proposed != cand else None
                 )
                 fallback_diagnostic = diagnostic(
-                    "original", cand, original_supported,
+                    "original", original_bounds, original_supported,
                     original_start_supported, original_end_supported,
                 )
                 primary = fallback_diagnostic if original_supported else proposal_diagnostic or fallback_diagnostic

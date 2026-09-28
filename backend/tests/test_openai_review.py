@@ -652,7 +652,24 @@ def make_text_fake(*, keywords=_AD_KW, input_tokens=1200, output_tokens=6, raise
             question = payload["questions"][key]
             criteria = question.get("criteria", {})
             if question.get("type") == "choice":
-                if key == "boundary_start":
+                if key == "end_run_category":
+                    tail = payload["state"]["candidate_tail"].lower()
+                    first_promo = min(
+                        (tail.find(marker) for marker in ("sponsor", "tonight on", "promo code")
+                         if marker in tail),
+                        default=len(tail),
+                    )
+                    first_protected = min(
+                        (tail.find(marker) for marker in ("welcome back", "editorial", "episode story")
+                         if marker in tail),
+                        default=len(tail),
+                    )
+                    option = (
+                        "mixed" if first_protected < first_promo < len(tail) else
+                        "protected" if first_protected < len(tail) else
+                        "removable" if first_promo < len(tail) else "protected"
+                    )
+                elif key == "boundary_start":
                     option = next((name for name, value in _START_OPTIONS.items() if value == candidate.get("start")), next(name for name in criteria if name != "unknown"))
                 elif key == "boundary_start_word":
                     option = next((name for name, value in _WORD_START_OPTIONS.items() if value == candidate.get("start")), "unknown")
@@ -1405,6 +1422,8 @@ def test_review_caller_context_reaches_detection_and_all_review_stages(jev_env, 
             "sponsor_read" in payload["questions"]
             or "start_speech" in payload["questions"]
             or "end_unit_comparison" in payload["questions"]
+            or "end_run_category" in payload["questions"]
+            or "end_transition" in payload["questions"]
             or any(key.startswith("boundary_") for key in payload["questions"])
             or all(key.endswith(("_near", "_extended")) for key in payload["questions"])
         ):
@@ -2013,11 +2032,11 @@ def test_refinement_centers_fine_context_on_distant_selected_end(jev_env, tmp_pa
     assert len(coarse_contexts) == 1
     assert "Acme sponsor offer and sign-off" in coarse_contexts[0]
     assert "Back to the discussion" in coarse_contexts[0]
-    assert "More discussion follows" not in coarse_contexts[0]
+    assert "More discussion follows" in coarse_contexts[0]
     assert len(fine_contexts) == 1
     assert "Acme sponsor offer and sign-off" in fine_contexts[0]
     assert "Back to the discussion" in fine_contexts[0]
-    assert "More discussion follows" not in fine_contexts[0]
+    assert "More discussion follows" in fine_contexts[0]
     assert (ad["start"], ad["end"]) == (100.0, 144.0)
 
 
@@ -2415,9 +2434,10 @@ def test_adjacent_end_unit_comparison_recovers_closing_url(
                     "selected": 0.09, "following": 0.90, "unknown": 0.01,
                 }
         if "boundary_end_word" in questions:
+            word_end = expected_end if expected_end in _WORD_END_OPTIONS.values() else 120.0
             _set_choice_answer(
                 result, payload, "boundary_end_word",
-                _boundary_option("boundary_end_word", expected_end or 120.0),
+                _boundary_option("boundary_end_word", word_end),
             )
         if "interval_comparison" in questions:
             _set_choice_answer(result, payload, "interval_comparison", "adjusted")
@@ -2435,6 +2455,109 @@ def test_adjacent_end_unit_comparison_recovers_closing_url(
 
     assert len(compared) == 1
     assert "Acme" in compared[0]["following"]
+
+
+@pytest.mark.parametrize(
+    ("tail_kind", "expected_end"),
+    [("consecutive", 129.74), ("protected", 101.39),
+     ("mixed", 101.39), ("forced_unsafe", 101.39)],
+)
+def test_end_transition_handles_adjacent_promo_and_programme_separator(
+    jev_env, tmp_path, tail_kind, expected_end,
+):
+    middle = (
+        [(102.12, 111.0, "The episode story resumes with the officer's morning.")]
+        if tail_kind in {"mixed", "forced_unsafe"} else []
+    )
+    later = (
+        (112.0, 129.74, "Tonight on WXYZ, the new season continues. The auditions continue tonight.")
+        if tail_kind in {"mixed", "forced_unsafe"} else
+        (102.12, 129.74, "The episode story resumes with the officer's morning.")
+        if tail_kind == "protected" else
+        (102.12, 129.74, "Tonight on WXYZ, the new season continues. The auditions continue tonight.")
+    )
+    prompt = build_review_prompt(
+        50.1, 131.82,
+        [(45.0, 50.1, "Okay, let's get into today's story.")],
+        [(68.2, 95.86, "Sponsor Acme makes it easy to keep your coverages in one place."),
+         (96.25, 101.39, "Acme membership eligibility and product restrictions apply."),
+         *middle, later],
+        [(135.84, 160.7, "Early in the morning, an officer woke to his alarm.")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[68.2s-68.5s] Sponsor\n"
+        "End edge:\n[96.25s-101.39s] Acme membership eligibility and product restrictions apply.\n"
+        + (
+            "[102.12s-111.0s] The episode story resumes with the officer's morning.\n"
+            "[112.0s-129.74s] Tonight on WXYZ, the new season continues. The auditions continue tonight.\n"
+            if tail_kind in {"mixed", "forced_unsafe"} else
+            "[102.12s-129.74s] The episode story resumes with the officer's morning.\n"
+            if tail_kind == "protected" else
+            "[102.12s-129.74s] Tonight on WXYZ, the new season continues. The auditions continue tonight.\n"
+        )
+    )
+    if tail_kind == "forced_unsafe":
+        prompt = prompt.replace(
+            "\nTranscript (60s before, the candidate ad, 60s after;",
+            "\nEffective category actions: sponsor=remove, self_promo=keep\n\n"
+            "Transcript (60s before, the candidate ad, 60s after;",
+        )
+    normal = make_text_fake()
+    transitions = []
+    safety = []
+    categories = []
+
+    def fake(payload, **kwargs):
+        fake_payload = {**payload, "state": {
+            **payload["state"], "candidate": {**payload["state"].get("candidate", {}), "end": 101.39},
+        }}
+        result = normal(fake_payload, **kwargs)
+        questions = payload["questions"]
+        end = (
+            129.74 if "boundary_end_word" in questions
+            and tail_kind in {"consecutive", "forced_unsafe"}
+            and 129.74 in _WORD_END_OPTIONS.values() else 101.39
+        )
+        _override_boundaries(result, payload, 68.2, end)
+        if "end_transition" in questions:
+            transitions.append(payload)
+            selected = _end_unit_option(129.74)
+            _set_choice_answer(result, payload, "end_transition", selected)
+        if "end_run_category" in questions:
+            categories.append(payload)
+            _set_choice_answer(
+                result, payload, "end_run_category",
+                "mixed" if tail_kind == "mixed" else
+                "protected" if tail_kind == "protected" else "removable",
+            )
+        if "sponsor_read" in questions or "whole_speech" in questions:
+            safety.append(payload)
+        if tail_kind == "forced_unsafe":
+            if "kept_category" in questions:
+                result["answers"]["kept_category"] = {"noul": 0.02}
+            for name in questions:
+                if name.startswith("same_show_access_"):
+                    result["answers"][name] = {"noul": 0.02}
+        if tail_kind == "forced_unsafe" and "whole_speech" in questions:
+            speech = payload["state"]["candidate_interval_speech"]
+            if "episode story resumes" in speech:
+                result["answers"]["whole_speech"] = {"noul": 0.98}
+        return result
+
+    response = _run(prompt, fake, tmp_path, refine_boundaries=True)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+
+    assert (ad["start"], ad["end"]) == (68.2, expected_end)
+    assert len(categories) == 1
+    assert len(transitions) == (0 if tail_kind in {"protected", "mixed"} else 1)
+    if transitions:
+        assert "Tonight on WXYZ" in transitions[0]["state"]["end_context"]
+        assert "Early in the morning" in transitions[0]["state"]["end_context"]
+    if tail_kind == "forced_unsafe":
+        assert sum("sponsor_read" in entry["questions"] for entry in safety) == 2
+        assert sum("whole_speech" in entry["questions"] for entry in safety) == 2
+        assert sum("kept_category" in entry["questions"] for entry in safety) == 2
+        assert not any("interval_comparison" in entry["questions"] for entry in safety)
 
 
 def test_oversized_end_group_choice_keeps_supported_original(
