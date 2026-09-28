@@ -1130,7 +1130,7 @@ _PROGRAMME_CRITERIA = {
     "false": "The target contains only the sponsor or promotional read, including narrative setup, personal story used to lead into the product, sponsor-related conversational thanks, offer, URL, or disclaimer. A pronoun referring to the sponsor in a brief relationship remark continues the sign-off. Brief break navigation without episode discussion is separate.",
 }
 _CONTINUITY_CRITERIA = {
-    "true": "The target has moved from removable promotion into independent episode conversation, reporting, interview, news, a spoken return to the show, or a keep-category message. It introduces protected speech rather than continuing the removable break. Judge only the target using the words before and after to locate the change in function.",
+    "true": "The target has moved from removable promotion into independent episode conversation, reporting, interview, news, a spoken return to the show, or a keep-category message. An explicit return-to-show phrase followed by host discussion is protected even when it immediately follows an ad disclaimer. Judge only the target using the words before and after to locate the change in function.",
     "false": "The target remains in the removable promotional break, including a distinct adjacent ad for another sponsor, show, or product. Product explanation, a demonstration, sponsor-related commentary, an offer, URL, or thanks remains promotional. Generic rhetoric, a curiosity hook, or a fact teaser also remains promotional when surrounding speech connects it to the promoted product, problem, claim, or offer.",
 }
 _PROGRAMME_CONTEXT_RULE = (
