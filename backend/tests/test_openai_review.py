@@ -2491,6 +2491,214 @@ def test_end_word_options_keep_truncated_closing_phrases_unknown():
     )
 
 
+@pytest.mark.parametrize("programme_score", [0.02, 0.98])
+def test_complete_terminal_cta_reaches_fine_end_and_still_checks_programme(
+    jev_env, tmp_path, programme_score,
+):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(90.0, 100.0, "Editorial before.")],
+        [(100.0, 110.0, "Sponsor offer."),
+         (110.0, 120.0, "Visit example .com.")],
+        [],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] Sponsor\n"
+        "End edge:\n[110.0s-111.0s] Visit\n"
+        "[111.0s-112.0s] example\n[112.0s-120.0s] .com.\n"
+    )
+    select = _select_pair_fake(100.0, 120.0)
+    coarse = []
+    fine = []
+    programme = []
+    closing = []
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        questions = payload["questions"]
+        if "boundary_end" in questions:
+            coarse.append(payload)
+        if "boundary_end_word" in questions:
+            fine.append(payload)
+        if "whole_speech" in questions:
+            programme.append(payload)
+            result["answers"]["whole_speech"] = {"noul": programme_score}
+        if "terminal_closing" in questions:
+            closing.append(payload)
+            result["answers"]["terminal_closing"] = {"noul": 0.98}
+        return result
+
+    if programme_score >= 0.85:
+        with pytest.raises(ReviewInconclusiveError) as raised:
+            _run(prompt, fake, tmp_path, refine_boundaries=True)
+        assert raised.value.reason == "original_range_not_confirmed"
+        assert raised.value.fallback["reason"] == "programme_content_detected"
+    else:
+        response = _run(prompt, fake, tmp_path, refine_boundaries=True)
+        ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+        assert (ad["start"], ad["end"]) == (100.0, 120.0)
+
+    assert len(coarse) == 1
+    instructions = coarse[0]["questions"]["boundary_end"]["instructions"]
+    assert "no later speech is supplied" in instructions
+    assert "complete" in instructions and "mid-URL or mid-phrase" in instructions
+    assert fine and programme
+    assert bool(closing) == (programme_score < 0.85)
+    if closing:
+        assert closing[0]["state"]["closing_speech"].endswith(".com.")
+        assert closing[0]["state"]["selected_boundary"] == 120.0
+    assert "no later speech is present" in " ".join(
+        fine[0]["questions"]["boundary_end_word"]["criteria"].values()
+    )
+
+
+def test_truncated_terminal_phrase_blocks_otherwise_accepted_boundary(
+    jev_env, tmp_path,
+):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(90.0, 100.0, "Editorial before.")],
+        [(100.0, 110.0, "Sponsor offer."),
+         (110.0, 120.0, "Visit example dot")],
+        [],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] Sponsor\n"
+        "End edge:\n[110.0s-111.0s] Visit\n"
+        "[111.0s-112.0s] example\n[112.0s-120.0s] dot\n"
+    )
+    select = _select_pair_fake(100.0, 120.0)
+    stages = []
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        questions = payload["questions"]
+        stages.extend(questions)
+        if "terminal_closing" in questions:
+            assert payload["state"]["closing_speech"].endswith("example dot")
+            result["answers"]["terminal_closing"] = {"noul": 0.02}
+        return result
+
+    with pytest.raises(ReviewInconclusiveError) as raised:
+        _run(prompt, fake, tmp_path, refine_boundaries=True)
+
+    assert raised.value.reason == "missing_boundary_coverage"
+    assert raised.value.stage == "boundary_coverage"
+    assert "boundary_end" in stages
+    assert "boundary_end_word" in stages
+    assert "sponsor_read" in stages
+    assert "terminal_closing" in stages
+
+
+def test_terminal_closing_checks_last_word_before_padded_row_end(
+    jev_env, tmp_path,
+):
+    prompt = build_review_prompt(
+        100.0, 119.8,
+        [(90.0, 100.0, "Editorial before.")],
+        [(100.0, 120.0, "Sponsor offer. Visit example dot")],
+        [],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] Sponsor\n"
+        "End edge:\n[100.0s-101.0s] Sponsor\n"
+        "[101.0s-102.0s] offer.\n[118.0s-118.5s] Visit\n"
+        "[118.5s-119.0s] example\n[119.0s-119.8s] dot\n"
+    )
+    select = _select_pair_fake(100.0, 119.8)
+    stages = []
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        stages.extend(payload["questions"])
+        if "terminal_closing" in payload["questions"]:
+            result["answers"]["terminal_closing"] = {"noul": 0.02}
+        return result
+
+    with pytest.raises(ReviewInconclusiveError) as raised:
+        _run(prompt, fake, tmp_path, refine_boundaries=True)
+
+    assert raised.value.reason == "missing_boundary_coverage"
+    assert "terminal_closing" in stages
+
+
+def test_terminal_allowance_does_not_include_later_programme_speech(
+    jev_env, tmp_path,
+):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(90.0, 100.0, "Editorial before.")],
+        [(100.0, 110.0, "Sponsor offer."),
+         (110.0, 120.0, "Visit example .com.")],
+        [(120.0, 130.0, "Editorial return.")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] Sponsor\n"
+        "End edge:\n[110.0s-111.0s] Visit\n"
+        "[111.0s-112.0s] example\n[112.0s-120.0s] .com.\n"
+        "[120.0s-121.0s] Editorial\n[121.0s-130.0s] return.\n"
+    )
+    select = _select_pair_fake(100.0, 120.0)
+    end_requests = []
+    closing_requests = []
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        if "boundary_end_word" in payload["questions"]:
+            end_requests.append(payload)
+        if "terminal_closing" in payload["questions"]:
+            closing_requests.append(payload)
+        return result
+
+    response = _run(prompt, fake, tmp_path, refine_boundaries=True)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+
+    assert (ad["start"], ad["end"]) == (100.0, 120.0)
+    assert end_requests
+    assert not closing_requests
+    assert any(
+        "kept speech begins: 'Editorial return.'" in option
+        for option in end_requests[0]["questions"]["boundary_end_word"]["criteria"].values()
+    )
+
+
+def test_terminal_cta_still_respects_kept_category(
+    jev_env, tmp_path,
+):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(90.0, 100.0, "Editorial before.")],
+        [(100.0, 110.0, "Sponsor offer and self promotion."),
+         (110.0, 120.0, "Visit example .com.")],
+        [],
+    ).replace(
+        "\nTranscript (60s before, the candidate ad, 60s after;",
+        "\nEffective category actions: sponsor=remove, self_promo=keep\n\n"
+        "Transcript (60s before, the candidate ad, 60s after;",
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] Sponsor\n"
+        "End edge:\n[110.0s-111.0s] Visit\n"
+        "[111.0s-112.0s] example\n[112.0s-120.0s] .com.\n"
+    )
+    select = _select_pair_fake(100.0, 120.0)
+    kept_requests = []
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        if "kept_category" in payload["questions"]:
+            kept_requests.append(payload)
+            result["answers"]["kept_category"] = {"noul": 0.99}
+        return result
+
+    with pytest.raises(ReviewInconclusiveError) as raised:
+        _run(prompt, fake, tmp_path, refine_boundaries=True)
+
+    assert kept_requests
+    assert raised.value.reason == "original_range_not_confirmed"
+    assert raised.value.fallback["reason"] == "programme_content_detected"
+
+
 def test_start_unit_options_include_neighboring_utterances():
     segments = [
         {"start": 90.0, "end": 92.0, "text": "Back after the break."},
@@ -3342,7 +3550,11 @@ def test_partial_overlap_does_not_transfer_programme_veto(jev_env, tmp_path):
             result["answers"]["whole_speech"] = {"noul": score}
         return result
 
-    response = _run(_meaningful_pair_prompt(), fake, tmp_path, refine_boundaries=True)
+    prompt = _meaningful_pair_prompt().replace(
+        "[120.0s-130.0s] Editorial return.",
+        "[120.0s-130.0s] Editorial return.\n[130.0s-140.0s] Editorial after.",
+    )
+    response = _run(prompt, fake, tmp_path, refine_boundaries=True)
     ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
 
     assert observed == {"original": 0.86, "proposed": 0.84}

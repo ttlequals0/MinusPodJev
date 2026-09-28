@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.29 - 2026-09-28
+
+- Let a complete closing offer, URL, or sign-off at the end of supplied review speech define the final ad utterance. Treat truncated endings as inconclusive; missing later speech alone does not prove the audio ends.
+
 ## 0.1.28 - 2026-09-28
 
 - Return the canonical name for a known sponsor in detection output so downstream brand checks can match spoken mentions. Unknown detection spans still omit the sponsor field.

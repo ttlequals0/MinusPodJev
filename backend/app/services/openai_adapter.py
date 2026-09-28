@@ -1040,7 +1040,7 @@ def _unit_end_question(
         mapping["original"] = original
     return {
         "type": "choice",
-        "instructions": "Which target utterance contains the final removable promotional word before the first independent programme or keep-category speech? Include all consecutive removal-eligible messages that intersect the candidate, even when adjacent messages promote different sponsors, shows, or products. When category_actions is supplied, remove and beep are eligible while keep must be preserved. Include each offer, URL, conversational thanks, call to action, and sign-off. Do not jump across independent programme speech or a keep message to a later break. The correct utterance may continue into independent show speech after its promotional words. Choose unknown if none fits.",
+        "instructions": "Which target utterance contains the final removable promotional word? Include all consecutive removal-eligible messages that intersect the candidate, even when adjacent messages promote different sponsors, shows, or products. When category_actions is supplied, remove and beep are eligible while keep must be preserved. Include each offer, URL, conversational thanks, call to action, and sign-off. Do not jump across independent programme speech or a keep message to a later break. The correct utterance may continue into independent show speech after its promotional words. When no later speech is supplied, a listed final utterance can close the ad if its words complete an offer, URL, call to action, thanks, or sign-off. Do not require a following programme utterance in that case. Missing later speech does not prove the audio or transcript ends. Choose unknown if the final supplied words end mid-URL or mid-phrase, or no listed utterance has a supported closing word.",
         "criteria": criteria,
     }, mapping
 
@@ -2882,6 +2882,50 @@ def run_review(
                     cache_hit=primary.get("cache_hit"),
                     proposal=proposal_diagnostic, fallback=fallback_diagnostic,
                 )
+            if (
+                ad_end >= max(float(word["end"]) for word in word_edges["end"]) - 0.01
+                and not any(
+                    float(segment["start"]) >= ad_end - 0.01 and str(segment["text"]).strip()
+                    for segment in coarse_segments
+                )
+            ):
+                closing_words = [
+                    word for word in word_edges["end"]
+                    if float(word["start"]) >= ad_start - 0.01
+                    and float(word["end"]) <= ad_end + 0.01
+                ][-40:]
+                closing_speech = " ".join(str(word["text"]).strip() for word in closing_words)
+                closing = review_questions(
+                    {
+                        "terminal_closing": {
+                            "type": "noul",
+                            "instructions": {
+                                "question": "Does the final observed promotional utterance finish a complete closing phrase at the selected boundary? Judge the supplied words, not an assumed end of the audio.",
+                                "closing_speech": closing_speech,
+                            },
+                            "criteria": {
+                                "true": "The final observed words complete the offer, URL, call to action, thanks, sign-off, or other closing phrase. No spoken URL or phrase is left unfinished.",
+                                "false": "The final observed words stop during a URL, offer, call to action, or sentence, or do not establish that the promotional phrase is complete. A missing later transcript is not evidence of completion.",
+                            },
+                        },
+                    },
+                    "terminal_closing",
+                    question_state_override={
+                        "guidance": _focused_guidance(review_guidance),
+                        "selected_boundary": ad_end,
+                        "closing_speech": closing_speech,
+                        **policy_state,
+                    },
+                )
+                closing_score = float(closing["answers"]["terminal_closing"])
+                if closing_score < review_choice_enter:
+                    _review_unavailable(
+                        pool, "Jev could not confirm a complete terminal ad closing", review_request_id,
+                        reason="missing_boundary_coverage", stage="boundary_coverage",
+                        score=closing_score, threshold=review_choice_enter,
+                        cache_hit=bool(closing["cache_hit"]),
+                        range_start=ad_start, range_end=ad_end,
+                    )
             logger.info(
                 "review request_id=%s refinement=completed original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f",
                 review_request_id, cand_start, cand_end, ad_start, ad_end,
