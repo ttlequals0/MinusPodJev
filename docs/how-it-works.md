@@ -13,7 +13,7 @@
 
 Jev scores one segment at a time ("is this line an ad?"); the client assembles the spans. The proxy wraps that as an OpenAI chat endpoint:
 
-1. Parse MinusPod's window prompt into segments.
+1. Parse MinusPod's window prompt into segments. Detection parsing reads only the transcript block, so timestamped show notes cannot override segment IDs.
 2. Ask Jev one noul per segment.
 3. Assemble spans and use one Choice question to classify each detected span.
 4. Name sponsors from MinusPod's sponsor list, with a gazetteer fallback.

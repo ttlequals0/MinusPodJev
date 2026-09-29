@@ -90,6 +90,24 @@ def test_build_payload_shape():
     assert "L0001" in question["instructions"]
 
 
+def test_build_payload_keeps_caller_context_separate_and_hashes_it():
+    segments = [{"sid": 1, "text": " hello "}]
+    base = build_payload(segments, model="jev-latest")
+    empty = build_payload(segments, model="jev-latest", caller_context=" \n ")
+    contextual = build_payload(
+        segments,
+        model="jev-latest",
+        caller_context="Podcast description: show notes and cue metadata",
+    )
+
+    assert empty == base
+    assert "caller_context" not in base["state"]
+    assert contextual["state"]["caller_context"] == "Podcast description: show notes and cue metadata"
+    assert contextual["state"]["transcript"] == base["state"]["transcript"]
+    assert contextual["state"]["guidance"] == base["state"]["guidance"]
+    assert hash_payload(contextual) != hash_payload(base)
+
+
 def test_parse_response_keeps_noul_answers_and_usage():
     entry = parse_response(ANSWER_BODY)
     assert entry["probabilities"] == {"s1": 0.98}
@@ -282,19 +300,6 @@ def test_review_validation_allowlist_and_confidence_are_independent():
             },
             "choice_confidence",
         ),
-        (
-            {
-                "answers": {
-                    "evidence": {"noul": 0.9},
-                    "start_0": {
-                        "choice": "unknown",
-                        "confidence": 0.9,
-                        "probabilities": {"unknown": 0.1, "w0": 0.9},
-                    },
-                }
-            },
-            "choice_winner",
-        ),
     ],
 )
 def test_review_validation_reports_malformed_rules(body, rule):
@@ -303,6 +308,37 @@ def test_review_validation_reports_malformed_rules(body, rule):
     assert raised.value.code == "jev_upstream_invalid_response"
     assert raised.value.rule == rule
     assert all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in raised.value.numeric_details.values())
+
+
+def test_review_validation_accepts_explicit_choice_that_is_not_probability_argmax():
+    questions = {
+        "boundary": {
+            "type": "choice",
+            "criteria": {f"end_{index}": "candidate" for index in range(6)},
+        },
+    }
+    body = {
+        "answers": {
+            "boundary": {
+                "choice": "end_0",
+                "confidence": 0.2,
+                "probabilities": {
+                    "end_0": 0.18,
+                    "end_1": 0.19,
+                    "end_2": 0.17,
+                    "end_3": 0.16,
+                    "end_4": 0.15,
+                    "end_5": 0.15,
+                },
+            },
+        },
+    }
+
+    answer = _review_answers(body, questions)["answers"]["boundary"]
+
+    assert answer["choice"] == "end_0"
+    assert answer["probabilities"]["end_0"] == 0.18
+    assert max(answer["probabilities"].values()) == 0.19
 
 
 def test_review_validation_reports_usage_rule_without_echoing_value():

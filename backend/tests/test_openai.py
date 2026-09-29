@@ -18,6 +18,7 @@ from minuspod_compat import (
     parse_id_ads_from_response,
     resolve_segment_id_ads,
 )
+from minuspod_compat.sponsors import is_sponsor_reasoning_rationale
 
 _SCHEMA_AD_KEYS = set(
     AD_DETECTION_JSON_SCHEMA["properties"]["ads"]["items"]["properties"]
@@ -75,7 +76,11 @@ TS_LINES = [
 
 
 def test_parse_transcript_timestamps_mode():
-    text = format_window_prompt("Pod", "Ep", "", TS_LINES, 0, 1, 0.0, 600.0)
+    text = format_window_prompt(
+        "Pod", "Ep", "[10.0s - 11.0s] show-note cue", TS_LINES,
+        0, 1, 0.0, 600.0,
+        audio_context="\n=== AUDIO SIGNALS ===\n[12.0s - 13.0s] cue",
+    )
     segments, mode = parse_transcript(text)
     assert mode == "timestamps"
     assert len(segments) == 8
@@ -87,7 +92,9 @@ def test_parse_transcript_timestamps_mode():
 def test_parse_transcript_segment_ids_mode():
     lines = ["[10] first line", "[11] second line", "[12] third line"]
     text = format_window_prompt(
-        "Pod", "Ep", "", lines, 0, 1, 0.0, 600.0, addressing_mode="segment_ids"
+        "Pod", "Ep", "[10.0s - 11.0s] show-note cue", lines, 0, 1, 0.0, 600.0,
+        audio_context="\n=== AUDIO SIGNALS ===\n[12.0s - 13.0s] cue",
+        addressing_mode="segment_ids",
     )
     segments, mode = parse_transcript(text)
     assert mode == "segment_ids"
@@ -101,6 +108,17 @@ def test_parse_transcript_junk_returns_empty():
     segments, mode = parse_transcript(text)
     assert segments == []
     assert mode == "empty"
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_parse_transcript_allows_blank_after_heading(newline):
+    text = newline.join([
+        "Transcript:", "", "[10] Host story.", "[11] Acme sponsor read.",
+        "", "AUDIO SIGNALS:", "[12.0s - 13.0s] cue",
+    ])
+    segments, mode = parse_transcript(text)
+    assert mode == "segment_ids"
+    assert [segment["sid"] for segment in segments] == [10, 11]
 
 
 def test_extract_user_text_last_user_message():
@@ -147,8 +165,9 @@ async def test_chat_completions_timestamps_round_trip(jev_env, client, monkeypat
 
     content = data["choices"][0]["message"]["content"]
     assert isinstance(content, str)
-    # The proxy adds only its provenance label beyond MinusPod's base schema.
-    for raw_ad in json.loads(content)["ads"]:
+    raw_ads = json.loads(content)["ads"]
+    assert raw_ads[0]["sponsor_name"] == "BetterHelp"
+    for raw_ad in raw_ads:
         assert set(raw_ad) <= _SCHEMA_AD_KEYS
     ads = parse_ads_from_response(content)
     assert len(ads) == 1
@@ -157,9 +176,10 @@ async def test_chat_completions_timestamps_round_trip(jev_env, client, monkeypat
     assert ad["end"] == 36.0
     assert ad["category"] == "sponsor"
     assert ad["confidence"] == 0.98
-    assert ad["sponsor"] == "jev-BetterHelp"
+    assert ad["sponsor"] == "BetterHelp"
     assert ad["end_text"].startswith("Use code SHOW")
-    assert ad["reason"].startswith("Based on transcript: This episode is sponsored by BetterHelp.")
+    assert ad["reason"].startswith("This episode is sponsored by BetterHelp.")
+    assert is_sponsor_reasoning_rationale(ad["reason"]) is False
 
 
 @pytest.mark.parametrize("category", SEGMENT_CATEGORIES)
@@ -368,7 +388,8 @@ async def test_chat_completions_segment_ids_round_trip(jev_env, client, monkeypa
         "[14] Now back to our regular conversation.",
     ]
     prompt = format_window_prompt(
-        "My Podcast", "Ep 2", "", lines, 0, 1, 0.0, 600.0, addressing_mode="segment_ids"
+        "My Podcast", "Ep 2", "[10.0s - 11.0s] show-note cue", lines,
+        0, 1, 0.0, 600.0, addressing_mode="segment_ids",
     )
     body = {"model": "jev-latest", "messages": [{"role": "user", "content": prompt}]}
     resp = await client.post(
@@ -380,6 +401,7 @@ async def test_chat_completions_segment_ids_round_trip(jev_env, client, monkeypa
     ad = parsed["ads"][0]
     assert ad["start_id"] == 12
     assert ad["end_id"] == 13
+    assert ad["sponsor_name"] == "Squarespace"
     assert "start" not in ad and "end" not in ad
     assert isinstance(ad["start_id"], int)
 
@@ -394,7 +416,7 @@ async def test_chat_completions_segment_ids_round_trip(jev_env, client, monkeypa
     resolved = resolve_segment_id_ads(id_ads, window)
     assert len(resolved) == 1
     assert resolved[0]["start"] == 120.0 and resolved[0]["end"] == 132.0
-    assert resolved[0]["sponsor"] == "jev-Squarespace"
+    assert resolved[0]["sponsor"] == "Squarespace"
 
 
 async def test_chat_completions_requires_api_key(jev_env, client, monkeypatch):
@@ -570,6 +592,7 @@ def test_unknown_sponsor_uses_grounded_reason_without_minting_label(jev_env, tmp
     content = response["choices"][0]["message"]["content"]
     raw_ad = json.loads(content)["ads"][0]
     assert "sponsor" not in raw_ad
+    assert "sponsor_name" not in raw_ad
     assert raw_ad["reason"] == "Based on transcript: Sponsored by Unknown Brand, visit unknown.example today."
     parsed = parse_ads_from_response(content)
     assert "sponsor" not in parsed[0]

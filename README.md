@@ -30,6 +30,8 @@ Jev Proxy does not support chapter generation. Chapter titles still need a secon
 
 Jev Proxy is a POC shim. It does not change the MinusPod runtime that controls holds, autoapproval, or verification logs. `compat/minuspod_compat` is a vendored snapshot used by the production proxy and offline benchmarks. Keep production operations in the existing MinusPod application until Jev is mature.
 
+Optional boundary refinement ranks nearby utterance starts, then checks words within the selected utterance. It compares the proposed cut with the original and checks each eligible cut for sponsor speech and programme speech. A separate programme veto can hold a cut even when the sponsor score passes. This path remains experimental; the archived review cases do not establish general accuracy.
+
 ## Requirements
 
 - Docker and Docker Compose for the container deployment
