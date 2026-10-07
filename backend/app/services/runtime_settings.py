@@ -30,6 +30,8 @@ class Thresholds:
     detection_stay: float
     review_evidence: float
     review_choice: float
+    review_boundary_cap_seconds: float = 60.0
+    review_context_seconds: float = 30.0
 
 
 def defaults_from_settings(config: Any) -> Thresholds:
@@ -41,6 +43,8 @@ def defaults_from_settings(config: Any) -> Thresholds:
         detection_stay=float(config.JEV_STAY),
         review_evidence=float(config.JEV_ENTER if evidence is None else evidence),
         review_choice=float(config.JEV_ENTER if choice is None else choice),
+        review_boundary_cap_seconds=float(config.JEV_REVIEW_BOUNDARY_CAP_SECONDS),
+        review_context_seconds=float(config.JEV_REVIEW_CONTEXT_SECONDS),
     )
 
 
@@ -56,24 +60,61 @@ def _validate_number(value: object, name: str) -> float:
     return number
 
 
+def _validate_seconds(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeSettingsValidationError(f"{name} must be a number")
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise RuntimeSettingsValidationError(f"{name} must be a finite number") from exc
+    if not math.isfinite(number) or not 0.0 < number <= 600.0:
+        raise RuntimeSettingsValidationError(
+            f"{name} must be between 0 exclusive and 600 seconds"
+        )
+    return number
+
+
+_EDITABLE_KEYS = {
+    "detection_enter",
+    "detection_stay",
+    "review_evidence",
+    "review_choice",
+    "review_boundary_cap_seconds",
+    "review_context_seconds",
+}
+
+
 def validate_editable(values: dict[str, object]) -> Thresholds:
     """Validate the complete set of runtime-editable thresholds."""
-    expected = {"detection_enter", "detection_stay", "review_evidence", "review_choice"}
-    if set(values) != expected:
-        raise RuntimeSettingsValidationError("thresholds must contain exactly four numeric fields")
+    if set(values) != _EDITABLE_KEYS:
+        raise RuntimeSettingsValidationError("thresholds must contain exactly six numeric fields")
     detection_enter = _validate_number(values["detection_enter"], "detection_enter")
     detection_stay = _validate_number(values["detection_stay"], "detection_stay")
     review_evidence = _validate_number(values["review_evidence"], "review_evidence")
     review_choice = _validate_number(values["review_choice"], "review_choice")
+    cap = _validate_seconds(
+        values["review_boundary_cap_seconds"], "review_boundary_cap_seconds"
+    )
+    context = _validate_seconds(values["review_context_seconds"], "review_context_seconds")
     if detection_enter < detection_stay:
         raise RuntimeSettingsValidationError("detection_enter must be at least detection_stay")
-    return Thresholds(detection_enter, detection_stay, review_evidence, review_choice)
+    return Thresholds(
+        detection_enter, detection_stay, review_evidence, review_choice, cap, context
+    )
 
 
 def _validate_persisted(values: dict[str, object], defaults: Thresholds) -> Thresholds:
-    """Accept the former three-field file format with the startup stay default."""
-    if set(values) == {"detection_enter", "review_evidence", "review_choice"}:
-        values = {**values, "detection_stay": defaults.detection_stay}
+    """Accept legacy three- and four-field files, filling new keys from startup defaults."""
+    keys = set(values)
+    three = {"detection_enter", "review_evidence", "review_choice"}
+    four = three | {"detection_stay"}
+    if keys == three or keys == four:
+        values = {
+            "detection_stay": defaults.detection_stay,
+            **values,
+            "review_boundary_cap_seconds": defaults.review_boundary_cap_seconds,
+            "review_context_seconds": defaults.review_context_seconds,
+        }
     return validate_editable(values)
 
 
@@ -128,6 +169,8 @@ def write(path: str, values: dict[str, object]) -> Thresholds:
                         "detection_stay": thresholds.detection_stay,
                         "review_evidence": thresholds.review_evidence,
                         "review_choice": thresholds.review_choice,
+                        "review_boundary_cap_seconds": thresholds.review_boundary_cap_seconds,
+                        "review_context_seconds": thresholds.review_context_seconds,
                     },
                     output,
                     separators=(",", ":"),

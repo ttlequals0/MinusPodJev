@@ -225,6 +225,66 @@ def test_boundary_candidates_use_supplied_words_up_to_sixty_seconds():
     assert len(starts) == len(set(starts)) and len(ends) == len(set(ends))
 
 
+def test_boundary_candidates_cap_seconds_is_adjustable():
+    segments = [{"start": 0.0, "end": 300.0, "text": "context"}]
+    words = {
+        "start": [{"start": 100.0, "end": 100.1, "text": "a"}],
+        "end": [
+            {"start": value - 0.1, "end": value, "text": f"w{index}"}
+            for index, value in enumerate((195.0, 215.0))
+        ],
+    }
+
+    _, default_ends = _boundary_candidates(segments, words, (100.0, 120.0))
+    _, wide_ends = _boundary_candidates(segments, words, (100.0, 120.0), cap_seconds=90.0)
+
+    assert 195.0 not in default_ends
+    assert 195.0 in wide_ends and 215.0 not in wide_ends
+
+
+def test_boundary_cap_setting_controls_offered_end_options(jev_env, tmp_path):
+    prompt = build_review_prompt(
+        100.0, 120.0,
+        [(90.0, 100.0, "Editorial before.")],
+        [(100.0, 110.0, "Editorial transition."),
+         (110.0, 120.0, "Sponsor offer ends.")],
+        [(120.0, 130.0, "Editorial return."),
+         (130.0, 190.0, "Long editorial discussion."),
+         (190.0, 195.0, "Closing remark.")],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] Editorial\n[110.0s-111.0s] Sponsor\n"
+        "End edge:\n[119.0s-120.0s] ends.\n[129.0s-130.0s] return.\n[189.0s-190.0s] discussion.\n"
+    )
+
+    def offered(cap):
+        seen: set[float] = set()
+        normal = make_text_fake()
+
+        def fake(payload, **kwargs):
+            result = normal(payload, **kwargs)
+            for options in (_WORD_END_OPTIONS.values(), _END_GROUP_OPTIONS.values()):
+                for value in options:
+                    seen.update(value if isinstance(value, list) else [value])
+            for value in _END_UNIT_OPTIONS.values():
+                if isinstance(value, list):
+                    seen.update(float(word["end"]) for word in value)
+                else:
+                    seen.add(value)
+            return result
+
+        cache = tmp_path / f"cap{cap}"
+        cache.mkdir()
+        try:
+            _run(prompt, fake, cache, refine_boundaries=True, review_boundary_cap_seconds=cap)
+        except ReviewInconclusiveError:
+            pass
+        return seen
+
+    assert 190.0 not in offered(60.0)
+    assert 190.0 in offered(90.0)
+
+
 def test_comparison_question_compares_two_eligible_intervals():
     question = adapter._comparison_question()["interval_comparison"]
 
@@ -770,8 +830,14 @@ def _run(
     enter=0.95,
     review_evidence_enter=None,
     review_choice_enter=None,
+    review_boundary_cap_seconds=None,
+    review_context_seconds=None,
 ):
     kwargs = {}
+    if review_boundary_cap_seconds is not None:
+        kwargs["review_boundary_cap_seconds"] = review_boundary_cap_seconds
+    if review_context_seconds is not None:
+        kwargs["review_context_seconds"] = review_context_seconds
     if fake is not None:
         kwargs["fetcher"] = fake
     return run_review(
@@ -2582,8 +2648,8 @@ def test_truncated_terminal_phrase_blocks_otherwise_accepted_boundary(
     with pytest.raises(ReviewInconclusiveError) as raised:
         _run(prompt, fake, tmp_path, refine_boundaries=True)
 
-    assert raised.value.reason == "missing_boundary_coverage"
-    assert raised.value.stage == "boundary_coverage"
+    assert raised.value.reason == "terminal_closing_unconfirmed"
+    assert raised.value.stage == "focused_validation"
     assert "boundary_end" in stages
     assert "boundary_end_word" in stages
     assert "sponsor_read" in stages
@@ -2618,8 +2684,68 @@ def test_terminal_closing_checks_last_word_before_padded_row_end(
     with pytest.raises(ReviewInconclusiveError) as raised:
         _run(prompt, fake, tmp_path, refine_boundaries=True)
 
-    assert raised.value.reason == "missing_boundary_coverage"
+    assert raised.value.reason == "terminal_closing_unconfirmed"
     assert "terminal_closing" in stages
+
+
+def _terminal_fallback_prompt() -> str:
+    return build_review_prompt(
+        100.0, 120.0,
+        [(90.0, 100.0, "Editorial before.")],
+        [(100.0, 106.0, "Editorial transition."),
+         (106.0, 120.0, "Sponsor offer. Visit example dot")],
+        [],
+    ) + (
+        "Boundary word timing, use these timestamps for corrections:\n"
+        "Start edge:\n[100.0s-101.0s] Editorial\n[106.0s-107.0s] Sponsor\n"
+        "End edge:\n[100.0s-101.0s] Editorial\n[106.0s-107.0s] Sponsor\n"
+        "[117.0s-118.0s] Visit\n[118.0s-119.0s] example\n[119.0s-120.0s] dot\n"
+    )
+
+
+def _terminal_fallback_fake(original_score: float):
+    select = _select_pair_fake(106.0, 120.0)
+    closings = []
+
+    def fake(payload, **kwargs):
+        result = select(payload, **kwargs)
+        if "interval_comparison" in payload["questions"]:
+            _set_choice_answer(result, payload, "interval_comparison", "adjusted")
+        if "terminal_closing" in payload["questions"]:
+            speech = payload["state"]["closing_speech"]
+            closings.append(speech)
+            original = speech.startswith("Editorial")
+            result["answers"]["terminal_closing"] = {"noul": original_score if original else 0.02}
+        return result
+
+    return fake, closings
+
+
+def test_terminal_closing_falls_back_to_safe_original(jev_env, tmp_path):
+    fake, closings = _terminal_fallback_fake(0.98)
+
+    response = _run(_terminal_fallback_prompt(), fake, tmp_path, refine_boundaries=True)
+    ad = json.loads(response["choices"][0]["message"]["content"])["ads"][0]
+
+    assert (ad["start"], ad["end"]) == (100.0, 120.0)
+    assert len(closings) == 2
+
+
+def test_terminal_closing_abstains_when_original_also_fails(jev_env, tmp_path):
+    fake, closings = _terminal_fallback_fake(0.02)
+
+    with pytest.raises(ReviewInconclusiveError) as raised:
+        _run(_terminal_fallback_prompt(), fake, tmp_path, refine_boundaries=True)
+
+    error = raised.value
+    assert error.reason == "terminal_closing_unconfirmed"
+    assert error.stage == "focused_validation"
+    assert len(closings) == 2
+    for detail, bounds in ((error.proposal, (106.0, 120.0)), (error.fallback, (100.0, 120.0))):
+        assert (detail["range_start"], detail["range_end"]) == bounds
+        assert detail["score"] == pytest.approx(0.02)
+        assert detail["threshold"] == pytest.approx(0.95)
+        assert detail["cache_hit"] is False
 
 
 def test_terminal_allowance_does_not_include_later_programme_speech(
@@ -3813,6 +3939,36 @@ async def test_review_api_reports_proposal_and_coverage_fallback_diagnostics(
     review = metrics.snapshot()["review"]
     assert review["outcomes"]["inconclusive"] == 1
     assert sum(review["outcomes"].values()) == 1
+
+
+async def test_review_api_reports_terminal_closing_diagnostics(
+    jev_env, client, monkeypatch
+):
+    monkeypatch.setattr(settings, "JEV_REVIEW_REFINE_BOUNDARIES", True)
+    fake, _ = _terminal_fallback_fake(0.02)
+    monkeypatch.setattr(jev, "call_payload", fake)
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": _terminal_fallback_prompt()}]},
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    error = response.json()["error"]
+    assert response.status_code == 422
+    assert error["reason"] == "terminal_closing_unconfirmed"
+    assert error["stage"] == "focused_validation"
+    assert error["proposal"] == {
+        "reason": "terminal_closing_unconfirmed",
+        "stage": "focused_validation",
+        "range_start": 106.0,
+        "range_end": 120.0,
+        "score": pytest.approx(0.02),
+        "threshold": 0.95,
+        "cache_hit": False,
+    }
+    assert error["fallback"]["range_start"] == 100.0
+    assert error["fallback"]["range_end"] == 120.0
+    assert metrics.snapshot()["review"]["reasons"]["terminal_closing_unconfirmed"] == 1
 
 
 async def test_review_api_keeps_range_reason_and_counts_decisive_programme_veto(

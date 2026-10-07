@@ -74,6 +74,8 @@ async def test_status_reports_effective_review_settings(client: AsyncClient, mon
         "detection_stay_threshold": 0.4,
         "evidence_threshold": 0.9137,
         "choice_threshold": 0.9137,
+        "boundary_cap_seconds": 60.0,
+        "context_seconds": 30.0,
     }
 
 

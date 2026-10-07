@@ -15,7 +15,7 @@
 - `GET /v1/models`, `GET /models`: advertise `typesafe/jev`.
 - `POST /api/v1/jev/ask`: native segments-in, spans-out endpoint.
 - `GET /api/status`, `GET /api/health`, `GET /api/stats`.
-- `GET /api/settings`, `PUT /api/settings`: runtime threshold settings.
+- `GET /api/settings`, `PUT /api/settings`: runtime threshold settings (six fields: detection_enter, detection_stay, review_evidence, review_choice, review_boundary_cap_seconds, review_context_seconds); PUT requires exactly six fields.
 - `GET /api/docs` when `PRODUCTION=false`.
 
 Confirmed local sponsor matches use the raw transcript excerpt as rationale. Unmatched spans keep the `Based on transcript:` wrapper and omit an explicit sponsor name.
@@ -39,6 +39,7 @@ Confirmed local sponsor matches use the raw transcript excerpt as rationale. Unm
   - `error.proposal` and `error.fallback`, each with `range_start` and `range_end` in seconds, `reason`, and `stage`.
   - Completed checks also include `score`, `threshold`, and `cache_hit`. Checks skipped for missing boundary coverage include `start_supported` and `end_supported` instead.
   - `error.message` summarizes both outcomes. Other abstentions have no proposal or fallback objects.
+  - When the proposed cut fails the final closing-phrase check but the original passes all absolute checks, the proxy returns the original interval. If both fail closing-phrase validation, it returns `422 jev_review_inconclusive` with reason `terminal_closing_unconfirmed` at stage `focused_validation`, with ranges and scores included.
 
 - Missing or malformed context, and invalid candidate bounds, remain `jev_review_invalid_request` responses. No-overlap candidates also remain invalid if they are neither inside the transcript envelope nor exactly touching its head or tail.
 - Invalid responses use fixed reasons `malformed_context`, `invalid_bounds`, or `outside_context`, with `stage=context`. Available diagnostics contain only finite candidate and context bounds in seconds, with no transcript text. Metrics count these requests as `invalid_request`.

@@ -18,7 +18,7 @@
 The proxy reads these settings from the process environment. A direct source run also reads a
 `.env` file in its working directory. Docker Compose uses `.env` for interpolation, but only
 variables listed under `environment:` are passed into the container. The Compose file currently
-passes the MinusPod settings, all four editable thresholds, the programme veto, review flags, fallback flag, and settings
+passes the MinusPod settings, the four probability threshold defaults, the programme veto, review flags, fallback flag, cache path, and settings
 path. It does not pass every variable in this reference; for example, `TYPESAFE_API_KEY` is not
 passed by the provided Compose file.
 
@@ -40,7 +40,7 @@ own access controls.
 | `JEV_RETRY_AFTER_MAX_SECONDS` | `5` | Maximum upstream `Retry-After` delay in seconds. |
 | `JEV_REQUEST_DEADLINE_SECONDS` | `75` | Total cooperative budget for one Jev operation, including retries. Keep it below nginx's 90-second timeout. |
 | `JEV_MAX_CONCURRENT_REQUESTS` | `4` | Maximum simultaneous upstream requests per worker. |
-| `JEV_CACHE_PATH` | `./jev_cache.json` | Legacy JSON cache import path. Active SQLite cache data is stored beside it. |
+| `JEV_CACHE_PATH` | `./jev_cache.json` | Legacy JSON cache import path. Active SQLite cache data is stored beside it. The default resolves to `/app/jev_cache.json` in the container, outside the `/app/data` volume, so the cache is lost when the container is replaced. Compose sets `/app/data/jev_cache.json`; other deployments should do the same. |
 | `JEV_CACHE_MAX_ENTRIES` | `10000` | Maximum cached response entries. |
 
 ## Security and access
@@ -48,13 +48,13 @@ own access controls.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `JEV_ALLOW_UNAUTHENTICATED_FALLBACK` | `false` | Permit `TYPESAFE_API_KEY` when a caller omits bearer auth. Use only for a protected internal deployment. A caller bearer token is otherwise required. |
-| `MINUSPOD_PASSWORD` | _(none)_ | MinusPod login password used for the sponsor API and for authenticating proxy settings writes. This is not the TypeSafe API key. |
+| `MINUSPOD_PASSWORD` | _(none)_ | MinusPod login password (the one typed into its web UI) used for the sponsor API and for authenticating proxy settings writes. This is not the TypeSafe API key and not `MINUSPOD_MASTER_PASSPHRASE`. With a wrong value the login returns 401, sponsor naming falls back to the gazetteer, and `GET /api/status` reports `authenticated: false`. |
 | `MINUSPOD_BASE_URL` | _(none)_ | MinusPod base URL. When unset, sponsor naming uses the built-in gazetteer. |
 | `CORS_ORIGINS` | `["http://localhost:3000", "http://localhost:5173"]` | JSON list of allowed browser origins. |
 
 ## Thresholds and review
 
-Values are probabilities from `0` to `1`. `JEV_ENTER` must be at least `JEV_STAY`.
+Values are probabilities from `0` to `1` (except where noted in seconds). `JEV_ENTER` must be at least `JEV_STAY`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -62,15 +62,17 @@ Values are probabilities from `0` to `1`. `JEV_ENTER` must be at least `JEV_STAY
 | `JEV_STAY` | `0.40` | Extends an open span. Compose passes this startup default. |
 | `JEV_REVIEW_EVIDENCE_THRESHOLD` | _(unset, inherits `JEV_ENTER`)_ | Evidence threshold for review. Blank values inherit `JEV_ENTER`. |
 | `JEV_REVIEW_CHOICE_THRESHOLD` | _(unset, inherits `JEV_ENTER`)_ | Minimum sponsor-read score for an eligible review cut. Blank values inherit `JEV_ENTER`. |
+| `JEV_REVIEW_BOUNDARY_CAP_SECONDS` | `60` | Startup default for the search window for observed word-boundary candidates, in seconds. Editable at runtime; seeds the `review_boundary_cap_seconds` runtime setting. |
+| `JEV_REVIEW_CONTEXT_SECONDS` | `30` | Startup default for transcript context around a boundary, in seconds. Editable at runtime; seeds the `review_context_seconds` runtime setting. |
 | `JEV_REVIEW_PROGRAMME_VETO` | `0.85` | Reject an eligible cut when a programme-speech check reaches this probability. |
 | `JEV_REVIEW_REFINE_BOUNDARIES` | `false` | Use Jev Choice questions and supplied word timings to refine review boundaries. |
 | `JEV_SETTINGS_PATH` | `./data/runtime-settings.json` | Runtime threshold file. Compose passes this variable and separately mounts the default `/app/data` directory to the `jevproxy-data` volume. |
 
 `GET /api/settings` and `PUT /api/settings` expose detection enter, detection stay, review evidence,
-and review Choice values.
+review choice, boundary cap, and context window values.
 
-- A saved four-field file overrides environment defaults until it is changed or removed.
-- A legacy three-field file uses the startup `JEV_STAY` value until its next save writes all four fields.
+- A saved six-field file overrides environment defaults until it is changed or removed.
+- Legacy three-field and four-field files are read and upgraded: missing fields are filled from startup defaults and written back as six fields on the next save.
 - The saved file survives container replacement only when its containing directory remains persistent.
 - The default path is under `/app/data`, which Compose mounts to a named volume. A custom path must
   also be covered by a persistent mount.

@@ -30,7 +30,10 @@ def settings_file(tmp_path, monkeypatch):
 
 async def test_settings_defaults_and_authenticated_persistence(client, settings_file):
     schema = (await client.get("/api/openapi.json")).json()["paths"]["/api/settings"]["put"]["requestBody"]["content"]["application/json"]["schema"]
-    assert set(schema["required"]) == {"detection_enter", "detection_stay", "review_evidence", "review_choice"}
+    assert set(schema["required"]) == {
+        "detection_enter", "detection_stay", "review_evidence", "review_choice",
+        "review_boundary_cap_seconds", "review_context_seconds",
+    }
     response = await client.get("/api/settings")
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
@@ -40,18 +43,22 @@ async def test_settings_defaults_and_authenticated_persistence(client, settings_
             "detection_stay": 0.4,
             "review_evidence": 0.95,
             "review_choice": 0.95,
+            "review_boundary_cap_seconds": 60.0,
+            "review_context_seconds": 30.0,
         },
         "defaults": {
             "detection_enter": 0.95,
             "detection_stay": 0.4,
             "review_evidence": 0.95,
             "review_choice": 0.95,
+            "review_boundary_cap_seconds": 60.0,
+            "review_context_seconds": 30.0,
         },
         "persisted": False,
         "editable": True,
     }
 
-    update = {"detection_enter": 0.8, "detection_stay": 0.6, "review_evidence": 0.91, "review_choice": 0.87}
+    update = {"detection_enter": 0.8, "detection_stay": 0.6, "review_evidence": 0.91, "review_choice": 0.87, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0}
     response = await client.put("/api/settings", json=update, headers=_headers())
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
@@ -60,6 +67,8 @@ async def test_settings_defaults_and_authenticated_persistence(client, settings_
         "detection_stay": 0.6,
         "review_evidence": 0.91,
         "review_choice": 0.87,
+        "review_boundary_cap_seconds": 60.0,
+        "review_context_seconds": 30.0,
     }
     assert settings_file.stat().st_mode & 0o777 == 0o600
 
@@ -69,7 +78,7 @@ async def test_settings_defaults_and_authenticated_persistence(client, settings_
 
 
 async def test_settings_require_local_password_and_do_not_call_upstream(client, settings_file):
-    update = {"detection_enter": 0.8, "detection_stay": 0.6, "review_evidence": 0.91, "review_choice": 0.87}
+    update = {"detection_enter": 0.8, "detection_stay": 0.6, "review_evidence": 0.91, "review_choice": 0.87, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0}
     assert (await client.put("/api/settings", json=update)).status_code == 403
     assert (await client.put("/api/settings", json=update, headers=_headers("wrong"))).status_code == 403
     assert not settings_file.exists()
@@ -78,16 +87,16 @@ async def test_settings_require_local_password_and_do_not_call_upstream(client, 
 @pytest.mark.parametrize(
     "body",
     [
-        {"detection_enter": "0.8", "detection_stay": 0.6, "review_evidence": 0.91, "review_choice": 0.87},
-        {"detection_enter": True, "detection_stay": 0.6, "review_evidence": 0.91, "review_choice": 0.87},
-        {"detection_enter": 0.8, "detection_stay": "0.6", "review_evidence": 0.91, "review_choice": 0.87},
-        {"detection_enter": 0.8, "detection_stay": True, "review_evidence": 0.91, "review_choice": 0.87},
-        {"detection_enter": 0.8, "detection_stay": -0.01, "review_evidence": 0.91, "review_choice": 0.87},
-        {"detection_enter": 0.8, "detection_stay": 1.01, "review_evidence": 0.91, "review_choice": 0.87},
-        {"detection_enter": 0.8, "detection_stay": 0.81, "review_evidence": 0.91, "review_choice": 0.87},
+        {"detection_enter": "0.8", "detection_stay": 0.6, "review_evidence": 0.91, "review_choice": 0.87, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0},
+        {"detection_enter": True, "detection_stay": 0.6, "review_evidence": 0.91, "review_choice": 0.87, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0},
+        {"detection_enter": 0.8, "detection_stay": "0.6", "review_evidence": 0.91, "review_choice": 0.87, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0},
+        {"detection_enter": 0.8, "detection_stay": True, "review_evidence": 0.91, "review_choice": 0.87, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0},
+        {"detection_enter": 0.8, "detection_stay": -0.01, "review_evidence": 0.91, "review_choice": 0.87, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0},
+        {"detection_enter": 0.8, "detection_stay": 1.01, "review_evidence": 0.91, "review_choice": 0.87, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0},
+        {"detection_enter": 0.8, "detection_stay": 0.81, "review_evidence": 0.91, "review_choice": 0.87, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0},
         {"detection_enter": 0.8, "detection_stay": 0.6, "review_evidence": 0.91},
         {"detection_enter": 0.8, "detection_stay": 0.6, "review_evidence": 0.91, "review_choice": 0.87, "extra": 1},
-        {"detection_enter": 10**400, "detection_stay": 0.6, "review_evidence": 0.91, "review_choice": 0.87},
+        {"detection_enter": 10**400, "detection_stay": 0.6, "review_evidence": 0.91, "review_choice": 0.87, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0},
     ],
 )
 async def test_settings_reject_invalid_updates(client, settings_file, body):
@@ -98,7 +107,7 @@ async def test_settings_reject_invalid_updates(client, settings_file, body):
 
 @pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity"])
 async def test_settings_reject_nonfinite_json(client, settings_file, number):
-    content = f'{{"detection_enter":{number},"detection_stay":0.6,"review_evidence":0.91,"review_choice":0.87}}'
+    content = f'{{"detection_enter":{number},"detection_stay":0.6,"review_evidence":0.91,"review_choice":0.87,"review_boundary_cap_seconds":60.0,"review_context_seconds":30.0}}'
     response = await client.put(
         "/api/settings",
         content=content,
@@ -110,7 +119,7 @@ async def test_settings_reject_nonfinite_json(client, settings_file, number):
 
 @pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity"])
 async def test_settings_reject_nonfinite_detection_stay_json(client, settings_file, number):
-    content = f'{{"detection_enter":0.8,"detection_stay":{number},"review_evidence":0.91,"review_choice":0.87}}'
+    content = f'{{"detection_enter":0.8,"detection_stay":{number},"review_evidence":0.91,"review_choice":0.87,"review_boundary_cap_seconds":60.0,"review_context_seconds":30.0}}'
     response = await client.put(
         "/api/settings",
         content=content,
@@ -127,7 +136,7 @@ async def test_settings_corruption_is_explicit_and_put_can_repair(client, settin
     assert response.status_code == 503
     assert "not utf-8" not in response.text
 
-    update = {"detection_enter": 0.82, "detection_stay": 0.6, "review_evidence": 0.92, "review_choice": 0.88}
+    update = {"detection_enter": 0.82, "detection_stay": 0.6, "review_evidence": 0.92, "review_choice": 0.88, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0}
     response = await client.put("/api/settings", json=update, headers=_headers())
     assert response.status_code == 200
     assert json.loads(settings_file.read_text()) == update
@@ -145,14 +154,14 @@ async def test_settings_read_storage_error_logs_safe_diagnostic(client, settings
 
 async def test_settings_write_directory_error_is_safe(client, settings_file):
     settings_file.mkdir()
-    update = {"detection_enter": 0.82, "detection_stay": 0.6, "review_evidence": 0.92, "review_choice": 0.88}
+    update = {"detection_enter": 0.82, "detection_stay": 0.6, "review_evidence": 0.92, "review_choice": 0.88, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0}
     response = await client.put("/api/settings", json=update, headers=_headers())
     assert response.status_code == 503
     assert "runtime-settings" not in response.text
 
 
 async def test_settings_write_storage_error_logs_safe_diagnostic(client, settings_file, caplog, monkeypatch):
-    update = {"detection_enter": 0.82, "detection_stay": 0.6, "review_evidence": 0.92, "review_choice": 0.88}
+    update = {"detection_enter": 0.82, "detection_stay": 0.6, "review_evidence": 0.92, "review_choice": 0.88, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0}
     def fail_replace(*_args):
         raise PermissionError(errno.EACCES, "permission denied", str(settings_file))
 
@@ -168,14 +177,14 @@ async def test_settings_write_storage_error_logs_safe_diagnostic(client, setting
 
 
 async def test_failed_replace_preserves_previous_settings(client, settings_file, monkeypatch):
-    original = {"detection_enter": 0.82, "detection_stay": 0.6, "review_evidence": 0.92, "review_choice": 0.88}
+    original = {"detection_enter": 0.82, "detection_stay": 0.6, "review_evidence": 0.92, "review_choice": 0.88, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0}
     assert (await client.put("/api/settings", json=original, headers=_headers())).status_code == 200
 
     def fail_replace(*_args):
         raise OSError("replace failed")
 
     monkeypatch.setattr(runtime_settings.os, "replace", fail_replace)
-    replacement = {"detection_enter": 0.83, "detection_stay": 0.61, "review_evidence": 0.93, "review_choice": 0.89}
+    replacement = {"detection_enter": 0.83, "detection_stay": 0.61, "review_evidence": 0.93, "review_choice": 0.89, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0}
     response = await client.put("/api/settings", json=replacement, headers=_headers())
     assert response.status_code == 503
     assert (await client.get("/api/settings")).json()["thresholds"]["detection_enter"] == 0.82
@@ -183,10 +192,10 @@ async def test_failed_replace_preserves_previous_settings(client, settings_file,
 
 
 async def test_failed_threshold_relationship_update_preserves_previous_settings(client, settings_file):
-    original = {"detection_enter": 0.82, "detection_stay": 0.6, "review_evidence": 0.92, "review_choice": 0.88}
+    original = {"detection_enter": 0.82, "detection_stay": 0.6, "review_evidence": 0.92, "review_choice": 0.88, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0}
     assert (await client.put("/api/settings", json=original, headers=_headers())).status_code == 200
 
-    invalid = {"detection_enter": 0.6, "detection_stay": 0.61, "review_evidence": 0.93, "review_choice": 0.89}
+    invalid = {"detection_enter": 0.6, "detection_stay": 0.61, "review_evidence": 0.93, "review_choice": 0.89, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0}
     response = await client.put("/api/settings", json=invalid, headers=_headers())
 
     assert response.status_code == 422
@@ -194,7 +203,7 @@ async def test_failed_threshold_relationship_update_preserves_previous_settings(
 
 
 async def test_four_field_file_ignores_changed_startup_stay(client, settings_file, monkeypatch):
-    update = {"detection_enter": 0.81, "detection_stay": 0.62, "review_evidence": 0.86, "review_choice": 0.88}
+    update = {"detection_enter": 0.81, "detection_stay": 0.62, "review_evidence": 0.86, "review_choice": 0.88, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0}
     assert (await client.put("/api/settings", json=update, headers=_headers())).status_code == 200
     monkeypatch.setattr(settings, "JEV_STAY", 0.7)
 
@@ -205,7 +214,7 @@ async def test_four_field_file_ignores_changed_startup_stay(client, settings_fil
 
 
 async def test_inference_takes_one_threshold_snapshot(client, settings_file, monkeypatch):
-    update = {"detection_enter": 0.81, "detection_stay": 0.62, "review_evidence": 0.86, "review_choice": 0.88}
+    update = {"detection_enter": 0.81, "detection_stay": 0.62, "review_evidence": 0.86, "review_choice": 0.88, "review_boundary_cap_seconds": 90.0, "review_context_seconds": 45.0}
     assert (await client.put("/api/settings", json=update, headers=_headers())).status_code == 200
     monkeypatch.setattr(settings, "TYPESAFE_API_KEY", "test-key")
     monkeypatch.setattr(settings, "JEV_ALLOW_UNAUTHENTICATED_FALLBACK", True)
@@ -226,12 +235,13 @@ async def test_inference_takes_one_threshold_snapshot(client, settings_file, mon
     assert response.status_code == 200
     assert (captured["enter"], captured["stay"]) == (0.81, 0.62)
     assert (captured["review_evidence_enter"], captured["review_choice_enter"]) == (0.86, 0.88)
+    assert (captured["review_boundary_cap_seconds"], captured["review_context_seconds"]) == (90.0, 45.0)
 
 
 def test_native_endpoint_uses_persisted_detection_stay(settings_file, monkeypatch):
     import app.api.v1.jev as api
 
-    update = {"detection_enter": 0.81, "detection_stay": 0.62, "review_evidence": 0.86, "review_choice": 0.88}
+    update = {"detection_enter": 0.81, "detection_stay": 0.62, "review_evidence": 0.86, "review_choice": 0.88, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0}
     write(str(settings_file), update)
     seen = {}
 
@@ -250,9 +260,9 @@ def test_native_endpoint_uses_persisted_detection_stay(settings_file, monkeypatc
 
 
 def test_atomic_full_writes_leave_one_valid_snapshot(settings_file):
-    defaults = Thresholds(0.95, 0.4, 0.95, 0.95)
+    defaults = Thresholds(0.95, 0.4, 0.95, 0.95, 60.0, 30.0)
     values = [
-        {"detection_enter": 0.81 + index / 100, "detection_stay": 0.6, "review_evidence": 0.86, "review_choice": 0.88}
+        {"detection_enter": 0.81 + index / 100, "detection_stay": 0.6, "review_evidence": 0.86, "review_choice": 0.88, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0}
         for index in range(8)
     ]
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -263,7 +273,7 @@ def test_atomic_full_writes_leave_one_valid_snapshot(settings_file):
 
 
 def test_read_legacy_three_field_file_uses_startup_stay(settings_file):
-    defaults = Thresholds(0.95, 0.4, 0.95, 0.95)
+    defaults = Thresholds(0.95, 0.4, 0.95, 0.95, 60.0, 30.0)
     settings_file.write_text(
         json.dumps({"detection_enter": 0.81, "review_evidence": 0.86, "review_choice": 0.88})
     )
@@ -271,4 +281,56 @@ def test_read_legacy_three_field_file_uses_startup_stay(settings_file):
     effective, persisted = read(str(settings_file), defaults)
 
     assert persisted is True
-    assert effective == Thresholds(0.81, 0.4, 0.86, 0.88)
+    assert effective == Thresholds(0.81, 0.4, 0.86, 0.88, 60.0, 30.0)
+
+
+_BASE = {"detection_enter": 0.8, "detection_stay": 0.6, "review_evidence": 0.91, "review_choice": 0.87}
+
+
+def test_validate_editable_accepts_six_fields():
+    values = {**_BASE, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0}
+    assert runtime_settings.validate_editable(values) == Thresholds(0.8, 0.6, 0.91, 0.87, 60.0, 30.0)
+
+
+def test_validate_editable_rejects_four_fields():
+    with pytest.raises(runtime_settings.RuntimeSettingsValidationError, match="six numeric"):
+        runtime_settings.validate_editable(dict(_BASE))
+
+
+@pytest.mark.parametrize("bad", [0, -1, 601, "60", True])
+@pytest.mark.parametrize("field", ["review_boundary_cap_seconds", "review_context_seconds"])
+async def test_settings_reject_invalid_seconds(client, settings_file, field, bad):
+    body = {**_BASE, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0, field: bad}
+    response = await client.put("/api/settings", json=body, headers=_headers())
+    assert response.status_code == 422
+    assert not settings_file.exists()
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [
+        {"detection_enter": 0.81, "review_evidence": 0.86, "review_choice": 0.88},
+        {"detection_enter": 0.81, "detection_stay": 0.62, "review_evidence": 0.86, "review_choice": 0.88},
+    ],
+)
+async def test_legacy_files_fill_seconds_from_startup_defaults(client, settings_file, monkeypatch, legacy):
+    monkeypatch.setattr(settings, "JEV_REVIEW_BOUNDARY_CAP_SECONDS", 75.0)
+    monkeypatch.setattr(settings, "JEV_REVIEW_CONTEXT_SECONDS", 20.0)
+    settings_file.write_text(json.dumps(legacy))
+
+    body = (await client.get("/api/settings")).json()
+
+    assert body["persisted"] is True
+    assert body["thresholds"]["review_boundary_cap_seconds"] == 75.0
+    assert body["thresholds"]["review_context_seconds"] == 20.0
+    assert body["defaults"]["review_boundary_cap_seconds"] == 75.0
+
+
+async def test_put_round_trips_six_fields(client, settings_file):
+    update = {**_BASE, "review_boundary_cap_seconds": 120.5, "review_context_seconds": 45.0}
+    assert (await client.put("/api/settings", json=update, headers=_headers())).status_code == 200
+
+    body = (await client.get("/api/settings")).json()
+
+    assert body["thresholds"] == update
+    assert body["persisted"] is True

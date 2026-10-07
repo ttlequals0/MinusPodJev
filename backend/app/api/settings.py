@@ -32,6 +32,8 @@ class ThresholdUpdate(BaseModel):
     detection_stay: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     review_evidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     review_choice: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    review_boundary_cap_seconds: float = Field(gt=0.0, le=600.0, allow_inf_nan=False)
+    review_context_seconds: float = Field(gt=0.0, le=600.0, allow_inf_nan=False)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -40,9 +42,16 @@ class ThresholdUpdate(BaseModel):
     def reject_non_numeric_values(cls, value: object) -> object:
         if not isinstance(value, dict):
             raise ValueError("thresholds must be an object")
-        expected = {"detection_enter", "detection_stay", "review_evidence", "review_choice"}
+        expected = {
+            "detection_enter",
+            "detection_stay",
+            "review_evidence",
+            "review_choice",
+            "review_boundary_cap_seconds",
+            "review_context_seconds",
+        }
         if set(value) != expected:
-            raise ValueError("thresholds must contain exactly four fields")
+            raise ValueError("thresholds must contain exactly six fields")
         if any(
             isinstance(item, bool) or not isinstance(item, (int, float))
             for item in value.values()
@@ -85,12 +94,16 @@ def _body(effective: Thresholds, defaults: Thresholds, persisted: bool) -> dict[
             "detection_stay": effective.detection_stay,
             "review_evidence": effective.review_evidence,
             "review_choice": effective.review_choice,
+            "review_boundary_cap_seconds": effective.review_boundary_cap_seconds,
+            "review_context_seconds": effective.review_context_seconds,
         },
         "defaults": {
             "detection_enter": defaults.detection_enter,
             "detection_stay": defaults.detection_stay,
             "review_evidence": defaults.review_evidence,
             "review_choice": defaults.review_choice,
+            "review_boundary_cap_seconds": defaults.review_boundary_cap_seconds,
+            "review_context_seconds": defaults.review_context_seconds,
         },
         "persisted": persisted,
         "editable": bool(settings.MINUSPOD_PASSWORD),
@@ -135,10 +148,13 @@ def update_settings(
             status_code=503, detail="Runtime settings unavailable", headers=_NO_STORE
         ) from exc
     logger.info(
-        "runtime settings saved detection_enter=%s detection_stay=%s review_evidence=%s review_choice=%s",
+        "runtime settings saved detection_enter=%s detection_stay=%s review_evidence=%s review_choice=%s "
+        "review_boundary_cap_seconds=%s review_context_seconds=%s",
         effective.detection_enter,
         effective.detection_stay,
         effective.review_evidence,
         effective.review_choice,
+        effective.review_boundary_cap_seconds,
+        effective.review_context_seconds,
     )
     return _body(effective, defaults, True)

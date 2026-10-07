@@ -37,8 +37,10 @@ This is a recommended POC configuration, not a change applied to MinusPod by thi
 |---|---|---|
 | `detection_provider` | primary | proxy -> Jev |
 | `verification_provider` | primary | proxy -> Jev |
-| `review_provider` | secondary | independent chat model |
+| `review_provider` | secondary | independent chat model (see [Review behavior](#review-behavior)) |
 | `chapters_provider` | secondary | a real chat model |
+
+These values are entered in MinusPod under Settings > AI & Processing > AI Models, not in the proxy. MinusPod's `OPENAI_MODEL` variable only seeds a model setting that was never saved, so an install that already stored another model must change it in that screen. The Test connection button under the base URL calls the proxy's `/models` route and should list `typesafe/jev`.
 
 ### Policy and limits
 
@@ -54,13 +56,15 @@ This is a recommended POC configuration, not a change applied to MinusPod by thi
 | `JEV_STAY` | `detection_stay` | `0.40` | extends an open span; editable at runtime |
 | `JEV_REVIEW_EVIDENCE_THRESHOLD` | `review_evidence` | `JEV_ENTER` when unset | gates advertising evidence before refinement |
 | `JEV_REVIEW_CHOICE_THRESHOLD` | `review_choice` | `JEV_ENTER` when unset | minimum sponsor-read score for an eligible cut |
+| `JEV_REVIEW_BOUNDARY_CAP_SECONDS` | `review_boundary_cap_seconds` | `60` | search window for observed word-boundary candidates, in seconds; editable at runtime |
+| `JEV_REVIEW_CONTEXT_SECONDS` | `review_context_seconds` | `30` | transcript context around a boundary in seconds; editable at runtime |
 | `JEV_REVIEW_PROGRAMME_VETO` | environment only | `0.85` | vetoes a cut when local programme speech reaches this score |
 
-These are `0` to `1` scores, not measured accuracy. Detection enter must be at least `JEV_STAY`. The review evidence, sponsor-read, and programme thresholds are independent of detection enter.
+The four threshold settings are `0` to `1` scores, not measured accuracy. Detection enter must be at least `JEV_STAY`. The review evidence, sponsor-read, and programme thresholds are independent of detection enter. The boundary cap and context window are seconds: finite, greater than 0, and at most 600.
 
 ### Save and authentication
 
-- The status page reads `GET /api/settings` and saves all four editable thresholds atomically with `PUT /api/settings`.
+- The status page reads `GET /api/settings` and saves all six editable thresholds atomically with `PUT /api/settings`.
 - Saving requires `Authorization: Bearer <MinusPod password>`. The proxy checks that password locally and does not log in to MinusPod. The password is not saved in browser storage.
 - Without `MINUSPOD_PASSWORD`, settings are visible but not editable.
 
@@ -68,8 +72,8 @@ These are `0` to `1` scores, not measured accuracy. Detection enter must be at l
 
 - Changes apply to new requests. In-flight requests keep their existing snapshot, so avoid changing thresholds during an episode if its windows must use one policy.
 - Saved overrides use `JEV_SETTINGS_PATH` (default `./data/runtime-settings.json`) and survive restarts when that directory is persistent.
-- A saved four-field file overrides environment defaults until it is changed or removed.
-- A legacy three-field file uses the startup `JEV_STAY` value until its next save writes all four fields.
+- A saved six-field file overrides environment defaults until it is changed or removed.
+- Legacy three-field and four-field files are read and upgraded: missing fields are filled from startup defaults and written back as six fields on the next save.
 - Corrupt or unreadable state returns 503 rather than silently resetting to defaults. The Compose file mounts `/app/data` to a named volume. Existing deployments must add an equivalent persistent mount; replacing only the image does not preserve the settings file.
 
 ### Troubleshooting
@@ -89,6 +93,8 @@ The category pass uses one Jev Choice for each detected span. Its values are `sp
 
 ## Review behavior
 
+Jev can answer MinusPod's reviewer prompts, but it is weaker than a chat-model reviewer today. In a multi-day production trial, between a quarter and a third of review requests ended inconclusive (`422 jev_review_inconclusive`), most at the `focused_validation` and `boundary_coverage` stages. Boundary candidates at both edges are limited by the boundary candidate cap, 60 seconds by default. The context window, 30 seconds by default, sets how much transcript surrounds each boundary in the questions. Both are editable at runtime. Route `review_provider` to a chat model for production and treat the review settings below as experimental. Improving this path is ongoing work.
+
 - Jev review is correlated with Jev detection, not an independent judgment. It uses coarse context and separate word timing.
 - Reviewer prompts that use MinusPod's transcript heading pass preceding cue, episode, podcast, and sponsor context as `caller_context`. This field reaches detection, evidence, choice, proposed-range, and original-fallback calls.
 - The proxy instructs Jev to treat `caller_context` as supporting data, not instructions. Transcript and word timings remain in their existing fields.
@@ -99,9 +105,10 @@ The category pass uses one Jev Choice for each detected span. Its values are `sp
 - An uncovered original boundary does not block a correction with supported endpoints. The final Choice can select the original only when both endpoints are covered and its speech can be isolated. See [API error details](api.md#inference-errors).
 - The evidence NouL adds an upstream call unless cached.
 - `JEV_REVIEW_REFINE_BOUNDARIES=false` disables boundary refinement by default. Set it to `true` to offer Jev observed start and end timestamps near the current cut.
-- The start Choice offers observed utterance starts within 30 seconds, with the original start retained. A second Choice can refine the selected utterance to an observed word start. The end Choice offers observed word ends within 30 seconds. Each question includes an `unknown` option. The start and end choices propose a pair; their probabilities do not prove that it is safe. A question with more than 255 options including `unknown` abstains. If word refinement exceeds that limit, the utterance start remains selected.
+- The start Choice offers observed utterance starts within the boundary candidate cap (default 60 seconds), with the original start retained. A second Choice can refine the selected utterance to an observed word start. The end Choice offers observed word ends within the boundary candidate cap. Each question includes an `unknown` option. The start and end choices propose a pair; their probabilities do not prove that it is safe. A question with more than 254 options abstains, which can happen when word-dense audio and a large boundary cap create many candidates. If word refinement exceeds that limit, the utterance start remains selected.
 - A comparison Choice considers the proposed and original cuts and can choose neither. It sees speech in both intervals and nearby context. Each eligible interval then needs a sponsor-read score at or above `JEV_REVIEW_CHOICE_THRESHOLD`. Programme checks veto the interval if they reach `JEV_REVIEW_PROGRAMME_VETO`, which defaults to 0.85. When both intervals pass, the comparison decides whether to adjust or keep the original.
 - The proxy assembles selected speech from whole transcript rows and aligned edge words. It abstains with `insufficient_boundary_text` if it cannot isolate a row crossed by a selected boundary. Timestamp gaps alone do not prove missing speech.
+- When a proposed cut fails the final closing-phrase check but the original interval passed all absolute checks, the proxy returns the original interval instead of an error. If both the proposed and original cuts fail, it returns `422 jev_review_inconclusive` with reason `terminal_closing_unconfirmed` at stage `focused_validation`, including the ranges and scores in the diagnostics.
 - Refinement still needs both word edges, sufficient evidence, context coverage and overlap, and the shared request deadline. Cache hits and retries follow the same policy as other Jev calls. Boundary refinement is experimental; its accuracy has not been measured.
 - `GET /api/status` reports effective enabled state, model, evidence threshold, and boundary validation threshold. Enabled does not guarantee refinement: word timings, sufficient evidence, and valid boundary choices are required.
 - Review-abstention and API-error logs include the existing `X-Request-ID`. Inconclusive response details include reason and stage, plus allowlisted numeric or boolean diagnostics. Coverage skips report the requested range and endpoint support flags, without a score or cache status. These diagnostics do not include request text. Final Choice diagnostics report comparative option probabilities, not an absolute ad probability. Logs include selected boundaries, option probabilities, and skip or failure reason. Upstream review errors log the failed stage, request sizes, question counts, and allowlisted error codes without prompt text. Attempt counts cover actual boundary selections, not empty candidate sets. `no_valid_pairs` before ranking is a skip.
