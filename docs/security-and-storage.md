@@ -13,13 +13,13 @@
 
 A caller bearer token is required by default for inference requests and is forwarded as the TypeSafe key. Set `JEV_ALLOW_UNAUTHENTICATED_FALLBACK=true` only for a protected internal deployment that must permit a configured `TYPESAFE_API_KEY` without a caller bearer token.
 
-`MINUSPOD_PASSWORD` is used for sponsor-list login and for locally authenticating runtime-settings saves. The settings password is not saved in browser storage. See [Configuration](configuration.md) and [Environment variables](environment-variables.md).
+`MINUSPOD_PASSWORD` is MinusPod's login password. It is used for sponsor-list login and for locally authenticating runtime-settings saves. It is not `MINUSPOD_MASTER_PASSPHRASE`, which only unlocks MinusPod's encrypted key store. The settings password is not saved in browser storage. See [Configuration](configuration.md) and [Environment variables](environment-variables.md).
 
 ## Request safety and cache
 
 - Requests are bounded by `JEV_MAX_CONCURRENT_REQUESTS=4` per worker. The Docker default of 1 worker permits up to 4 concurrent requests. The shim does not apply text, segment, or request-body limits; Jev enforces its current upstream model limits.
 - `JEV_REQUEST_DEADLINE_SECONDS=75` is a cooperative request budget covering retries and retry waits. Keep it below nginx's 90 second response-inactivity timeout when changing either value.
-- `JEV_CACHE_PATH` is retained as the legacy JSON import source. Active responses are stored in a SQLite sidecar beside it and capped at `JEV_CACHE_MAX_ENTRIES=10000` entries. Failed sponsor refreshes pause for `SPONSOR_FAILURE_COOLDOWN_SECONDS=900` seconds before another attempt. This cooldown is per worker, so account for workers and replicas against MinusPod's login limit.
+- `JEV_CACHE_PATH` is retained as the legacy JSON import source. Active responses are stored in a SQLite sidecar beside it and capped at `JEV_CACHE_MAX_ENTRIES=10000` entries. Point it inside the persistent volume (`/app/data/jev_cache.json`, which Compose does) or the cache is lost when the container is replaced. Failed sponsor refreshes pause for `SPONSOR_FAILURE_COOLDOWN_SECONDS=900` seconds before another attempt. This cooldown is per worker, so account for workers and replicas against MinusPod's login limit.
 
 ## Logging
 

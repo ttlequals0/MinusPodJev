@@ -33,6 +33,7 @@ _REVIEW_REASON_CODES = (
     "edge_content_unconfirmed",
     "adjacent_message_continues",
     "unrelated_editorial",
+    "terminal_closing_unconfirmed",
     "malformed_context",
     "invalid_choice",
     "upstream_failure",

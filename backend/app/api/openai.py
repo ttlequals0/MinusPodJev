@@ -122,6 +122,8 @@ def chat_completions(
                 review_evidence_enter=thresholds.review_evidence,
                 review_choice_enter=thresholds.review_choice,
                 review_programme_veto=settings.JEV_REVIEW_PROGRAMME_VETO,
+                review_boundary_cap_seconds=thresholds.review_boundary_cap_seconds,
+                review_context_seconds=thresholds.review_context_seconds,
                 category_pass=settings.JEV_CATEGORY_PASS,
                 category_context=settings.JEV_CATEGORY_CONTEXT,
                 default_category=settings.JEV_DEFAULT_CATEGORY,
@@ -224,6 +226,7 @@ _INCONCLUSIVE_REASONS = frozenset(
         "insufficient_boundary_text",
         "policy_conflict",
         "category_policy_unconfirmed",
+        "terminal_closing_unconfirmed",
     }
 )
 _INCONCLUSIVE_STAGES = frozenset(
@@ -251,6 +254,7 @@ _METRIC_REASONS = frozenset(
         "edge_content_unconfirmed",
         "adjacent_message_continues",
         "unrelated_editorial",
+        "terminal_closing_unconfirmed",
     }
 )
 
@@ -398,7 +402,7 @@ def _review_error(
     if request_id is not None:
         headers["X-Request-ID"] = request_id
         logger.warning(
-            "review request_id=%s status=%d error_code=%s reason=%s stage=%s candidate_start=%s candidate_end=%s context_start=%s context_end=%s score=%s threshold=%s cache_hit=%s proposal=%s fallback=%s",
+            "review request_id=%s status=%d error_code=%s reason=%s stage=%s candidate_start=%s candidate_end=%s context_start=%s context_end=%s score=%s threshold=%s cache_hit=%s proposal=%s fallback=%s range_start=%s range_end=%s",
             request_id,
             status,
             code,
@@ -413,6 +417,8 @@ def _review_error(
             safe_diagnostics.get("cache_hit", "unknown"),
             safe_diagnostics.get("proposal", "unknown"),
             safe_diagnostics.get("fallback", "unknown"),
+            safe_diagnostics.get("range_start", "unknown"),
+            safe_diagnostics.get("range_end", "unknown"),
         )
     error: dict[str, Any] = {
         "message": message,

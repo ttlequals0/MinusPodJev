@@ -104,5 +104,7 @@ def status_check() -> dict[str, Any]:
             "detection_stay_threshold": thresholds.detection_stay,
             "evidence_threshold": thresholds.review_evidence,
             "choice_threshold": thresholds.review_choice,
+            "boundary_cap_seconds": thresholds.review_boundary_cap_seconds,
+            "context_seconds": thresholds.review_context_seconds,
         },
     }

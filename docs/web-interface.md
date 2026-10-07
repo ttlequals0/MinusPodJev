@@ -25,7 +25,12 @@ The page calls `/api/health`, `/api/status`, `/api/settings`, and `/api/stats` d
 
 ## Review settings
 
-- The page reads `GET /api/settings` and saves all four editable thresholds atomically with `PUT /api/settings`.
+- Detection enter and detection stay thresholds (probabilities from 0 to 1).
+- Review evidence threshold (probability from 0 to 1, or inherits detection enter).
+- Review choice threshold (probability from 0 to 1, or inherits detection enter).
+- Boundary candidate cap (seconds, greater than 0 and at most 600; default 60).
+- Boundary context window (seconds, greater than 0 and at most 600; default 30).
+- The page reads `GET /api/settings` and saves all six editable thresholds atomically with `PUT /api/settings`.
 - Saving requires `Authorization: Bearer <MinusPod password>`. The proxy checks that password locally and does not log in to MinusPod.
 - Without `MINUSPOD_PASSWORD`, settings are visible but not editable.
 

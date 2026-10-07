@@ -49,11 +49,15 @@ The included Compose file starts `ttlequals0/minuspodjev:latest`, persists runti
 docker compose up -d
 ```
 
-1. Set `MINUSPOD_BASE_URL` and `MINUSPOD_PASSWORD` in the Compose environment for live sponsor naming. Set `MINUSPOD_PASSWORD` for runtime-settings editing.
-2. Point MinusPod's primary detection and verification provider at `http://<proxy-host>:8080/v1`. Use `openai_compatible`, `typesafe/jev`, and `timestamps` addressing. The [provider fields table](docs/configuration.md#provider-fields) has the full configuration.
-3. Configure an independent secondary chat model for review and chapter titles.
+1. Set `MINUSPOD_BASE_URL` and `MINUSPOD_PASSWORD` in the Compose environment for live sponsor naming and runtime-settings editing. `MINUSPOD_PASSWORD` is the MinusPod login password, not `MINUSPOD_MASTER_PASSPHRASE` and not the TypeSafe key.
+2. In MinusPod, open Settings > AI & Processing > AI Models. Set the provider to `openai_compatible` with base URL `http://<proxy-host>:8080/v1` and the TypeSafe key as the API key. Use model `typesafe/jev` with `timestamps` addressing for detection and verification. `OPENAI_MODEL` only seeds settings that were never saved, so an existing install must pick the model here. The [provider fields table](docs/configuration.md#provider-fields) has the full configuration.
+3. Configure a secondary chat model and route the ad reviewer and chapter titles to it. See the reviewer note below.
 
 MinusPod supplies the TypeSafe key on each request; do not normally set a fallback key in Compose.
+
+### Jev as the ad reviewer
+
+The proxy answers MinusPod's reviewer prompts, but Jev is not a good reviewer yet. In a multi-day production trial it returned inconclusive on between a quarter and a third of review requests. Its boundary refinement only offers cuts within the candidate cap, 60 seconds by default and editable at runtime, so larger corrections are out of reach. Show content that a chat-model reviewer trimmed correctly stayed in Jev's cuts. Keep Jev on detection and verification, route review to a chat model, and treat the review path as work in progress.
 
 `http://localhost:8080/` is the status UI from the Docker host. The default loopback binding requires explicit exposure before a remote MinusPod can call the proxy. For intentional LAN or reverse-proxy exposure, set `JEVPROXY_BIND_ADDRESS=0.0.0.0` and provide appropriate network access controls. See [Configuration](docs/configuration.md) and [Installation](docs/installation.md).
 

@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     # Application
     APP_NAME: str = Field(default="Jev Proxy", description="Application name")
-    APP_VERSION: str = Field(default="0.1.29", description="Application version")
+    APP_VERSION: str = Field(default="0.1.30", description="Application version")
     APP_DESCRIPTION: str = Field(
         default="Thin HTTP proxy around the TypeSafe Jev System One endpoint",
         description="Application description",
@@ -106,6 +106,18 @@ class Settings(BaseSettings):
         le=1.0,
         allow_inf_nan=False,
         description="Independent programme-speech veto threshold during boundary review",
+    )
+    JEV_REVIEW_BOUNDARY_CAP_SECONDS: float = Field(
+        default=60.0,
+        gt=0.0,
+        allow_inf_nan=False,
+        description="Startup default for the runtime review_boundary_cap_seconds setting",
+    )
+    JEV_REVIEW_CONTEXT_SECONDS: float = Field(
+        default=30.0,
+        gt=0.0,
+        allow_inf_nan=False,
+        description="Startup default for the runtime review_context_seconds setting",
     )
     JEV_SETTINGS_PATH: str = Field(
         default="./data/runtime-settings.json",

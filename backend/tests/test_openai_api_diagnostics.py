@@ -24,6 +24,8 @@ def test_inconclusive_api_error_exposes_only_controlled_diagnostics(
                 "detection_stay": 0.5,
                 "review_evidence": 0.7,
                 "review_choice": 0.6,
+                "review_boundary_cap_seconds": 60.0,
+                "review_context_seconds": 30.0,
             },
         )(),
     )
@@ -80,6 +82,8 @@ def test_untrusted_exception_attributes_are_filtered_from_response_and_logs(
                 "detection_stay": 0.5,
                 "review_evidence": 0.7,
                 "review_choice": 0.6,
+                "review_boundary_cap_seconds": 60.0,
+                "review_context_seconds": 30.0,
             },
         )(),
     )
@@ -125,7 +129,7 @@ def test_invalid_request_diagnostics_filter_untrusted_attributes(
         lambda _settings: type(
             "Thresholds",
             (),
-            {"detection_enter": 0.5, "detection_stay": 0.5, "review_evidence": 0.7, "review_choice": 0.6},
+            {"detection_enter": 0.5, "detection_stay": 0.5, "review_evidence": 0.7, "review_choice": 0.6, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0},
         )(),
     )
 
@@ -163,6 +167,9 @@ def test_new_inconclusive_reasons_map_to_existing_metric_enums() -> None:
         assert openai._metric_inconclusive_reason(
             {"reason": reason, "stage": "focused_validation"}
         ) == "choice_inconclusive"
+    assert openai._metric_inconclusive_reason(
+        {"reason": "terminal_closing_unconfirmed", "stage": "focused_validation"}
+    ) == "terminal_closing_unconfirmed"
 
 
 def test_boundary_coverage_diagnostics_are_whitelisted_and_finite(
@@ -176,7 +183,7 @@ def test_boundary_coverage_diagnostics_are_whitelisted_and_finite(
         lambda _settings: type(
             "Thresholds",
             (),
-            {"detection_enter": 0.5, "detection_stay": 0.5, "review_evidence": 0.7, "review_choice": 0.6},
+            {"detection_enter": 0.5, "detection_stay": 0.5, "review_evidence": 0.7, "review_choice": 0.6, "review_boundary_cap_seconds": 60.0, "review_context_seconds": 30.0},
         )(),
     )
 

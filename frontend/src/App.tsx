@@ -7,6 +7,8 @@ type ReviewSettings = {
   model?: string
   evidence_threshold?: number
   choice_threshold?: number
+  boundary_cap_seconds?: number
+  context_seconds?: number
 }
 type Status = { status: string; jev: Upstream; minuspod: Upstream; review?: ReviewSettings }
 type Thresholds = {
@@ -14,6 +16,8 @@ type Thresholds = {
   detection_stay: number
   review_evidence: number
   review_choice: number
+  review_boundary_cap_seconds: number
+  review_context_seconds: number
 }
 type RuntimeSettings = {
   thresholds: Thresholds
@@ -26,6 +30,8 @@ type SettingsDraft = {
   detection_stay: string
   review_evidence: string
   review_choice: string
+  review_boundary_cap_seconds: string
+  review_context_seconds: string
 }
 type Latency = { count: number; sum: number; min: number; max: number; average: number }
 type RefinementStats = {
@@ -64,6 +70,8 @@ type Stats = {
 }
 type ApiState = { health: Health | null; status: Status | null; stats: Stats | null; settings: RuntimeSettings | null; error: string | null; statsError: string | null }
 
+const DOCS_URL = 'https://github.com/ttlequals0/MinusPodJev/blob/main/docs'
+
 const initialState: ApiState = { health: null, status: null, stats: null, settings: null, error: null, statsError: null }
 
 function settingsToDraft(settings: RuntimeSettings): SettingsDraft {
@@ -72,6 +80,8 @@ function settingsToDraft(settings: RuntimeSettings): SettingsDraft {
     detection_stay: String(settings.thresholds.detection_stay),
     review_evidence: String(settings.thresholds.review_evidence),
     review_choice: String(settings.thresholds.review_choice),
+    review_boundary_cap_seconds: String(settings.thresholds.review_boundary_cap_seconds),
+    review_context_seconds: String(settings.thresholds.review_context_seconds),
   }
 }
 
@@ -214,13 +224,21 @@ function App() {
       detection_stay: Number(draft.detection_stay),
       review_evidence: Number(draft.review_evidence),
       review_choice: Number(draft.review_choice),
+      review_boundary_cap_seconds: Number(draft.review_boundary_cap_seconds),
+      review_context_seconds: Number(draft.review_context_seconds),
     }
     if (Object.values(draft).some((value) => !value.trim())) {
-      setSettingsError('Enter all four thresholds before saving.')
+      setSettingsError('Enter all six settings before saving.')
       return
     }
-    if (Object.values(values).some((value) => !Number.isFinite(value) || value < 0 || value > 1)) {
+    const probabilityKeys = ['detection_enter', 'detection_stay', 'review_evidence', 'review_choice'] as const
+    const secondsKeys = ['review_boundary_cap_seconds', 'review_context_seconds'] as const
+    if (probabilityKeys.some((key) => !Number.isFinite(values[key]) || values[key] < 0 || values[key] > 1)) {
       setSettingsError('Thresholds must be finite probabilities from 0 to 1.')
+      return
+    }
+    if (secondsKeys.some((key) => !Number.isFinite(values[key]) || values[key] <= 0 || values[key] > 600)) {
+      setSettingsError('Seconds settings must be greater than 0 and at most 600.')
       return
     }
     if (values.detection_enter < values.detection_stay) {
@@ -365,6 +383,8 @@ function ReviewCard({
   const thresholds = runtimeSettings?.thresholds
   const evidenceThreshold = thresholds?.review_evidence ?? settings?.evidence_threshold
   const choiceThreshold = thresholds?.review_choice ?? settings?.choice_threshold
+  const boundaryCap = thresholds?.review_boundary_cap_seconds ?? settings?.boundary_cap_seconds
+  const contextWindow = thresholds?.review_context_seconds ?? settings?.context_seconds
   return <article className="card review-card"><h3>Jev review</h3>
     {settings || runtimeSettings ? <>
       <dl>
@@ -372,18 +392,22 @@ function ReviewCard({
         <Definition label="Model" value={settings?.model ?? 'Not reported'} />
         <Definition label="Evidence threshold" value={evidenceThreshold == null ? 'Not reported' : String(evidenceThreshold)} />
         <Definition label="Boundary validation threshold" value={choiceThreshold == null ? 'Not reported' : String(choiceThreshold)} />
+        <Definition label="Boundary candidate cap" value={boundaryCap == null ? 'Not reported' : `${boundaryCap} s`} />
+        <Definition label="Boundary context window" value={contextWindow == null ? 'Not reported' : `${contextWindow} s`} />
       </dl>
-      <p className="card-note">Enabled does not mean every review runs refinement. Both word-timing edges and sufficient evidence are required.</p>
+      <p className="card-note">Enabled does not mean every review runs refinement. Both word-timing edges and sufficient evidence are required. <a href={`${DOCS_URL}/configuration.md#review-behavior`} target="_blank" rel="noreferrer">Review behavior</a>.</p>
       {runtimeSettings && draft && <form className="settings-form" onSubmit={onSave}>
         <h4>Runtime thresholds</h4>
-        <p className="card-note">Thresholds are scores from 0 to 1, not accuracy measurements. Detection enter must be at least detection stay. Review evidence and boundary validation are independent. Values apply to new requests; in-flight requests keep existing settings.</p>
-        <dl className="settings-saved"><Definition label="Saved detection enter" value={String(runtimeSettings.thresholds.detection_enter)} /><Definition label="Saved detection stay" value={String(runtimeSettings.thresholds.detection_stay)} /><Definition label="Saved review evidence" value={String(runtimeSettings.thresholds.review_evidence)} /><Definition label="Saved boundary validation" value={String(runtimeSettings.thresholds.review_choice)} /><Definition label="Persistence" value={runtimeSettings.persisted ? 'Saved override' : 'Environment defaults'} /></dl>
-        <p className="card-note">Environment defaults: detection enter {String(runtimeSettings.defaults.detection_enter)}, detection stay {String(runtimeSettings.defaults.detection_stay)}, review evidence {String(runtimeSettings.defaults.review_evidence)}, boundary validation {String(runtimeSettings.defaults.review_choice)}.</p>
+        <p className="card-note">Thresholds are 0 to 1 scores. The two seconds fields are search windows. Detection enter must be at least detection stay. Changes apply to new requests. <a href={`${DOCS_URL}/configuration.md#runtime-threshold-settings`} target="_blank" rel="noreferrer">Settings reference</a>.</p>
+        <dl className="settings-saved"><Definition label="Saved detection enter" value={String(runtimeSettings.thresholds.detection_enter)} /><Definition label="Saved detection stay" value={String(runtimeSettings.thresholds.detection_stay)} /><Definition label="Saved review evidence" value={String(runtimeSettings.thresholds.review_evidence)} /><Definition label="Saved boundary validation" value={String(runtimeSettings.thresholds.review_choice)} /><Definition label="Saved boundary candidate cap" value={`${runtimeSettings.thresholds.review_boundary_cap_seconds} s`} /><Definition label="Saved boundary context window" value={`${runtimeSettings.thresholds.review_context_seconds} s`} /><Definition label="Persistence" value={runtimeSettings.persisted ? 'Saved override' : 'Environment defaults'} /></dl>
+        <p className="card-note">Environment defaults: detection enter {String(runtimeSettings.defaults.detection_enter)}, detection stay {String(runtimeSettings.defaults.detection_stay)}, review evidence {String(runtimeSettings.defaults.review_evidence)}, boundary validation {String(runtimeSettings.defaults.review_choice)}, boundary candidate cap {String(runtimeSettings.defaults.review_boundary_cap_seconds)} s, boundary context window {String(runtimeSettings.defaults.review_context_seconds)} s.</p>
         <div className="settings-fields">
           <SettingsField id="detection-enter" label="Draft detection enter (JEV_ENTER)" value={draft.detection_enter} min={0} onChange={(value) => onDraftChange('detection_enter', value)} disabled={!runtimeSettings.editable || saving} />
           <SettingsField id="detection-stay" label="Draft detection stay (JEV_STAY)" value={draft.detection_stay} min={0} onChange={(value) => onDraftChange('detection_stay', value)} disabled={!runtimeSettings.editable || saving} />
           <SettingsField id="review-evidence" label="Draft review evidence" value={draft.review_evidence} min={0} onChange={(value) => onDraftChange('review_evidence', value)} disabled={!runtimeSettings.editable || saving} />
           <SettingsField id="review-choice" label="Draft boundary validation" value={draft.review_choice} min={0} onChange={(value) => onDraftChange('review_choice', value)} disabled={!runtimeSettings.editable || saving} />
+          <SettingsField id="review-boundary-cap" label="Draft boundary candidate cap (seconds)" value={draft.review_boundary_cap_seconds} min={0} max={600} step="1" onChange={(value) => onDraftChange('review_boundary_cap_seconds', value)} disabled={!runtimeSettings.editable || saving} />
+          <SettingsField id="review-context-window" label="Draft boundary context window (seconds)" value={draft.review_context_seconds} min={0} max={600} step="1" onChange={(value) => onDraftChange('review_context_seconds', value)} disabled={!runtimeSettings.editable || saving} />
         </div>
         {runtimeSettings.editable ? <>
           <label className="settings-credential" htmlFor="settings-credential">MinusPod password</label>
@@ -398,8 +422,8 @@ function ReviewCard({
   </article>
 }
 
-function SettingsField({ id, label, value, min, onChange, disabled }: { id: string; label: string; value: string; min: number; onChange: (value: string) => void; disabled: boolean }) {
-  return <div className="settings-field"><label htmlFor={id}>{label}</label><input id={id} type="number" inputMode="decimal" min={min} max={1} step="any" required value={value} onChange={(event) => onChange(event.target.value)} disabled={disabled} /></div>
+function SettingsField({ id, label, value, min, max = 1, step = 'any', onChange, disabled }: { id: string; label: string; value: string; min: number; max?: number; step?: string; onChange: (value: string) => void; disabled: boolean }) {
+  return <div className="settings-field"><label htmlFor={id}>{label}</label><input id={id} type="number" inputMode="decimal" min={min} max={max} step={step} required value={value} onChange={(event) => onChange(event.target.value)} disabled={disabled} /></div>
 }
 
 function RuntimeStats({ stats, statsError }: { stats: Stats | null; statsError: string | null }) {

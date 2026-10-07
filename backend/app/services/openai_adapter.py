@@ -74,6 +74,8 @@ _REVIEW_SYSTEM_SIGNATURES = (
 )
 _EVIDENCE_MAX_CHARS = 400
 _PROGRAMME_VETO = 0.85
+_BOUNDARY_CANDIDATE_CAP_SECONDS = 60.0
+_BOUNDARY_CONTEXT_SECONDS = 30.0
 
 
 class _CategoryPolicyConflictError(ValueError):
@@ -166,7 +168,7 @@ def sanitize_review_range_diagnostic(value: dict[str, Any] | None) -> dict[str, 
         and reason in {
             "proposed_range_not_confirmed", "original_range_not_confirmed", "edge_content_unconfirmed",
             "adjacent_message_continues", "unrelated_editorial", "programme_content_detected",
-            "category_policy_unconfirmed",
+            "category_policy_unconfirmed", "terminal_closing_unconfirmed",
         }
         and stage == "focused_validation"
     ):
@@ -218,6 +220,7 @@ class ReviewInconclusiveError(ReviewUnavailableError):
             "insufficient_boundary_text",
             "policy_conflict",
             "category_policy_unconfirmed",
+            "terminal_closing_unconfirmed",
         }
     )
     _STAGES = frozenset(
@@ -476,6 +479,8 @@ def run_chat_completion(
     review_evidence_enter: float | None = None,
     review_choice_enter: float | None = None,
     review_programme_veto: float = _PROGRAMME_VETO,
+    review_boundary_cap_seconds: float = _BOUNDARY_CANDIDATE_CAP_SECONDS,
+    review_context_seconds: float = _BOUNDARY_CONTEXT_SECONDS,
     review_request_id: str | None = None,
     fetcher: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -502,6 +507,8 @@ def run_chat_completion(
             review_evidence_enter=review_evidence_enter,
             review_choice_enter=review_choice_enter,
             review_programme_veto=review_programme_veto,
+            review_boundary_cap_seconds=review_boundary_cap_seconds,
+            review_context_seconds=review_context_seconds,
             uid=uid,
             max_retries=max_retries,
             retry_after_max=retry_after_max,
@@ -847,11 +854,12 @@ def _choice_state(
     cand: tuple[float, float],
     guidance: str,
     caller_context: str,
+    context_seconds: float = _BOUNDARY_CONTEXT_SECONDS,
 ) -> dict[str, Any]:
     def nearby(value: float) -> str:
         nearby_rows = [segment for segment in segments
-                       if float(segment["end"]) >= value - _BOUNDARY_CONTEXT_SECONDS
-                       and float(segment["start"]) <= value + _BOUNDARY_CONTEXT_SECONDS]
+                       if float(segment["end"]) >= value - context_seconds
+                       and float(segment["start"]) <= value + context_seconds]
         before = [segment for segment in nearby_rows if float(segment["end"]) <= value][-16:]
         crossing = [segment for segment in nearby_rows
                     if float(segment["start"]) < value < float(segment["end"])]
@@ -887,8 +895,6 @@ def _edge_reference(words: Sequence[dict[str, Any]], value: float, direction: st
     return f"{value:.2f}s: before {before!r}; after {after!r}"
 
 
-_BOUNDARY_CANDIDATE_CAP_SECONDS = 60.0
-_BOUNDARY_CONTEXT_SECONDS = 30.0
 _BOUNDARY_CHOICE_LIMIT = 254
 _END_WORD_GROUP_SIZE = 8
 _END_WORD_GROUP_THRESHOLD = 24
@@ -898,13 +904,14 @@ def _boundary_candidates(
     segments: Sequence[dict[str, Any]],
     word_edges: dict[str, list[dict[str, Any]]],
     cand: tuple[float, float],
+    cap_seconds: float = _BOUNDARY_CANDIDATE_CAP_SECONDS,
 ) -> tuple[list[float], list[float]]:
     """Return every observed word edge near the current cut."""
     context_start, context_end = _review_context_envelope(segments, word_edges)
     starts = [float(word["start"]) for word in word_edges["start"]
-              if abs(float(word["start"]) - cand[0]) <= _BOUNDARY_CANDIDATE_CAP_SECONDS]
+              if abs(float(word["start"]) - cand[0]) <= cap_seconds]
     ends = [float(word["end"]) for word in word_edges["end"]
-            if abs(float(word["end"]) - cand[1]) <= _BOUNDARY_CANDIDATE_CAP_SECONDS]
+            if abs(float(word["end"]) - cand[1]) <= cap_seconds]
     start_supported, end_supported = _range_boundary_support(segments, word_edges, cand)
     if start_supported:
         starts.append(cand[0])
@@ -1206,6 +1213,7 @@ def _speech_before_interval(
     segments: Sequence[dict[str, Any]],
     word_edges: dict[str, list[dict[str, Any]]],
     boundary: float,
+    context_seconds: float = _BOUNDARY_CONTEXT_SECONDS,
 ) -> str:
     observed = sorted(
         {
@@ -1213,7 +1221,7 @@ def _speech_before_interval(
             for words in word_edges.values()
             for word in words
             if float(word["end"]) <= boundary
-            and boundary - float(word["end"]) <= _BOUNDARY_CONTEXT_SECONDS
+            and boundary - float(word["end"]) <= context_seconds
         }
     )
     if observed:
@@ -1222,7 +1230,7 @@ def _speech_before_interval(
         str(segment["text"]).strip()
         for segment in segments
         if float(segment["end"]) <= boundary
-        and boundary - float(segment["end"]) <= _BOUNDARY_CONTEXT_SECONDS
+        and boundary - float(segment["end"]) <= context_seconds
     ]
     return " ".join(" ".join(preceding).split()[-64:])
 
@@ -1522,6 +1530,8 @@ def run_review(
     review_evidence_enter: float | None = None,
     review_choice_enter: float | None = None,
     review_programme_veto: float = _PROGRAMME_VETO,
+    review_boundary_cap_seconds: float = _BOUNDARY_CANDIDATE_CAP_SECONDS,
+    review_context_seconds: float = _BOUNDARY_CONTEXT_SECONDS,
     review_request_id: str | None = None,
     guidance: str = GUIDANCE,
     fetcher: Callable[..., dict[str, Any]] | None = None,
@@ -1532,6 +1542,12 @@ def run_review(
     review_choice_enter = enter if review_choice_enter is None else review_choice_enter
     if not math.isfinite(review_programme_veto) or not 0.0 <= review_programme_veto <= 1.0:
         raise ValueError("review programme veto must be between 0 and 1")
+    for _name, _seconds in (
+        ("review boundary cap", review_boundary_cap_seconds),
+        ("review context window", review_context_seconds),
+    ):
+        if not math.isfinite(_seconds) or _seconds <= 0.0:
+            raise ValueError(f"{_name} must be a finite number greater than 0 seconds")
     end = deadline_at if deadline_at is not None else time.monotonic() + request_deadline
     text = extract_user_text(messages)
     caller_context, transcript_text = _review_prompt_parts(text)
@@ -1585,13 +1601,15 @@ def run_review(
         coarse_segments, word_edges
     )
     logger.info(
-        "review request_id=%s stage=context refine_boundaries=%s start_word_count=%d end_word_count=%d evidence_threshold=%s choice_threshold=%s",
+        "review request_id=%s stage=context refine_boundaries=%s start_word_count=%d end_word_count=%d evidence_threshold=%s choice_threshold=%s boundary_cap=%s context_window=%s",
         review_request_id,
         refine_boundaries,
         len(word_edges["start"]),
         len(word_edges["end"]),
         review_evidence_enter,
         review_choice_enter,
+        review_boundary_cap_seconds,
+        review_context_seconds,
     )
     has_overlap = any(
         min(float(segment["end"]), cand[1]) > max(float(segment["start"]), cand[0])
@@ -1814,7 +1832,9 @@ def run_review(
             return None
         questions = _same_show_access_questions(
             interval_speech,
-            _speech_before_interval(segments, word_edges, bounds[0]),
+            _speech_before_interval(
+                segments, word_edges, bounds[0], context_seconds=review_context_seconds,
+            ),
         )
         if not questions:
             return None
@@ -1983,6 +2003,7 @@ def run_review(
             segments,
             word_edges,
             cand,
+            cap_seconds=review_boundary_cap_seconds,
         )
         if not any(
             _valid_pair(start, end, cand, (ad_start, ad_end), boundary_context_start, boundary_context_end)
@@ -2031,12 +2052,15 @@ def run_review(
             cand_end,
         )
         try:
-            rank_state = _choice_state(coarse_segments, cand, review_guidance, caller_context)
+            rank_state = _choice_state(
+                coarse_segments, cand, review_guidance, caller_context,
+                context_seconds=review_context_seconds,
+            )
             boundary_state = {"candidate": {"start": cand_start, "end": cand_end}, **policy_state}
             end_context_center = (
                 ad_end
                 if boundary_context_start <= ad_end <= boundary_context_end
-                and abs(ad_end - cand_end) <= _BOUNDARY_CANDIDATE_CAP_SECONDS
+                and abs(ad_end - cand_end) <= review_boundary_cap_seconds
                 else cand_end
             )
 
@@ -2046,6 +2070,7 @@ def run_review(
                     for center in sorted({*centers, cand_end})
                     for line in _choice_state(
                         coarse_segments, (cand_start, center), review_guidance, caller_context,
+                        context_seconds=review_context_seconds,
                     )["end_context"].splitlines()
                 ))
 
@@ -2064,6 +2089,7 @@ def run_review(
                     end_context(selected) if side == "end" else
                     _choice_state(
                         coarse_segments, centered, review_guidance, caller_context,
+                        context_seconds=review_context_seconds,
                     )[f"{side}_context"]
                 )
                 return state
@@ -2191,7 +2217,7 @@ def run_review(
                         transition_keys = [
                             key for key in end_keys[selected_index + 1:]
                             if key in end_word_units
-                            and float(end_word_units[key][0]["start"]) <= cand_end + _BOUNDARY_CONTEXT_SECONDS
+                            and float(end_word_units[key][0]["start"]) <= cand_end + review_context_seconds
                         ]
                         transition_criteria = {"unknown": "The final promotional utterance is not supported by the supplied speech."}
                         for index, key in enumerate(transition_keys):
@@ -2594,6 +2620,7 @@ def run_review(
             if proposed_supported and original_supported and original_bounds == cand:
                 context = _choice_state(
                     coarse_segments, cand, review_guidance, caller_context,
+                    context_seconds=review_context_seconds,
                 )
                 comparison_state: dict[str, Any] = {
                     "guidance": review_guidance,
@@ -2882,17 +2909,19 @@ def run_review(
                     cache_hit=primary.get("cache_hit"),
                     proposal=proposal_diagnostic, fallback=fallback_diagnostic,
                 )
-            if (
-                ad_end >= max(float(word["end"]) for word in word_edges["end"]) - 0.01
-                and not any(
-                    float(segment["start"]) >= ad_end - 0.01 and str(segment["text"]).strip()
-                    for segment in coarse_segments
-                )
-            ):
+            def terminal_closing(interval: tuple[float, float]) -> tuple[bool, dict[str, Any] | None]:
+                if (
+                    interval[1] < max(float(word["end"]) for word in word_edges["end"]) - 0.01
+                    or any(
+                        float(segment["start"]) >= interval[1] - 0.01 and str(segment["text"]).strip()
+                        for segment in coarse_segments
+                    )
+                ):
+                    return True, None
                 closing_words = [
                     word for word in word_edges["end"]
-                    if float(word["start"]) >= ad_start - 0.01
-                    and float(word["end"]) <= ad_end + 0.01
+                    if float(word["start"]) >= interval[0] - 0.01
+                    and float(word["end"]) <= interval[1] + 0.01
                 ][-40:]
                 closing_speech = " ".join(str(word["text"]).strip() for word in closing_words)
                 closing = review_questions(
@@ -2912,20 +2941,41 @@ def run_review(
                     "terminal_closing",
                     question_state_override={
                         "guidance": _focused_guidance(review_guidance),
-                        "selected_boundary": ad_end,
+                        "selected_boundary": interval[1],
                         "closing_speech": closing_speech,
                         **policy_state,
                     },
                 )
                 closing_score = float(closing["answers"]["terminal_closing"])
-                if closing_score < review_choice_enter:
-                    _review_unavailable(
-                        pool, "Jev could not confirm a complete terminal ad closing", review_request_id,
-                        reason="missing_boundary_coverage", stage="boundary_coverage",
-                        score=closing_score, threshold=review_choice_enter,
-                        cache_hit=bool(closing["cache_hit"]),
-                        range_start=ad_start, range_end=ad_end,
+                return closing_score >= review_choice_enter, {
+                    "reason": "terminal_closing_unconfirmed", "stage": "focused_validation",
+                    "range_start": interval[0], "range_end": interval[1],
+                    "score": closing_score, "threshold": review_choice_enter,
+                    "cache_hit": bool(closing["cache_hit"]),
+                }
+
+            selected_was_proposed = (ad_start, ad_end) == proposed
+            passed, selected_diag = terminal_closing((ad_start, ad_end))
+            fallback_diag: dict[str, Any] | None = None
+            if not passed and selected_was_proposed and original_safe and original_bounds != proposed:
+                fallback_passed, fallback_diag = terminal_closing(original_bounds)
+                if fallback_passed:
+                    logger.info(
+                        "review request_id=%s stage=terminal_closing fallback=original proposed_start=%.3f proposed_end=%.3f proposed_score=%s threshold=%s",
+                        review_request_id, proposed[0], proposed[1],
+                        selected_diag["score"] if selected_diag else None, review_choice_enter,
                     )
+                    ad_start, ad_end = original_bounds
+                    passed = True
+            if not passed and selected_diag is not None:
+                _review_unavailable(
+                    pool, "Jev could not confirm a complete terminal ad closing", review_request_id,
+                    reason="terminal_closing_unconfirmed", stage="focused_validation",
+                    score=selected_diag["score"], threshold=review_choice_enter,
+                    cache_hit=selected_diag["cache_hit"], candidate=cand,
+                    proposal=selected_diag if selected_was_proposed else None,
+                    fallback=fallback_diag or (None if selected_was_proposed else selected_diag),
+                )
             logger.info(
                 "review request_id=%s refinement=completed original_start=%.3f original_end=%.3f proposed_start=%.3f proposed_end=%.3f",
                 review_request_id, cand_start, cand_end, ad_start, ad_end,

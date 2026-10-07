@@ -21,6 +21,8 @@ services:
       - JEV_ALLOW_UNAUTHENTICATED_FALLBACK=${JEV_ALLOW_UNAUTHENTICATED_FALLBACK:-false}
       - JEV_REVIEW_REFINE_BOUNDARIES=${JEV_REVIEW_REFINE_BOUNDARIES:-false}
       - JEV_SETTINGS_PATH=${JEV_SETTINGS_PATH:-./data/runtime-settings.json}
+      # Keep the Jev response cache on the volume; the image default is outside it.
+      - JEV_CACHE_PATH=${JEV_CACHE_PATH:-/app/data/jev_cache.json}
       # Keep the fallback unset in normal deployments. If you set it, callers
       # still need a bearer token unless JEV_ALLOW_UNAUTHENTICATED_FALLBACK=true.
       # - TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-}
