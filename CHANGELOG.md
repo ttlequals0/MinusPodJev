@@ -5,6 +5,7 @@
 - Add two new runtime-editable review settings: boundary candidate cap (seconds) and context window (seconds), both with validation and startup environment defaults.
 - Return the original interval when a proposed cut fails closing-phrase validation but the original passes all absolute checks. Include ranges and scores in diagnostics when both fail with new reason `terminal_closing_unconfirmed`.
 - Read legacy three-field and four-field settings files, fill the missing fields from startup defaults, and write six fields on the next save.
+- Build the frontend stage on the build platform so arm64 images no longer run node under emulation.
 - Keep the Jev response cache on the data volume in Compose with `JEV_CACHE_PATH=/app/data/jev_cache.json`. Document where the model is set in MinusPod, the login password versus the master passphrase, a Podman Quadlet unit, and the current state of Jev as a reviewer.
 
 ## 0.1.29 - 2026-09-28

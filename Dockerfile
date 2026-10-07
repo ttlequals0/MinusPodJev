@@ -1,7 +1,8 @@
 # Builds the status frontend and proxy backend into one image.
 
-# Stage 1: Frontend Build
-FROM node:20-alpine AS frontend-builder
+# Stage 1: Frontend Build. Output is static files, so build on the host platform
+# instead of running node under emulation for arm64 images.
+FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-builder
 
 WORKDIR /app/frontend
 
