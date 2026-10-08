@@ -66,8 +66,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Create necessary directories for nginx and fix permissions
 RUN mkdir -p /var/cache/nginx /var/log/nginx /run && \
-    touch /run/nginx.pid && \
-    chown -R nginx:nginx /var/cache/nginx /var/log/nginx /run/nginx.pid && \
+    chown -R nginx:nginx /var/cache/nginx /var/log/nginx && \
     chown -R nginx:nginx /usr/share/nginx/html
 
 # Create app user

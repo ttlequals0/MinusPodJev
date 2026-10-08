@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.31 - 2026-10-08
+
+- Stop pre-creating `/run/nginx.pid` in the image. Podman copies image files into tmpfs mounts, so the nginx-owned file landed in a sticky 1777 directory where the kernel's `fs.protected_regular` refused nginx's open and `ReadOnly=yes` failed at startup. nginx now creates the file itself (#6).
+- Rename the Runtime stats view to Stats and keep the Refresh button from covering the navigation on narrow screens.
+
 ## 0.1.30 - 2026-10-06
 
 - Add two new runtime-editable review settings: boundary candidate cap (seconds) and context window (seconds), both with validation and startup environment defaults.
