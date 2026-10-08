@@ -287,7 +287,7 @@ function App() {
       <header className="topbar">
         <div className="topbar-inner">
           <div className="brand"><img className="brand-mark" src="/minuspodjev-logo.png" alt="" /><strong>MinusPod</strong><span>Jev Proxy</span></div>
-          <nav aria-label="Page sections"><a href="#overview">Overview</a><a href="#runtime">Runtime stats</a></nav>
+          <nav aria-label="Page sections"><a href="#overview">Overview</a><a href="#runtime">Stats</a></nav>
           <button className="refresh" type="button" onClick={() => void refresh()} disabled={loading || settingsSaving}>
             {loading ? 'Refreshing...' : 'Refresh'}
           </button>
@@ -331,7 +331,7 @@ function App() {
         </section>
 
         <section className="section" id="runtime" aria-labelledby="runtime-title">
-          <div className="section-heading"><div><h2 id="runtime-title">Runtime stats</h2><p>Current proxy process only. Counters reset when the process restarts.</p></div><span className="badge">Process scoped</span></div>
+          <div className="section-heading"><div><h2 id="runtime-title">Stats</h2><p>Current proxy process only. Counters reset when the process restarts.</p></div><span className="badge">Process scoped</span></div>
           {statsUpdatedAt && <p className="stats-updated">Stats updated {statsUpdatedAt.toLocaleTimeString()}</p>}
           {state.statsError && <div className="notice error" role="status">{state.stats ? `Stats refresh failed. Showing last received values: ${state.statsError}` : `Runtime stats unavailable: ${state.statsError}`}</div>}
           <RuntimeStats stats={state.stats} statsError={state.statsError} />

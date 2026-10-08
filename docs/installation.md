@@ -57,7 +57,7 @@ WantedBy=default.target
 - Create the data directory and hand it to container UID 1000, the user uvicorn runs as: `mkdir -p ~/jevproxy-data && podman unshare chown 1000:1000 ~/jevproxy-data`. Drop the `:Z` suffix on hosts without SELinux.
 - Create the secret from a file holding the MinusPod login password: `podman secret create minuspod_password /path/to/password-file`. Do not reuse the `MINUSPOD_MASTER_PASSPHRASE` secret here.
 - The four capabilities are the tested minimum for the published image. supervisord needs `CAP_SETUID` and `CAP_SETGID` to drop to the app and nginx users; the nginx master process needs `CAP_CHOWN` and `CAP_DAC_OVERRIDE` to create its temp directories under `/var/lib/nginx`. With fewer, nginx exits at startup and the port never opens.
-- `ReadOnly=yes` works when these paths are tmpfs: `/run`, `/var/cache/nginx`, `/var/log/nginx`, `/var/lib/nginx/tmp`, and `/tmp`. For example `Mount=type=tmpfs,destination=/run,tmpfs-size=16M` for each one.
+- `ReadOnly=yes` works when these paths are tmpfs: `/run`, `/var/cache/nginx`, `/var/log/nginx`, `/var/lib/nginx/tmp`, and `/tmp`. For example `Mount=type=tmpfs,destination=/run,tmpfs-size=16M` for each one. Images before 0.1.31 need `tmpfs-mode=0755` on the `/run` mount; later images accept the default mode.
 - Check with `curl http://127.0.0.1:8080/api/status` and `curl http://127.0.0.1:8080/v1/models`; the second must list `typesafe/jev`.
 
 ## Local development
